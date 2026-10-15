@@ -1,14 +1,13 @@
 /**
- * HOANG VIP ADAPTIVE - FINAL single-file
+ * HOANG VIP ADAPTIVE - FINAL FULL FILE
  *
- * Mục tiêu:
- * - Không thiên vị T/X
- * - Tự nhận diện cầu / pattern
- * - Tự học online: model + pattern + markov
- * - Contradictory / bias guard: tự reset nếu lệch cực đoan
- * - Gating: chỉ dự đoán khi đủ chắc chắn
+ * - Always predicts (never N/A by default)
+ * - Detects bias and self-corrects
+ * - Pattern miner + Markov + EWMA + online logistic
+ * - Calibration + adaptive ensemble weights
+ * - Gating metadata preserved in history
  * - JSON persistence + backup
- * - API: /api/predict/:game, /api/analyze/:game, /api/export/:game
+ * - Routes: /api/predict/:game, /api/analyze/:game, /api/export/:game
  * - Admin: /admin/reset-model/:game, /admin/backtest/:game, /admin/metrics/:game
  * - UI: /md5, /taixiu
  *
@@ -296,7 +295,7 @@ function buildFeatureVector(sequence, mergedPatterns) {
   return { vector, meta: { baseLen: base.length, patternLen: pat.length, topPatterns: mergedPatterns.slice(0, PATTERN_TOP_N) } };
 }
 
-// ------------------------Online logistic------------------------
+// ------------------------ Online logistic ------------------------
 function initModelIfNeeded(db, dim) {
   db.model = db.model || {};
   if (!db.model.weights || db.model.weights.length !== dim) {
@@ -410,7 +409,7 @@ function gatingDecision(calibratedProb, entropy, comps) {
   return { pass: true, reason: 'ok', agree };
 }
 
-// ---------- Bias detection & reset ----------
+// ---------- Bias detection & self-correction ----------
 function detectAndCorrectBias(db, game) {
   try {
     const LOOK = 60;
@@ -419,7 +418,7 @@ function detectAndCorrectBias(db, game) {
     if (!recent || recent.length < 10) return;
     let cntT = 0, cntX = 0;
     for (const r of recent) {
-      if (!r || !r.DU_DOAN) continue;
+      if (!r || !r.DU_DOAN || r.DU_DOAN === 'N/A') continue;
       if (r.DU_DOAN === 'T') cntT++; else if (r.DU_DOAN === 'X') cntX++;
     }
     const total = cntT + cntX;
@@ -531,7 +530,6 @@ async function processGameTick(game) {
 
     const fvInfo = buildFeatureVector(seq, merged);
     const x = fvInfo.vector;
-
     initModelIfNeeded(db, x.length);
     const logit = predictLogit(db, x);
     const pModel = sigmoid(logit);
@@ -587,9 +585,7 @@ async function processGameTick(game) {
           };
           updateEnsembleWeights(db, compLosses);
         }
-      } catch (e) {
-        // no-op
-      }
+      } catch (e) {}
     }
 
     const predictionValue = finalP >= 0.5 ? 'T' : 'X';
@@ -598,10 +594,10 @@ async function processGameTick(game) {
       phienDuDoan: currentSession + 1,
       xucXac: [Number(latest.FirstDice || 0), Number(latest.SecondDice || 0), Number(latest.ThirdDice || 0)],
       ketQua: itemToResult(latest),
-      DU_DOAN: gate.pass ? predictionValue : 'N/A',  // do not output if low confidence
-      TI_LE: gate.pass ? `${(Math.max(finalP, 1 - finalP) * 100).toFixed(1)}%` : 'LOW',
+      DU_DOAN: predictionValue, // always output prediction
+      TI_LE: `${(Math.max(finalP, 1 - finalP) * 100).toFixed(1)}%${!gate.pass ? ' (LOW)' : ''}`,
       mauCau: (fvInfo.meta && fvInfo.meta.topPatterns) ? fvInfo.meta.topPatterns.map(p => p.pattern).slice(0, 6).join('; ') : 'Auto',
-      trangThai: gate.pass ? 'ĐANG CHỜ' : 'LOW CONF',
+      trangThai: 'ĐANG CHỜ',
       meta: {
         featureVector: x,
         logit,
@@ -619,6 +615,7 @@ async function processGameTick(game) {
 
     db.history.push(newEntry);
     if (db.history.length > MAX_HISTORY) db.history.splice(0, db.history.length - MAX_HISTORY);
+
     db.lastProcessedSession = currentSession;
 
     detectAndCorrectBias(db, game);
@@ -668,7 +665,7 @@ app.get('/api/predict/:game', async (req, res) => {
     const gate = gatingDecision(finalP, entropy, { modelProb: pModel, patternProb: pPattern, markovProb: pMarkov });
 
     return res.json({
-      prediction: gate.pass ? (finalP >= 0.5 ? 'T' : 'X') : 'N/A',
+      prediction: finalP >= 0.5 ? 'T' : 'X',
       finalP: Number(finalP.toFixed(4)),
       calibrated: Number(calibrated.toFixed(4)),
       modelProb: Number(pModel.toFixed(4)),
