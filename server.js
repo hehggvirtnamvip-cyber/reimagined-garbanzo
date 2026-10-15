@@ -1,15 +1,14 @@
 /**
- * HOANG VIP ADAPTIVE - FINAL FULL FILE
+ * HOANG VIP ADAPTIVE - FULL SINGLE FILE (Tài/Xỉu only)
  *
- * - Always predicts (never N/A by default)
- * - Detects bias and self-corrects
- * - Pattern miner + Markov + EWMA + online logistic
- * - Calibration + adaptive ensemble weights
- * - Gating metadata preserved in history
- * - JSON persistence + backup
- * - Routes: /api/predict/:game, /api/analyze/:game, /api/export/:game
- * - Admin: /admin/reset-model/:game, /admin/backtest/:game, /admin/metrics/:game
- * - UI: /md5, /taixiu
+ * Chức năng:
+ * - Luôn dự đoán Tài/Xỉu (không hiển thị T/X ở UI)
+ * - Không thiên vị Tài hay Xỉu (bias guard + debias)
+ * - Online adaptive model: Pattern miner + Markov + Multi-alpha EWMA + Logistic
+ * - Gating: còn metadata gate nếu low-confidence
+ * - Persistence JSON + backup
+ * - Polling + retry + admin endpoints
+ * - UI simple /md5 /taixiu
  *
  * Run:
  *  npm i express axios
@@ -59,8 +58,13 @@ const CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 0.78);
 const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 0.65);
 const ENSEMBLE_ETA = Number(process.env.ENSEMBLE_ETA || 0.08);
 
-// ------------------------ Helpers ------------------------
+// ---------- Helpers ----------
 function now() { return new Date().toISOString(); }
+function labelFromTX(code) {
+  if (code === 'T') return 'Tài';
+  if (code === 'X') return 'Xỉu';
+  return code;
+}
 function safeReadJson(filePath, fallback = null) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -81,6 +85,9 @@ function entropyFromProb(p) {
   const eps = 1e-12;
   return -(p * Math.log(p + eps) + (1 - p) * Math.log(1 - p + eps));
 }
+function clamp(x, min = 1e-6, max = 1 - 1e-6) {
+  return Math.min(Math.max(x, min), max);
+}
 function getCurrentTimeSlot(date = new Date()) {
   const h = date.getHours();
   if (h >= 6 && h < 12) return 'Sang';
@@ -95,7 +102,7 @@ function itemToResult(item) {
   return sum >= 11 ? 'T' : 'X';
 }
 
-// ------------------------ DB ------------------------
+// ---------- DB ----------
 function defaultDB() {
   return {
     history: [],
@@ -107,7 +114,8 @@ function defaultDB() {
     patterns: { lastExtractedAt: null, list: [] },
     ensembleWeights: { model: 0.34, pattern: 0.33, markov: 0.33 },
     checkpoints: [],
-    biasCorrections: []
+    biasCorrections: [],
+    _strictUnbiased: true // default on, so it's neutral by design
   };
 }
 function loadDatabase(game) {
@@ -124,7 +132,30 @@ function saveDatabase(game, db) {
   safeAtomicWrite(BACKUP_FILES[game], db);
 }
 
-// ------------------------ Pattern mining ------------------------
+// ---------- Debias ----------
+function getRecentMeanPred(db, windowSize = 200) {
+  const hist = (db.history || []).slice(-windowSize);
+  if (!hist.length) return 0.5;
+  let sum = 0, cnt = 0;
+  for (const h of hist) {
+    if (h && h.meta && h.meta.combinedProb !== undefined) {
+      sum += Number(h.meta.combinedProb);
+      cnt++;
+    } else if (h && h.meta && h.meta.calibratedProb !== undefined) {
+      sum += Number(h.meta.calibratedProb);
+      cnt++;
+    }
+  }
+  return cnt ? (sum / cnt) : 0.5;
+}
+function debiasProbability(db, p, windowSize = 200) {
+  if (!db._strictUnbiased) return clamp(p);
+  const mean = getRecentMeanPred(db, windowSize);
+  const shift = mean - 0.5;
+  return clamp(p - shift);
+}
+
+// ---------- Pattern mining ----------
 function extractFrequentPatterns(sequence, minSupport = PATTERN_MIN_SUPPORT, maxLen = PATTERN_MAX_LEN, topN = PATTERN_TOP_N) {
   const n = sequence.length;
   if (n < 2) return [];
@@ -195,7 +226,7 @@ function mergeAndDecayPatterns(dbPatterns, newPatterns, seqLen) {
   return merged.slice(0, Math.max(PATTERN_TOP_N * 2, 80));
 }
 
-// ------------------------ Markov ------------------------
+// ---------- Markov ----------
 function buildMarkov(sequence, maxOrder = MARKOV_MAX_ORDER) {
   const n = sequence.length;
   const models = {};
@@ -226,7 +257,7 @@ function markovPredict(models, sequence) {
   return { T: 0.5, X: 0.5, orderUsed: 0 };
 }
 
-// ------------------------ Feature builder ------------------------
+// ---------- Feature builder ----------
 function ngramContextDiff(sequence, n) {
   if (sequence.length < n + 1) return 0;
   const ctx = sequence.slice(-n).join('');
@@ -252,7 +283,6 @@ function buildBaseFeatures(sequence) {
     s3 = a3 * v + (1 - a3) * s3;
   }
   f.push(s1, s2, s3);
-
   const last = sequence[sequence.length - 1];
   let streak = 1;
   for (let i = sequence.length - 2; i >= 0; i--) {
@@ -295,7 +325,7 @@ function buildFeatureVector(sequence, mergedPatterns) {
   return { vector, meta: { baseLen: base.length, patternLen: pat.length, topPatterns: mergedPatterns.slice(0, PATTERN_TOP_N) } };
 }
 
-// ------------------------ Online logistic ------------------------
+// ---------- Online logistic ----------
 function initModelIfNeeded(db, dim) {
   db.model = db.model || {};
   if (!db.model.weights || db.model.weights.length !== dim) {
@@ -418,8 +448,8 @@ function detectAndCorrectBias(db, game) {
     if (!recent || recent.length < 10) return;
     let cntT = 0, cntX = 0;
     for (const r of recent) {
-      if (!r || !r.DU_DOAN || r.DU_DOAN === 'N/A') continue;
-      if (r.DU_DOAN === 'T') cntT++; else if (r.DU_DOAN === 'X') cntX++;
+      if (!r || !r.DU_DOAN_CODE) continue;
+      if (r.DU_DOAN_CODE === 'T') cntT++; else if (r.DU_DOAN_CODE === 'X') cntX++;
     }
     const total = cntT + cntX;
     if (total < 8) return;
@@ -445,7 +475,7 @@ function detectAndCorrectBias(db, game) {
   } catch (err) {}
 }
 
-// ---------- Checkpointing ----------
+// ---------- checkpoint ----------
 function maybeCheckpoint(db, game) {
   const window = Math.max(20, Math.min(200, Math.floor(MAX_HISTORY / 2)));
   const completed = db.history.filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI');
@@ -493,7 +523,7 @@ function backtest(db) {
   return { accuracy: total ? (correct / total) : 0, total, correct };
 }
 
-// ---------- Fetch with retry ----------
+// ---------- fetch ----------
 async function fetchWithRetry(url, attempts = 2) {
   for (let i = 0; i < attempts; i++) {
     try {
@@ -530,6 +560,7 @@ async function processGameTick(game) {
 
     const fvInfo = buildFeatureVector(seq, merged);
     const x = fvInfo.vector;
+
     initModelIfNeeded(db, x.length);
     const logit = predictLogit(db, x);
     const pModel = sigmoid(logit);
@@ -541,7 +572,10 @@ async function processGameTick(game) {
     const pPattern = computePatternSignal(merged);
     const combined = combineSignals(db, pModel, pPattern, pMarkov);
     const calibrated = calibrate(db, logit);
-    const finalP = Math.min(Math.max(0.000001, 0.9 * calibrated + 0.1 * combined.p), 0.999999);
+
+    let finalP = Math.min(Math.max(0.000001, 0.9 * calibrated + 0.1 * combined.p), 0.999999);
+    finalP = debiasProbability(db, finalP, 200);
+
     const entropy = entropyFromProb(finalP);
     const comps = { modelProb: pModel, patternProb: pPattern, markovProb: pMarkov };
     const gate = gatingDecision(finalP, entropy, comps);
@@ -549,7 +583,8 @@ async function processGameTick(game) {
     const lastRecorded = db.history[db.history.length - 1];
     if (lastRecorded && Number(lastRecorded.phienDuDoan) === currentSession) {
       const actual = itemToResult(latest);
-      const wasCorrect = (lastRecorded.DU_DOAN === actual);
+      const lastCode = lastRecorded.DU_DOAN_CODE || ((lastRecorded.DU_DOAN === 'Tài') ? 'T' : (lastRecorded.DU_DOAN === 'Xỉu' ? 'X' : null));
+      const wasCorrect = (lastCode === actual);
       lastRecorded.ketQua = actual;
       lastRecorded.trangThai = wasCorrect ? 'ĐÚNG' : 'SAI';
 
@@ -588,13 +623,16 @@ async function processGameTick(game) {
       } catch (e) {}
     }
 
-    const predictionValue = finalP >= 0.5 ? 'T' : 'X';
+    const predictionCode = finalP >= 0.5 ? 'T' : 'X';
+    const predictionLabel = labelFromTX(predictionCode);
+
     const newEntry = {
       phien: currentSession,
       phienDuDoan: currentSession + 1,
       xucXac: [Number(latest.FirstDice || 0), Number(latest.SecondDice || 0), Number(latest.ThirdDice || 0)],
       ketQua: itemToResult(latest),
-      DU_DOAN: predictionValue, // always output prediction
+      DU_DOAN_CODE: predictionCode,
+      DU_DOAN: predictionLabel, // visible in UI
       TI_LE: `${(Math.max(finalP, 1 - finalP) * 100).toFixed(1)}%${!gate.pass ? ' (LOW)' : ''}`,
       mauCau: (fvInfo.meta && fvInfo.meta.topPatterns) ? fvInfo.meta.topPatterns.map(p => p.pattern).slice(0, 6).join('; ') : 'Auto',
       trangThai: 'ĐANG CHỜ',
@@ -617,7 +655,6 @@ async function processGameTick(game) {
     if (db.history.length > MAX_HISTORY) db.history.splice(0, db.history.length - MAX_HISTORY);
 
     db.lastProcessedSession = currentSession;
-
     detectAndCorrectBias(db, game);
     maybeCheckpoint(db, game);
     saveDatabase(game, db);
@@ -660,12 +697,18 @@ app.get('/api/predict/:game', async (req, res) => {
     const pPattern = computePatternSignal(merged);
     const combined = combineSignals(db, pModel, pPattern, pMarkov);
     const calibrated = calibrate(db, logit);
-    const finalP = Math.min(Math.max(0.000001, 0.9 * calibrated + 0.1 * combined.p), 0.999999);
+
+    let finalP = Math.min(Math.max(0.000001, 0.9 * calibrated + 0.1 * combined.p), 0.999999);
+    finalP = debiasProbability(db, finalP, 200);
+
     const entropy = entropyFromProb(finalP);
     const gate = gatingDecision(finalP, entropy, { modelProb: pModel, patternProb: pPattern, markovProb: pMarkov });
+    const predCode = finalP >= 0.5 ? 'T' : 'X';
+    const predLabel = labelFromTX(predCode);
 
     return res.json({
-      prediction: finalP >= 0.5 ? 'T' : 'X',
+      predictionCode: predCode,
+      prediction: predLabel,
       finalP: Number(finalP.toFixed(4)),
       calibrated: Number(calibrated.toFixed(4)),
       modelProb: Number(pModel.toFixed(4)),
@@ -810,7 +853,7 @@ app.get('/:game', (req, res) => {
             ${rows.map(it => `
               <tr>
                 <td>${it.phienDuDoan}</td>
-                <td>${it.DU_DOAN === 'N/A' ? '<span style=\"color:#fbbf24;font-weight:bold\">N/A</span>' : '<b>' + it.DU_DOAN + '</b>'}</td>
+                <td><b>${it.DU_DOAN || 'Tài'}</b></td>
                 <td>${it.TI_LE}</td>
                 <td><small>${(it.mauCau || '')}</small></td>
                 <td>${it.ketQua || ''}</td>
