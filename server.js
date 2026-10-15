@@ -1,6 +1,6 @@
 /**
- * HỆ THỐNG PHÂN TÍCH & DỰ ĐOÁN TÀI XỈU / MD5 - HOÀNG VIP WIN ULTIMATE v5.0
- * Tích hợp: Thống kê chuỗi Thắng/Thua (Streak), Khung giờ hoạt động & Auto-Backup dữ liệu.
+ * HỆ THỐNG PHÂN TÍCH & DỰ ĐOÁN TÀI XỈU / MD5 - HOÀNG VIP WIN v5.1 (CHUẨN API THỰC TẾ)
+ * Ánh xạ chính xác các trường: SessionId, FirstDice, SecondDice, ThirdDice, DiceSum, BetSide
  */
 
 const express = require('express');
@@ -14,13 +14,12 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Cấu hình API 2 bàn chơi
+// Cấu hình API 2 bàn chơi chuẩn theo yêu cầu của bạn
 const APIS = {
     md5: 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau',
     taixiu: 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau'
 };
 
-// Cơ sở dữ liệu và file Backup riêng biệt cho từng bàn
 const DB_FILES = {
     md5: path.join(__dirname, 'db_md5.json'),
     taixiu: path.join(__dirname, 'db_taixiu.json')
@@ -37,38 +36,20 @@ function loadDatabase(gameType) {
 
     if (fs.existsSync(file)) {
         try {
-            const rawData = fs.readFileSync(file, 'utf8');
-            return JSON.parse(rawData);
+            return JSON.parse(fs.readFileSync(file, 'utf8'));
         } catch (e) {
-            console.error(`Lỗi đọc file database ${gameType}, đang thử khôi phục từ Backup...`, e);
             if (fs.existsSync(backupFile)) {
                 try {
-                    const backupData = fs.readFileSync(backupFile, 'utf8');
-                    return JSON.parse(backupData);
-                } catch (err) {
-                    console.error(`Khôi phục backup ${gameType} thất bại:`, err);
-                }
+                    return JSON.parse(fs.readFileSync(backupFile, 'utf8'));
+                } catch (err) {}
             }
         }
     }
     
-    // Cấu trúc khởi tạo ban đầu chuẩn v5.0 (Bổ sung Streak & TimeStats)
     return { 
         history: [], 
-        stats: { 
-            total: 0, 
-            wins: 0, 
-            losses: 0,
-            currentStreak: 0,       // >0 là chuỗi thắng, <0 là chuỗi thua
-            maxWinStreak: 0,        // Chuỗi thắng liên tiếp dài nhất
-            maxLossStreak: 0        // Chuỗi thua liên tiếp dài nhất
-        }, 
-        timeStats: {                // Thống kê hiệu suất theo khung giờ (Sáng, Chiều, Tối, Đêm)
-            Sang: { total: 0, wins: 0 },   // 06:00 - 12:00
-            Chieu: { total: 0, wins: 0 },  // 12:00 - 18:00
-            Toi: { total: 0, wins: 0 },    // 18:00 - 00:00
-            Dem: { total: 0, wins: 0 }     // 00:00 - 06:00
-        },
+        stats: { total: 0, wins: 0, losses: 0, currentStreak: 0, maxWinStreak: 0, maxLossStreak: 0 }, 
+        timeStats: { Sang: { total: 0, wins: 0 }, Chieu: { total: 0, wins: 0 }, Toi: { total: 0, wins: 0 }, Dem: { total: 0, wins: 0 } },
         lastProcessedSession: null 
     };
 }
@@ -76,17 +57,11 @@ function loadDatabase(gameType) {
 function saveDatabase(gameType, data) {
     const file = DB_FILES[gameType];
     const backupFile = BACKUP_FILES[gameType];
-
     const jsonData = JSON.stringify(data, null, 2);
-
-    // 1. Ghi dữ liệu chính
     fs.writeFileSync(file, jsonData, 'utf8');
-
-    // 2. Tự động tạo bản Backup an toàn mỗi khi lưu
     fs.writeFileSync(backupFile, jsonData, 'utf8');
 }
 
-// Hàm xác định khung giờ hiện tại để thống kê
 function getCurrentTimeSlot() {
     const hour = new Date().getHours();
     if (hour >= 6 && hour < 12) return 'Sang';
@@ -96,17 +71,20 @@ function getCurrentTimeSlot() {
 }
 
 /**
- * THUẬT TOÁN SOI CẦU SIÊU CẤP ULTIMATE (20+ MẪU CẦU)
+ * THUẬT TOÁN SOI CẦU SIÊU CẤP 20+ MẪU CẦU
  */
-function analyzePatternUltimate(dicesHistory) {
-    if (!dicesHistory || dicesHistory.length < 10) {
+function analyzePatternUltimate(historyList) {
+    if (!historyList || historyList.length < 10) {
         return { prediction: 'T', rate: '75.0%', pattern: 'Khởi tạo quét dải tần số' };
     }
 
-    const sequence = dicesHistory.map(item => {
-        if (typeof item === 'string') return item.toUpperCase();
-        const total = (item.dice1 || item.d1 || 0) + (item.dice2 || item.d2 || 0) + (item.dice3 || item.d3 || 0);
-        return total >= 11 ? 'T' : 'X';
+    // Chuyển đổi dữ liệu thô từ API (BetSide: 1 = Tài, 0 = Xỉu) thành chuỗi 'T' và 'X'
+    const sequence = historyList.map(item => {
+        if (item.BetSide !== undefined) {
+            return Number(item.BetSide) === 1 ? 'T' : 'X';
+        }
+        const sum = item.DiceSum || ((item.FirstDice || 0) + (item.SecondDice || 0) + (item.ThirdDice || 0));
+        return sum >= 11 ? 'T' : 'X';
     });
 
     const recentStr = sequence.slice(-20).join('');
@@ -164,36 +142,34 @@ function analyzePatternUltimate(dicesHistory) {
 }
 
 /**
- * HÀM XỬ LÝ CẬP NHẬT TỰ ĐỘNG CHO TỪNG BÀN (Tích hợp Streak & TimeStats)
+ * XỬ LÝ CRON-JOB QUÉT API ĐỒNG BỘ MỖI 5 GIÂY
  */
 async function processGameTick(game) {
     try {
         const response = await axios.get(APIS[game], { timeout: 8000 });
-        const apiData = response.data;
-        const historyList = Array.isArray(apiData) ? apiData : (apiData.data || apiData.list || []);
+        const historyList = Array.isArray(response.data) ? response.data : (response.data.data || response.data.list || []);
 
         if (historyList.length === 0) return;
 
+        // Lấy phiên mới nhất từ SessionId trong API thực tế
         const latestItem = historyList[historyList.length - 1];
-        const currentSession = latestItem.session || latestItem.phien || (Number(latestItem.id || 0) + 1);
+        const currentSession = Number(latestItem.SessionId || latestItem.session || 0);
 
         let db = loadDatabase(game);
 
         if (db.lastProcessedSession !== currentSession) {
-            const d1 = latestItem.dice1 || latestItem.d1 || 1;
-            const d2 = latestItem.dice2 || latestItem.d2 || 1;
-            const d3 = latestItem.dice3 || latestItem.d3 || 1;
-            const totalScore = d1 + d2 + d3;
-            const actualResult = totalScore >= 11 ? 'T' : 'X';
+            const d1 = Number(latestItem.FirstDice || 1);
+            const d2 = Number(latestItem.SecondDice || 1);
+            const d3 = Number(latestItem.ThirdDice || 1);
+            const actualResult = (latestItem.BetSide !== undefined) ? (Number(latestItem.BetSide) === 1 ? 'T' : 'X') : ((latestItem.DiceSum >= 11) ? 'T' : 'X');
 
-            // 1. Chấm điểm dự đoán của phiên trước và cập nhật Streak / TimeStats
+            // 1. Chấm điểm dự đoán phiên trước
             const lastRecorded = db.history[db.history.length - 1];
-            if (lastRecorded && lastRecorded.phiênDuDoan == currentSession) {
+            if (lastRecorded && Number(lastRecorded.phiênDuDoan) === currentSession) {
                 const isCorrect = (lastRecorded.DU_DOAN === actualResult);
                 lastRecorded.ketQua = actualResult;
                 lastRecorded.trangThai = isCorrect ? 'ĐÚNG' : 'SAI';
 
-                // Cập nhật Thống kê Tổng & Khung giờ
                 db.stats.total++;
                 const currentSlot = getCurrentTimeSlot();
                 if (!db.timeStats[currentSlot]) db.timeStats[currentSlot] = { total: 0, wins: 0 };
@@ -202,35 +178,19 @@ async function processGameTick(game) {
                 if (isCorrect) {
                     db.stats.wins++;
                     db.timeStats[currentSlot].wins++;
-
-                    // Xử lý chuỗi Thắng (Streak Thắng)
-                    if (db.stats.currentStreak >= 0) {
-                        db.stats.currentStreak++;
-                    } else {
-                        db.stats.currentStreak = 1;
-                    }
-                    if (db.stats.currentStreak > db.stats.maxWinStreak) {
-                        db.stats.maxWinStreak = db.stats.currentStreak;
-                    }
+                    db.stats.currentStreak = db.stats.currentStreak >= 0 ? db.stats.currentStreak + 1 : 1;
+                    if (db.stats.currentStreak > db.stats.maxWinStreak) db.stats.maxWinStreak = db.stats.currentStreak;
                 } else {
                     db.stats.losses++;
-
-                    // Xử lý chuỗi Thua (Streak Thua)
-                    if (db.stats.currentStreak <= 0) {
-                        db.stats.currentStreak--;
-                    } else {
-                        db.stats.currentStreak = -1;
-                    }
+                    db.stats.currentStreak = db.stats.currentStreak <= 0 ? db.stats.currentStreak - 1 : -1;
                     const absLoss = Math.abs(db.stats.currentStreak);
-                    if (absLoss > db.stats.maxLossStreak) {
-                        db.stats.maxLossStreak = absLoss;
-                    }
+                    if (absLoss > db.stats.maxLossStreak) db.stats.maxLossStreak = absLoss;
                 }
             }
 
-            // 2. Chạy thuật toán dự đoán cho phiên tiếp theo
+            // 2. Chạy thuật toán dự đoán phiên tiếp theo
             const analysis = analyzePatternUltimate(historyList);
-            const predictedSession = Number(currentSession) + 1;
+            const predictedSession = currentSession + 1;
 
             const newPredictionEntry = {
                 PHIÊN: currentSession,
@@ -248,21 +208,21 @@ async function processGameTick(game) {
 
             db.lastProcessedSession = currentSession;
             saveDatabase(game, db);
-            console.log(`[AUTO-CRON v5.0] Bàn ${game.toUpperCase()} - Phiên: ${currentSession} | Dự đoán phiên sau (${predictedSession}): ${analysis.prediction} (${analysis.rate}) | Streak: ${db.stats.currentStreak}`);
+            console.log(`[HOÀNG VIP WIN] Bàn ${game.toUpperCase()} - Phiên: ${currentSession} | Dự đoán phiên sau (${predictedSession}): ${analysis.prediction} (${analysis.rate})`);
         }
     } catch (error) {
-        console.error(`[AUTO-CRON ERROR] Bàn ${game}:`, error.message);
+        console.error(`[LỖI API ${game.toUpperCase()}]`, error.message);
     }
 }
 
-// Vòng lặp Cron-Job tự động quét mỗi 5 giây
+// Chạy Cron-Job mỗi 5 giây
 setInterval(() => {
     processGameTick('md5');
     processGameTick('taixiu');
 }, 5000);
 
 /**
- * API ENDPOINT TRẢ VỀ JSON KẾT QUẢ GỌN GÀNG (ĐÃ BỔ SUNG STREAK & TIMESTATS)
+ * API TRẢ VỀ JSON GỌN GÀNG ĐÚNG CHUẨN YÊU CẦU
  */
 app.get('/api/analyze/:game', (req, res) => {
     const game = req.params.game;
@@ -275,7 +235,7 @@ app.get('/api/analyze/:game', (req, res) => {
 
     return res.json({
         bànChơi: game.toUpperCase(),
-        hệThống: "HOÀNG VIP WIN ULTIMATE v5.0 (STREAK & AUTO-BACKUP)",
+        hệThống: "HOÀNG VIP WIN v5.1 (API THỰC TẾ)",
         phânTíchMớiNhiệt: {
             PHIÊN: latestEntry.PHIÊN || 0,
             "Xúc xắc": latestEntry.xucXac || [0, 0, 0],
@@ -295,12 +255,11 @@ app.get('/api/analyze/:game', (req, res) => {
         thốngKêTổngQuan: {
             ...db.stats,
             tiLeThang: db.stats.total > 0 ? ((db.stats.wins / db.stats.total) * 100).toFixed(2) + '%' : '0%'
-        },
-        thongKeKhungGio: db.timeStats
+        }
     });
 });
 
-// Giao diện Web Dashboard trực quan hiển thị Streak & Khung giờ
+// Dashboard Web
 app.get('/:game', (req, res) => {
     const game = req.params.game;
     if (!DB_FILES[game]) return res.send('Trang không tồn tại. Dùng /md5 hoặc /taixiu');
@@ -310,7 +269,7 @@ app.get('/:game', (req, res) => {
     res.send(`
         <html>
         <head>
-            <title>HOÀNG VIP WIN v5.0 - ${game.toUpperCase()}</title>
+            <title>HOÀNG VIP WIN v5.1 - ${game.toUpperCase()}</title>
             <meta charset="utf-8">
             <style>
                 body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #050811; color: #f1f5f9; padding: 20px; }
@@ -322,43 +281,22 @@ app.get('/:game', (req, res) => {
                 .dung { color: #4ade80; font-weight: bold; }
                 .sai { color: #f87171; font-weight: bold; }
                 .btn { display: inline-block; padding: 10px 20px; background: #0284c7; color: white; text-decoration: none; border-radius: 6px; margin-right: 10px; font-weight: bold; }
-                .btn:hover { background: #0369a1; }
-                .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
             </style>
-            <script>
-                setTimeout(() => { window.location.reload(); }, 10000);
-            </script>
+            <script>setTimeout(() => { window.location.reload(); }, 10000);</script>
         </head>
         <body>
-            <h1>HOÀNG VIP WIN v5.0 - BÀN: ${game.toUpperCase()}</h1>
+            <h1>HOÀNG VIP WIN v5.1 - BÀN: ${game.toUpperCase()}</h1>
             <div style="text-align:center; margin-bottom: 20px;">
-                <a href="/md5" class="btn">Bàn MD5 v5.0</a>
-                <a href="/taixiu" class="btn">Bàn Tài Xỉu v5.0</a>
+                <a href="/md5" class="btn">Bàn MD5 Pro</a>
+                <a href="/taixiu" class="btn">Bàn Tài Xỉu Pro</a>
             </div>
-            
-            <div class="grid">
-                <div class="box">
-                    <h3>📊 Thống Kê Hiệu Suất & Streak</h3>
-                    <p>Tổng phiên soi: <b>${db.stats.total}</b> | Thắng: <b style="color:#4ade80">${db.stats.wins}</b> | Thua: <b style="color:#f87171">${db.stats.losses}</b></p>
-                    <p>Tỷ lệ chính xác: <b>${winRate}%</b></p>
-                    <hr style="border-color:#334155; margin:15px 0;">
-                    <p>Chuỗi hiện tại (Streak): <b style="color:${db.stats.currentStreak >= 0 ? '#4ade80' : '#f87171'}">${db.stats.currentStreak >= 0 ? '+' + db.stats.currentStreak + ' Thắng' : db.stats.currentStreak + ' Thua'}</b></p>
-                    <p>Chuỗi thắng dài nhất (Max Win): <b style="color:#4ade80">${db.stats.maxWinStreak} tay</b></p>
-                    <p>Chuỗi thua dài nhất (Max Loss): <b style="color:#f87171">${db.stats.maxLossStreak} tay</b></p>
-                </div>
-                
-                <div class="box">
-                    <h3>🕒 Hiệu Suất Theo Khung Giờ</h3>
-                    <p>Sáng (06h - 12h): <b>${db.timeStats.Sang.wins}/${db.timeStats.Sang.total}</b></p>
-                    <p>Chiều (12h - 18h): <b>${db.timeStats.Chieu.wins}/${db.timeStats.Chieu.total}</b></p>
-                    <p>Tối (18h - 00h): <b>${db.timeStats.Toi.wins}/${db.timeStats.Toi.total}</b></p>
-                    <p>Đêm (00h - 06h): <b>${db.timeStats.Dem.wins}/${db.timeStats.Dem.total}</b></p>
-                    <p style="font-size: 12px; color: #94a3b8; margin-top: 10px;">🛡️ Auto-Backup: Đã kích hoạt lưu trữ an toàn chống mất dữ liệu.</p>
-                </div>
-            </div>
-
             <div class="box">
-                <h3>📜 Nhật Ký Dự Đoán Gần Nhất</h3>
+                <h3>📊 Thống Kê Hiệu Suất Trực Tuyến</h3>
+                <p>Tổng phiên: <b>${db.stats.total}</b> | Thắng: <b style="color:#4ade80">${db.stats.wins}</b> | Thua: <b style="color:#f87171">${db.stats.losses}</b> | Tỷ lệ: <b>${winRate}%</b></p>
+                <p>Streak: <b style="color:${db.stats.currentStreak >= 0 ? '#4ade80' : '#f87171'}">${db.stats.currentStreak}</b> | Max Win: <b style="color:#4ade80">${db.stats.maxWinStreak}</b> | Max Loss: <b style="color:#f87171">${db.stats.maxLossStreak}</b></p>
+            </div>
+            <div class="box">
+                <h3>📜 Nhật Ký Dự Đoán & Đúng/Sai</h3>
                 <table>
                     <tr>
                         <th>Phiên Dự Đoán</th>
@@ -384,16 +322,9 @@ app.get('/:game', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send(`
-        <h2>Hệ Thống API Soi Cầu HOÀNG VIP WIN v5.0 (Streak & Auto-Backup)</h2>
-        <p>Chọn bàn để xem trực tiếp:</p>
-        <ul>
-            <li><a href="/md5">Bàn MD5 Dashboard</a> -> API: <code>/api/analyze/md5</code></li>
-            <li><a href="/taixiu">Bàn Tài Xỉu Dashboard</a> -> API: <code>/api/analyze/taixiu</code></li>
-        </ul>
-    `);
+    res.send(`<h2>Hệ Thống API Soi Cầu HOÀNG VIP WIN v5.1</h2><ul><li><a href="/md5">Bàn MD5</a></li><li><a href="/taixiu">Bàn Tài Xỉu</a></li></ul>`);
 });
 
 app.listen(PORT, () => {
-    console.log(`Server HOÀNG VIP WIN v5.0 đang chạy tại cổng ${PORT}`);
+    console.log(`Server HOÀNG VIP WIN v5.1 đang chạy tại cổng ${PORT}`);
 });
