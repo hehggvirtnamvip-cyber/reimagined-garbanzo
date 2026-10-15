@@ -5,10 +5,11 @@
  * - Luôn dự đoán Tài/Xỉu (không hiển thị T/X ở UI)
  * - Không thiên vị Tài hay Xỉu (bias guard + debias)
  * - Online adaptive model: Pattern miner + Markov + Multi-alpha EWMA + Logistic
- * - Gating: còn metadata gate nếu low-confidence
+ * - Gating: metadata gate nếu low-confidence
  * - Persistence JSON + backup
  * - Polling + retry + admin endpoints
  * - UI simple /md5 /taixiu
+ * - API history: /api/history/:game?limit=100 and /api/history/export/:game
  *
  * Run:
  *  npm i express axios
@@ -115,7 +116,7 @@ function defaultDB() {
     ensembleWeights: { model: 0.34, pattern: 0.33, markov: 0.33 },
     checkpoints: [],
     biasCorrections: [],
-    _strictUnbiased: true // default on, so it's neutral by design
+    _strictUnbiased: true // default on to avoid bias
   };
 }
 function loadDatabase(game) {
@@ -439,7 +440,7 @@ function gatingDecision(calibratedProb, entropy, comps) {
   return { pass: true, reason: 'ok', agree };
 }
 
-// ---------- Bias detection & self-correction ----------
+// ---------- Bias detection ----------
 function detectAndCorrectBias(db, game) {
   try {
     const LOOK = 60;
@@ -475,7 +476,7 @@ function detectAndCorrectBias(db, game) {
   } catch (err) {}
 }
 
-// ---------- checkpoint ----------
+// ---------- Checkpointing ----------
 function maybeCheckpoint(db, game) {
   const window = Math.max(20, Math.min(200, Math.floor(MAX_HISTORY / 2)));
   const completed = db.history.filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI');
@@ -523,7 +524,7 @@ function backtest(db) {
   return { accuracy: total ? (correct / total) : 0, total, correct };
 }
 
-// ---------- fetch ----------
+// ---------- Fetch ----------
 async function fetchWithRetry(url, attempts = 2) {
   for (let i = 0; i < attempts; i++) {
     try {
@@ -632,7 +633,7 @@ async function processGameTick(game) {
       xucXac: [Number(latest.FirstDice || 0), Number(latest.SecondDice || 0), Number(latest.ThirdDice || 0)],
       ketQua: itemToResult(latest),
       DU_DOAN_CODE: predictionCode,
-      DU_DOAN: predictionLabel, // visible in UI
+      DU_DOAN: predictionLabel,
       TI_LE: `${(Math.max(finalP, 1 - finalP) * 100).toFixed(1)}%${!gate.pass ? ' (LOW)' : ''}`,
       mauCau: (fvInfo.meta && fvInfo.meta.topPatterns) ? fvInfo.meta.topPatterns.map(p => p.pattern).slice(0, 6).join('; ') : 'Auto',
       trangThai: 'ĐANG CHỜ',
@@ -653,8 +654,8 @@ async function processGameTick(game) {
 
     db.history.push(newEntry);
     if (db.history.length > MAX_HISTORY) db.history.splice(0, db.history.length - MAX_HISTORY);
-
     db.lastProcessedSession = currentSession;
+
     detectAndCorrectBias(db, game);
     maybeCheckpoint(db, game);
     saveDatabase(game, db);
@@ -755,6 +756,54 @@ app.get('/api/export/:game', (req, res) => {
   res.send(csv);
 });
 
+// -------------------- New: History JSON APIs --------------------
+app.get('/api/history/:game', (req, res) => {
+  const game = req.params.game;
+  if (!DB_FILES[game]) return res.status(400).json({ error: 'Bàn chơi không hợp lệ.' });
+  const db = loadDatabase(game);
+  const limit = Math.max(1, Math.min(2000, Number(req.query.limit) || 200));
+  const slice = db.history.slice(-limit).reverse();
+
+  const items = slice.map(it => ({
+    phien: it.phien,
+    phienDuDoan: it.phienDuDoan,
+    xucXac: Array.isArray(it.xucXac) ? it.xucXac : [],
+    ketQua: it.ketQua || null,
+    duDoan: it.DU_DOAN || null,
+    tiLe: it.TI_LE || null,
+    createdAt: (it.meta && it.meta.createdAt) || null
+  }));
+
+  return res.json({ game, count: items.length, items });
+});
+
+app.get('/api/history/export/:game', (req, res) => {
+  const game = req.params.game;
+  if (!DB_FILES[game]) return res.status(400).send('Bàn chơi không hợp lệ.');
+  const db = loadDatabase(game);
+  const exportObj = {
+    game,
+    exportedAt: now(),
+    history: db.history.map(it => ({
+      phien: it.phien,
+      phienDuDoan: it.phienDuDoan,
+      xucXac: it.xucXac || [],
+      ketQua: it.ketQua || null,
+      duDoan: it.DU_DOAN || null,
+      duDoanCode: it.DU_DOAN_CODE || (it.DU_DOAN === 'Tài' ? 'T' : (it.DU_DOAN === 'Xỉu' ? 'X' : null)),
+      tiLe: it.TI_LE || null,
+      trangThai: it.trangThai || null,
+      meta: it.meta || {}
+    }))
+  };
+
+  const fname = `history_${game}_${(new Date()).toISOString().replace(/[:.]/g, '-')}.json`;
+  res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+  res.setHeader('Content-Type', 'application/json');
+  return res.send(JSON.stringify(exportObj, null, 2));
+});
+
+// ---------- Admin routes ----------
 app.get('/admin/patterns/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
