@@ -1,16 +1,22 @@
 /**
- * server.js — FULL FIX
+ * server.js — FULL FIX (robust parsing, force-tick, redirects, APIs)
  *
- * - Robust upstream parsing (array / text / newline JSON objects)
- * - Force-tick endpoint: POST /admin/force-tick/:game
- * - Always write DU_DOAN (code + label)
- * - /api/predict returns prediction immediately (ignores gate blocking output)
- * - /api/simple returns latest; if none, triggers immediate tick
- * - Logging improvements
+ * Usage:
+ *  npm i express axios
+ *  node server.js
  *
- * Run:
- *   npm i express axios
- *   node server.js
+ * Endpoints:
+ *  GET  /md5 -> redirect to /api/simple/md5
+ *  GET  /taixiu -> redirect to /api/simple/taixiu
+ *  GET  /api/simple/:game  -> { phien, tong, ketQua, phienDuDoan, duDoan, tiLe }
+ *  GET  /api/predict/:game -> detailed prediction & meta (computes on-demand)
+ *  GET  /api/history/:game -> JSON history
+ *  POST /admin/force-tick/:game -> force one tick now
+ *  POST /admin/reset-model/:game -> reset model
+ *  POST /admin/config/:game -> quick config
+ *  GET  /admin/db/:game -> db summary
+ *
+ * The file is single-file, persistent via JSON in same dir.
  */
 
 'use strict';
@@ -24,7 +30,7 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --------- Config ---------
+// ---------- Config ----------
 const PORT = Number(process.env.PORT || 3000);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
 const MAX_HISTORY = Number(process.env.MAX_HISTORY || 600);
@@ -41,14 +47,14 @@ if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 const DB_FILES = { md5: path.join(DB_DIR, 'db_md5.json'), taixiu: path.join(DB_DIR, 'db_taixiu.json') };
 const BACKUP_FILES = { md5: path.join(DB_DIR, 'backup_db_md5.json'), taixiu: path.join(DB_DIR, 'backup_db_taixiu.json') };
 
-// thresholds tuned to reduce LOW labels
+// thresholds tuned to be permissive by default
 let CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 0.55);
 let ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 0.95);
 
-// learning defaults (keep conservative)
+// learning defaults (conservative)
 let LR_LEARNING_RATE = Number(process.env.LR_LEARNING_RATE || 0.11);
 const LR_REGULARIZATION = Number(process.env.LR_REGULARIZATION || 1e-4);
-const ENSEMBLE_ETA = Number(process.env.ENSEMBLE_ETA || 0.08);
+let ENSEMBLE_ETA = Number(process.env.ENSEMBLE_ETA || 0.08);
 
 const MARKOV_MAX_ORDER = Number(process.env.MARKOV_MAX_ORDER || 3);
 const PATTERN_TOP_N = Number(process.env.PATTERN_TOP_N || 30);
@@ -58,14 +64,14 @@ const PATTERN_MAX_LEN = Number(process.env.PATTERN_MAX_LEN || 10);
 const CALIBRATION_LR = Number(process.env.CALIBRATION_LR || 0.02);
 const GRAD_CLIP = Number(process.env.GRAD_CLIP || 5.0);
 
-// --------- Helpers ---------
+// ---------- Helpers ----------
 function now() { return new Date().toISOString(); }
 function safeReadJson(file, fallback = null) {
   try {
     if (!fs.existsSync(file)) return fallback;
     return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch (e) {
-    console.warn('safeReadJson error', file, e.message);
+    console.warn('safeReadJson error', file, e && e.message);
     return fallback;
   }
 }
@@ -75,7 +81,7 @@ function safeWriteJson(file, obj) {
     fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
     fs.renameSync(tmp, file);
   } catch (e) {
-    console.error('safeWriteJson error', file, e.message);
+    console.error('safeWriteJson error', file, e && e.message);
   }
 }
 function sigmoid(z) { return 1 / (1 + Math.exp(-z)); }
@@ -83,14 +89,10 @@ function entropyFromProb(p) {
   const eps = 1e-12;
   return -(p * Math.log(p + eps) + (1 - p) * Math.log(1 - p + eps));
 }
-function labelFromCode(code) {
-  if (code === 'T') return 'Tài';
-  if (code === 'X') return 'Xỉu';
-  return code;
-}
 function clamp(x, a = 1e-6, b = 1 - 1e-6) { return Math.min(Math.max(x, a), b); }
+function labelFromCode(c) { if (c === 'T') return 'Tài'; if (c === 'X') return 'Xỉu'; return c; }
 
-// --------- DB ---------
+// ---------- DB ----------
 function defaultDB() {
   return {
     history: [],
@@ -119,16 +121,12 @@ function saveDB(game, db) {
   safeWriteJson(BACKUP_FILES[game], db);
 }
 
-// --------- Robust upstream parsing ---------
-// Accepts response.data (could be array, object, string containing array or newline JSON objects)
+// ---------- Robust parsing of upstream ----------
 function parseUpstreamData(raw) {
   if (!raw) return [];
-  // If already array
   if (Array.isArray(raw)) return raw;
-  // If object
   if (typeof raw === 'object') return [raw];
 
-  // raw is string -> try JSON.parse
   if (typeof raw === 'string') {
     const s = raw.trim();
     // try parse as JSON array/object
@@ -137,33 +135,32 @@ function parseUpstreamData(raw) {
       if (Array.isArray(j)) return j;
       if (typeof j === 'object') return [j];
     } catch (e) {
-      // not a single json; attempt to extract {...} objects via regex
+      // fallback: extract {...} occurrences
       const objs = [];
-      // match sequences like {"SessionId":...}
       const re = /{[^}]*}/g;
       let m;
       while ((m = re.exec(s)) !== null) {
         try {
-          const candidate = m[0];
-          const parsed = JSON.parse(candidate);
+          const parsed = JSON.parse(m[0]);
           objs.push(parsed);
         } catch (err) {
-          // skip malformed segment
+          // skip
         }
       }
-      // If found items, return them
       if (objs.length) return objs;
 
-      // As last resort, split by newlines and try parse each line
+      // final fallback: split by lines and parse each
       const lines = s.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
       for (const line of lines) {
         try {
           const p = JSON.parse(line);
           if (p) objs.push(p);
-        } catch (err) {
-          // try to trim trailing commas
-          const trimmed = line.replace(/,$/, '');
-          try { const p2 = JSON.parse(trimmed); if (p2) objs.push(p2); } catch (_) {}
+        } catch (_) {
+          const t = line.replace(/,$/, '');
+          try {
+            const p2 = JSON.parse(t);
+            if (p2) objs.push(p2);
+          } catch (_) {}
         }
       }
       if (objs.length) return objs;
@@ -172,40 +169,35 @@ function parseUpstreamData(raw) {
   return [];
 }
 
-// --------- Minimal feature & model (kept simple but stable) ---------
+// ---------- Minimal feature/model ----------
 function itemToResult(item) {
   if (!item) return null;
   if (item.BetSide !== undefined) return Number(item.BetSide) === 1 ? 'T' : 'X';
-  // compute sum from dice fields if present
   const first = Number(item.FirstDice || item.First || item.first || 0);
   const second = Number(item.SecondDice || item.Second || item.second || 0);
   const third = Number(item.ThirdDice || item.Third || item.third || 0);
-  const diceSum = Number(item.DiceSum || item.DiceSum === 0 ? item.DiceSum : (first + second + third));
-  const sum = Number(diceSum || (first + second + third));
+  const providedSum = (item.DiceSum !== undefined) ? Number(item.DiceSum) : null;
+  const sum = providedSum !== null ? providedSum : (first + second + third);
   return sum >= 11 ? 'T' : 'X';
 }
 
-// Very small feature builder (keeps model stable)
 function buildSimpleFV(sequence) {
-  // returns feature vector: [bias, last1, last2, ewma_short]
   const f = [];
   f.push(1.0);
   const n = sequence.length;
-  const last1 = n >= 1 ? (sequence[n - 1] === 'T' ? 1 : 0) : 0;
-  const last2 = n >= 2 ? (sequence[n - 2] === 'T' ? 1 : 0) : 0;
-  f.push(last1, last2);
-  // ewma over last 20
-  let alpha = 0.2, ewma = 0;
+  f.push(n >= 1 ? (sequence[n - 1] === 'T' ? 1 : 0) : 0);
+  f.push(n >= 2 ? (sequence[n - 2] === 'T' ? 1 : 0) : 0);
+  let ewma = 0;
+  const alpha = 0.2;
   const tail = sequence.slice(-20);
   for (const s of tail) {
-    const v = s === 'T' ? 1 : 0;
-    ewma = alpha * v + (1 - alpha) * ewma;
+    ewma = alpha * (s === 'T' ? 1 : 0) + (1 - alpha) * ewma;
   }
   f.push(ewma);
   return f;
 }
 
-function initModel(db, dim) {
+function initModelIfNeeded(db, dim) {
   db.model = db.model || {};
   if (!db.model.weights || db.model.weights.length !== dim) {
     db.model.weights = Array(dim).fill(0).map(() => (Math.random() - 0.5) * 0.02);
@@ -214,16 +206,16 @@ function initModel(db, dim) {
   }
 }
 function predictLogit(db, fv) {
-  initModel(db, fv.length);
+  initModelIfNeeded(db, fv.length);
   let z = db.model.bias || 0;
   for (let i = 0; i < fv.length; i++) z += (db.model.weights[i] || 0) * fv[i];
   return z;
 }
-function sgdUpdate(db, fv, label) {
-  initModel(db, fv.length);
+function sgdUpdate(db, fv, labelT) {
+  initModelIfNeeded(db, fv.length);
   const z = predictLogit(db, fv);
   const p = sigmoid(z);
-  const err = label - p;
+  const err = labelT - p;
   db.model.iter = (db.model.iter || 0) + 1;
   const adapt = 1 / Math.sqrt(1 + db.model.iter / 1000);
   const lr = LR_LEARNING_RATE * adapt;
@@ -235,110 +227,83 @@ function sgdUpdate(db, fv, label) {
   return { p, err };
 }
 
-// ensemble combine (simple average weighted)
 function combineProbs(db, modelP, patternP = 0.5, markovP = 0.5) {
   const w = db.ensembleWeights || { model: 0.5, pattern: 0.25, markov: 0.25 };
   const raw = (w.model * modelP) + (w.pattern * patternP) + (w.markov * markovP);
   return clamp(raw);
 }
 
-// --------- Core tick logic with robust parse ---------
+// ---------- Core tick ----------
 const axiosInstance = axios.create({ timeout: API_TIMEOUT_MS });
 
 async function processGameTick(game) {
   try {
     const api = APIS[game];
-    if (!api) {
-      console.warn('No API for game', game);
-      return;
-    }
+    if (!api) return;
 
     const resp = await axiosInstance.get(api);
     const parsed = parseUpstreamData(resp.data);
-
     if (!parsed || parsed.length === 0) {
       console.warn(`[${game}] upstream returned no parsable records`);
       return;
     }
 
-    // Ensure these parsed items are ordered oldest->newest if possible.
-    // We'll use the array as given; upstream seems to return chronological list.
     const db = loadDB(game);
 
-    // determine latest session id from upstream
     const lastItem = parsed[parsed.length - 1];
-    const sessionId = Number(lastItem.SessionId || lastItem.session || 0);
-    if (!sessionId) {
-      console.warn(`[${game}] couldn't determine session id from upstream item`);
-    }
+    const sessionId = Number(lastItem.SessionId || lastItem.session || 0) || null;
 
-    // If already processed, skip
-    if (db.lastProcessedSession && sessionId && Number(db.lastProcessedSession) === sessionId) {
+    if (sessionId && db.lastProcessedSession && Number(db.lastProcessedSession) === sessionId) {
       // nothing new
       return;
     }
 
-    // Build sequence from parsed (last MAX_HISTORY results)
     const seq = parsed.slice(-MAX_HISTORY).map(itemToResult).filter(Boolean);
-
-    // Build feature vector
     const fv = buildSimpleFV(seq);
-    const dbLocal = db;
 
-    // Model predict
-    initModel(dbLocal, fv.length);
-    const logit = predictLogit(dbLocal, fv);
+    initModelIfNeeded(db, fv.length);
+    const logit = predictLogit(db, fv);
     const modelP = sigmoid(logit);
 
-    // Very small markov: use last two items
+    // simple markov & pattern signals
     let markovP = 0.5;
     if (seq.length >= 2) {
-      const last = seq.slice(-2).join('');
-      // quick simple counts in parsed history
-      let t = 0, total = 0;
+      const last2 = seq.slice(-2).join('');
+      let t = 0, tot = 0;
       for (let i = 0; i + 2 < seq.length; i++) {
-        if (seq.slice(i, i + 2).join('') === last) {
-          total++;
+        if (seq.slice(i, i + 2).join('') === last2) {
+          tot++;
           if (seq[i + 2] === 'T') t++;
         }
       }
-      if (total > 0) markovP = (t + 1) / (total + 2);
+      if (tot > 0) markovP = (t + 1) / (tot + 2);
     }
 
-    // pattern signal: simple frequent last-3 pattern check
     let patternP = 0.5;
     if (seq.length >= 3) {
-      const tail = seq.slice(-3).join('');
-      let t = 0, total = 0;
+      const tail3 = seq.slice(-3).join('');
+      let t = 0, tot = 0;
       for (let i = 0; i + 3 < seq.length; i++) {
-        if (seq.slice(i, i + 3).join('') === tail) {
-          total++;
+        if (seq.slice(i, i + 3).join('') === tail3) {
+          tot++;
           if (seq[i + 3] === 'T') t++;
         }
       }
-      if (total > 0) patternP = (t + 1) / (total + 2);
+      if (tot > 0) patternP = (t + 1) / (tot + 2);
     }
 
-    // combine
-    const combinedRaw = combineProbs(dbLocal, modelP, patternP, markovP);
-
-    // calibrate (very simple)
+    const combinedRaw = combineProbs(db, modelP, patternP, markovP);
     const calibrated = clamp(0.9 * combinedRaw + 0.1 * modelP);
-
-    // final prob
-    let finalP = calibrated;
+    const finalP = calibrated;
     const entropy = entropyFromProb(finalP);
-
-    // gating decision (kept for metadata but will not block output)
     const gatePass = (calibrated >= CONFIDENCE_THRESHOLD && entropy <= ENTROPY_THRESHOLD);
 
     const predictionCode = finalP >= 0.5 ? 'T' : 'X';
     const predictionLabel = labelFromCode(predictionCode);
 
-    // Create entry and ALWAYS write DU_DOAN
     const newEntry = {
-      phien: sessionId || (dbLocal.history.length ? (dbLocal.history[dbLocal.history.length - 1].phien + 1) : null),
-      phienDuDoan: (sessionId ? sessionId + 1 : null),
+      phien: sessionId || (db.history.length ? (db.history[db.history.length - 1].phien + 1) : null),
+      phienDuDoan: sessionId ? sessionId + 1 : null,
       xucXac: [
         Number(lastItem.FirstDice || lastItem.First || lastItem.first || 0),
         Number(lastItem.SecondDice || lastItem.Second || lastItem.second || 0),
@@ -348,7 +313,7 @@ async function processGameTick(game) {
       DU_DOAN_CODE: predictionCode,
       DU_DOAN: predictionLabel,
       TI_LE: `${(Math.max(finalP, 1 - finalP) * 100).toFixed(1)}%${!gatePass ? ' (LOW)' : ''}`,
-      mauCau: '', // optional pattern summary
+      mauCau: '',
       trangThai: 'ĐANG CHỜ',
       meta: {
         sourceCount: parsed.length,
@@ -363,58 +328,53 @@ async function processGameTick(game) {
       }
     };
 
-    // Save previous entry's result if it exists and matches session (i.e., fill ketQua/trangThai)
-    const lastRecorded = dbLocal.history[dbLocal.history.length - 1];
+    // fill previous pending entry if exists
+    const lastRecorded = db.history[db.history.length - 1];
     if (lastRecorded && lastRecorded.phienDuDoan && lastRecorded.phienDuDoan === newEntry.phien) {
-      // fill final result for lastRecorded using lastItem (we have actual result)
       const actual = newEntry.ketQua;
       const lastCode = lastRecorded.DU_DOAN_CODE || (lastRecorded.DU_DOAN === 'Tài' ? 'T' : (lastRecorded.DU_DOAN === 'Xỉu' ? 'X' : null));
       const wasCorrect = lastCode === actual;
       lastRecorded.ketQua = actual;
       lastRecorded.trangThai = wasCorrect ? 'ĐÚNG' : 'SAI';
+      db.stats.total = (db.stats.total || 0) + 1;
+      if (wasCorrect) db.stats.wins = (db.stats.wins || 0) + 1;
+      else db.stats.losses = (db.stats.losses || 0) + 1;
 
-      // update stats
-      dbLocal.stats.total = (dbLocal.stats.total || 0) + 1;
-      if (wasCorrect) dbLocal.stats.wins = (dbLocal.stats.wins || 0) + 1;
-      else dbLocal.stats.losses = (dbLocal.stats.losses || 0) + 1;
-
-      // online update model using lastRecorded.meta.featureVector if present
+      // update model on stored fv if present
       try {
         if (lastRecorded.meta && Array.isArray(lastRecorded.meta.featureVector)) {
           const storedFV = lastRecorded.meta.featureVector;
           const labelT = actual === 'T' ? 1 : 0;
-          sgdUpdate(dbLocal, storedFV, labelT);
+          sgdUpdate(db, storedFV, labelT);
         }
       } catch (e) {
-        console.warn('model update error', e.message);
+        console.warn('model update error', e && e.message);
       }
     }
 
-    // attach current feature vector for future update
     newEntry.meta.featureVector = fv;
-    dbLocal.history.push(newEntry);
-    if (dbLocal.history.length > MAX_HISTORY) dbLocal.history.splice(0, dbLocal.history.length - MAX_HISTORY);
+    db.history.push(newEntry);
+    if (db.history.length > MAX_HISTORY) db.history.splice(0, db.history.length - MAX_HISTORY);
 
-    dbLocal.lastProcessedSession = sessionId || dbLocal.lastProcessedSession;
-    dbLocal.metaEvents = dbLocal.metaEvents || [];
-    dbLocal.metaEvents.push({ at: now(), type: 'tick', sessionId, prediction: predictionCode, gatePass });
+    db.lastProcessedSession = sessionId || db.lastProcessedSession;
+    db.metaEvents = db.metaEvents || [];
+    db.metaEvents.push({ at: now(), type: 'tick', sessionId, prediction: predictionCode, gatePass });
 
-    saveDB(game, dbLocal);
+    saveDB(game, db);
 
-    console.log(`[${game}] tick processed session=${sessionId} pred=${predictionCode} p=${(finalP).toFixed(4)} gate=${gatePass}`);
-    return;
+    console.log(`[${game}] tick session=${sessionId} pred=${predictionCode} p=${finalP.toFixed(4)} gate=${gatePass}`);
   } catch (err) {
     console.error('processGameTick error', err && err.message ? err.message : err);
     throw err;
   }
 }
 
-// --------- Polling ---------
+// ---------- Polling ----------
 function startPolling() {
   async function loop() {
     try {
       await Promise.all(Object.keys(APIS).map(async (g) => {
-        try { await processGameTick(g); } catch (e) { /* individual errors logged */ }
+        try { await processGameTick(g); } catch (e) { /* logged */ }
       }));
     } catch (e) {
       console.error('poll loop error', e && e.message);
@@ -425,44 +385,47 @@ function startPolling() {
   loop();
 }
 
-// --------- Routes ---------
-// Simple JSON endpoint required format: { phien, tong, ketQua, phienDuDoan, duDoan, tiLe }
+// ---------- Routes ----------
+
+// Redirects for quick access: /md5 and /taixiu go to simple JSON API
+app.get('/md5', (req, res) => res.redirect('/api/simple/md5'));
+app.get('/taixiu', (req, res) => res.redirect('/api/simple/taixiu'));
+
+// health root
+app.get('/', (req, res) => res.send('OK — server running. Use /api/simple/:game or /api/predict/:game'));
+
+// Simple JSON as requested
 app.get('/api/simple/:game', async (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
-  const db = loadDB(game);
-  const latest = db.history && db.history.length ? db.history[db.history.length - 1] : null;
+  let db = loadDB(game);
+  let latest = db.history && db.history.length ? db.history[db.history.length - 1] : null;
   if (!latest) {
-    // try immediate tick to populate
-    try {
-      await processGameTick(game);
-    } catch (_) { /* ignore */ }
+    // try to fetch immediately
+    try { await processGameTick(game); } catch (_) {}
+    db = loadDB(game);
+    latest = db.history && db.history.length ? db.history[db.history.length - 1] : null;
   }
-  const db2 = loadDB(game);
-  const latest2 = db2.history && db2.history.length ? db2.history[db2.history.length - 1] : null;
-  if (!latest2) return res.status(204).send();
+  if (!latest) return res.status(204).send();
   return res.json({
-    phien: latest2.phien || null,
-    tong: db2.stats ? (db2.stats.total || 0) : 0,
-    ketQua: latest2.ketQua || null,
-    phienDuDoan: latest2.phienDuDoan || null,
-    duDoan: latest2.DU_DOAN || null,
-    tiLe: latest2.TI_LE || null
+    phien: latest.phien || null,
+    tong: db.stats ? (db.stats.total || 0) : 0,
+    ketQua: latest.ketQua || null,
+    phienDuDoan: latest.phienDuDoan || null,
+    duDoan: latest.DU_DOAN || null,
+    tiLe: latest.TI_LE || null
   });
 });
 
-// Detailed predict (computes on-demand, returns prediction even if gate fails)
+// Predict endpoint computes on demand and returns recent prediction + meta
 app.get('/api/predict/:game', async (req, res) => {
   const game = req.params.game;
   if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
   try {
-    // call processGameTick once to compute latest
     await processGameTick(game);
-    // return latest summary
     const db = loadDB(game);
     const latest = db.history && db.history.length ? db.history[db.history.length - 1] : null;
     if (!latest) return res.status(204).send();
-    // return prediction fields + internals
     return res.json({
       predictionCode: latest.DU_DOAN_CODE,
       prediction: latest.DU_DOAN,
@@ -474,7 +437,7 @@ app.get('/api/predict/:game', async (req, res) => {
   }
 });
 
-// export history JSON
+// history export
 app.get('/api/history/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
@@ -492,31 +455,16 @@ app.get('/api/history/:game', (req, res) => {
   return res.json({ game, count: items.length, items });
 });
 
-// admin: force tick immediate
+// admin: force tick
 app.post('/admin/force-tick/:game', async (req, res) => {
   const game = req.params.game;
   if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
   try {
     await processGameTick(game);
-    return res.json({ ok: true, msg: 'tick executed' });
+    return res.json({ ok: true, msg: `tick executed for ${game}` });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e && e.message ? e.message : 'tick error' });
   }
-});
-
-// admin: view db (safe)
-app.get('/admin/db/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
-  const db = loadDB(game);
-  // don't return full model weights by default to reduce payload; will include meta
-  return res.json({
-    stats: db.stats,
-    lastProcessedSession: db.lastProcessedSession,
-    historyCount: (db.history || []).length,
-    patternsCount: (db.patterns && db.patterns.list) ? db.patterns.list.length : 0,
-    metaEvents: db.metaEvents || []
-  });
 });
 
 // admin: reset model
@@ -533,7 +481,7 @@ app.post('/admin/reset-model/:game', (req, res) => {
   return res.json({ ok: true });
 });
 
-// admin: set thresholds/config quickly
+// admin: set config quick
 app.post('/admin/config/:game', (req, res) => {
   const game = req.params.game;
   const body = req.body || {};
@@ -548,22 +496,31 @@ app.post('/admin/config/:game', (req, res) => {
   return res.json({ ok: true, confidence: CONFIDENCE_THRESHOLD, entropy: ENTROPY_THRESHOLD, lr: LR_LEARNING_RATE });
 });
 
-// UI root minimal
-app.get('/', (req, res) => {
-  res.send('Server running. Use /api/simple/:game or /api/predict/:game');
+// admin: db summary
+app.get('/admin/db/:game', (req, res) => {
+  const game = req.params.game;
+  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
+  const db = loadDB(game);
+  return res.json({
+    stats: db.stats,
+    lastProcessedSession: db.lastProcessedSession,
+    historyCount: (db.history || []).length,
+    patternsCount: (db.patterns && db.patterns.list) ? db.patterns.list.length : 0,
+    metaEvents: db.metaEvents || []
+  });
 });
 
-// start server and polling
+// ---------- Start ----------
 const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startPolling();
 });
 
 process.on('SIGINT', () => {
-  console.log('Shutting down');
+  console.log('SIGINT received — shutting down');
   server.close(() => process.exit(0));
 });
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received');
+  console.log('SIGTERM received — shutting down');
   server.close(() => process.exit(0));
 });
