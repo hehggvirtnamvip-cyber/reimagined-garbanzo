@@ -1,19 +1,22 @@
 /**
- * HOANG VIP ADAPTIVE - FULL SINGLE FILE (Tài/Xỉu only)
+ * HOANG VIP ADAPTIVE - FINAL single-file (with simple JSON API)
  *
- * Chức năng:
- * - Luôn dự đoán Tài/Xỉu (không hiển thị T/X ở UI)
- * - Không thiên vị Tài hay Xỉu (bias guard + debias)
- * - Online adaptive model: Pattern miner + Markov + Multi-alpha EWMA + Logistic
- * - Gating: metadata gate nếu low-confidence
- * - Persistence JSON + backup
- * - Polling + retry + admin endpoints
- * - UI simple /md5 /taixiu
- * - API history: /api/history/:game?limit=100 and /api/history/export/:game
+ * - Always predicts Tài/Xỉu (visible)
+ * - Internal codes T/X used for learning/evaluation
+ * - Debias + bias-guard to avoid favoring one side
+ * - Pattern miner + Markov + EWMA + online logistic + calibration
+ * - Adaptive ensemble weights, gating metadata
+ * - Persistence (atomic JSON) + backups per game
+ * - Endpoints:
+ *    - /api/predict/:game (detailed)
+ *    - /api/simple/:game  <-- SIMPLE JSON (exact format you requested)
+ *    - /api/analyze/:game, /api/export/:game
+ *    - /admin/* (reset, backtest, metrics, config)
+ *    - UI: /md5, /taixiu
  *
  * Run:
- *  npm i express axios
- *  node server.js
+ *   npm i express axios
+ *   node server.js
  */
 
 'use strict';
@@ -28,6 +31,7 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ---------------- Config ----------------
 const PORT = Number(process.env.PORT || 3000);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
 const MAX_HISTORY = Number(process.env.MAX_HISTORY || 400);
@@ -44,6 +48,7 @@ if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 const DB_FILES = { md5: path.join(DB_DIR, 'db_md5.json'), taixiu: path.join(DB_DIR, 'db_taixiu.json') };
 const BACKUP_FILES = { md5: path.join(DB_DIR, 'backup_db_md5.json'), taixiu: path.join(DB_DIR, 'backup_db_taixiu.json') };
 
+// Learning & algorithm params
 let LR_LEARNING_RATE = Number(process.env.LR_LEARNING_RATE || 0.11);
 const LR_REGULARIZATION = Number(process.env.LR_REGULARIZATION || 1e-4);
 const MARKOV_MAX_ORDER = Number(process.env.MARKOV_MAX_ORDER || 3);
@@ -59,51 +64,18 @@ const CONFIDENCE_THRESHOLD = Number(process.env.CONFIDENCE_THRESHOLD || 0.78);
 const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 0.65);
 const ENSEMBLE_ETA = Number(process.env.ENSEMBLE_ETA || 0.08);
 
-// ---------- Helpers ----------
+// ---------------- Utilities ----------------
 function now() { return new Date().toISOString(); }
-function labelFromTX(code) {
-  if (code === 'T') return 'Tài';
-  if (code === 'X') return 'Xỉu';
-  return code;
-}
-function safeReadJson(filePath, fallback = null) {
-  try {
-    if (!fs.existsSync(filePath)) return fallback;
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch (e) {
-    return fallback;
-  }
-}
-function safeAtomicWrite(filePath, data) {
-  try {
-    const tmp = filePath + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-    fs.renameSync(tmp, filePath);
-  } catch (e) {}
-}
+function labelFromTX(code) { if (code === 'T') return 'Tài'; if (code === 'X') return 'Xỉu'; return code; }
+function safeReadJson(filePath, fallback = null) { try { if (!fs.existsSync(filePath)) return fallback; return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (e) { return fallback; } }
+function safeAtomicWrite(filePath, data) { try { const tmp = filePath + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8'); fs.renameSync(tmp, filePath); } catch (e) {} }
 function sigmoid(z) { return 1 / (1 + Math.exp(-z)); }
-function entropyFromProb(p) {
-  const eps = 1e-12;
-  return -(p * Math.log(p + eps) + (1 - p) * Math.log(1 - p + eps));
-}
-function clamp(x, min = 1e-6, max = 1 - 1e-6) {
-  return Math.min(Math.max(x, min), max);
-}
-function getCurrentTimeSlot(date = new Date()) {
-  const h = date.getHours();
-  if (h >= 6 && h < 12) return 'Sang';
-  if (h >= 12 && h < 18) return 'Chieu';
-  if (h >= 18 && h < 24) return 'Toi';
-  return 'Dem';
-}
-function itemToResult(item) {
-  if (!item) return null;
-  if (item.BetSide !== undefined) return Number(item.BetSide) === 1 ? 'T' : 'X';
-  const sum = item.DiceSum !== undefined ? Number(item.DiceSum) : ((Number(item.FirstDice) || 0) + (Number(item.SecondDice) || 0) + (Number(item.ThirdDice) || 0));
-  return sum >= 11 ? 'T' : 'X';
-}
+function entropyFromProb(p) { const eps = 1e-12; return -(p * Math.log(p + eps) + (1 - p) * Math.log(1 - p + eps)); }
+function clamp(x, min = 1e-6, max = 1 - 1e-6) { return Math.min(Math.max(x, min), max); }
+function getCurrentTimeSlot(date = new Date()) { const h = date.getHours(); if (h >= 6 && h < 12) return 'Sang'; if (h >= 12 && h < 18) return 'Chieu'; if (h >= 18 && h < 24) return 'Toi'; return 'Dem'; }
+function itemToResult(item) { if (!item) return null; if (item.BetSide !== undefined) return Number(item.BetSide) === 1 ? 'T' : 'X'; const sum = item.DiceSum !== undefined ? Number(item.DiceSum) : ((Number(item.FirstDice) || 0) + (Number(item.SecondDice) || 0) + (Number(item.ThirdDice) || 0)); return sum >= 11 ? 'T' : 'X'; }
 
-// ---------- DB ----------
+// ---------------- Persistence (per-game JSON) ----------------
 function defaultDB() {
   return {
     history: [],
@@ -116,7 +88,7 @@ function defaultDB() {
     ensembleWeights: { model: 0.34, pattern: 0.33, markov: 0.33 },
     checkpoints: [],
     biasCorrections: [],
-    _strictUnbiased: true // default on to avoid bias
+    _strictUnbiased: true
   };
 }
 function loadDatabase(game) {
@@ -133,19 +105,14 @@ function saveDatabase(game, db) {
   safeAtomicWrite(BACKUP_FILES[game], db);
 }
 
-// ---------- Debias ----------
+// ---------------- Debias utilities ----------------
 function getRecentMeanPred(db, windowSize = 200) {
   const hist = (db.history || []).slice(-windowSize);
   if (!hist.length) return 0.5;
   let sum = 0, cnt = 0;
   for (const h of hist) {
-    if (h && h.meta && h.meta.combinedProb !== undefined) {
-      sum += Number(h.meta.combinedProb);
-      cnt++;
-    } else if (h && h.meta && h.meta.calibratedProb !== undefined) {
-      sum += Number(h.meta.calibratedProb);
-      cnt++;
-    }
+    if (h && h.meta && h.meta.combinedProb !== undefined) { sum += Number(h.meta.combinedProb); cnt++; }
+    else if (h && h.meta && h.meta.calibratedProb !== undefined) { sum += Number(h.meta.calibratedProb); cnt++; }
   }
   return cnt ? (sum / cnt) : 0.5;
 }
@@ -156,7 +123,7 @@ function debiasProbability(db, p, windowSize = 200) {
   return clamp(p - shift);
 }
 
-// ---------- Pattern mining ----------
+// ---------------- Pattern miner ----------------
 function extractFrequentPatterns(sequence, minSupport = PATTERN_MIN_SUPPORT, maxLen = PATTERN_MAX_LEN, topN = PATTERN_TOP_N) {
   const n = sequence.length;
   if (n < 2) return [];
@@ -201,14 +168,7 @@ function mergeAndDecayPatterns(dbPatterns, newPatterns, seqLen) {
   for (const p of (dbPatterns || [])) {
     const age = Math.max(0, seqLen - (p.lastIndex || 0));
     const decay = Math.pow(0.5, age / Math.max(1, halfLife));
-    map[p.pattern] = {
-      pattern: p.pattern,
-      score: (p.score || p.rawScore || 0) * decay,
-      count: p.count || 0,
-      lastIndex: p.lastIndex || -1,
-      pT: p.pT || 0,
-      pX: p.pX || 0
-    };
+    map[p.pattern] = { pattern: p.pattern, score: (p.score || p.rawScore || 0) * decay, count: p.count || 0, lastIndex: p.lastIndex || -1, pT: p.pT || 0, pX: p.pX || 0 };
   }
   for (const np of (newPatterns || [])) {
     const ex = map[np.pattern];
@@ -216,8 +176,7 @@ function mergeAndDecayPatterns(dbPatterns, newPatterns, seqLen) {
       ex.score = (ex.score || 0) + np.rawScore;
       ex.count = (ex.count || 0) + np.count;
       ex.lastIndex = Math.max(ex.lastIndex || -1, np.lastIndex || -1);
-      ex.pT = np.pT;
-      ex.pX = np.pX;
+      ex.pT = np.pT; ex.pX = np.pX;
     } else {
       map[np.pattern] = { pattern: np.pattern, score: np.rawScore, count: np.count, lastIndex: np.lastIndex, pT: np.pT, pX: np.pX };
     }
@@ -227,7 +186,7 @@ function mergeAndDecayPatterns(dbPatterns, newPatterns, seqLen) {
   return merged.slice(0, Math.max(PATTERN_TOP_N * 2, 80));
 }
 
-// ---------- Markov ----------
+// ---------------- Markov ----------------
 function buildMarkov(sequence, maxOrder = MARKOV_MAX_ORDER) {
   const n = sequence.length;
   const models = {};
@@ -258,7 +217,7 @@ function markovPredict(models, sequence) {
   return { T: 0.5, X: 0.5, orderUsed: 0 };
 }
 
-// ---------- Feature builder ----------
+// ---------------- Feature builder ----------------
 function ngramContextDiff(sequence, n) {
   if (sequence.length < n + 1) return 0;
   const ctx = sequence.slice(-n).join('');
@@ -293,7 +252,6 @@ function buildBaseFeatures(sequence) {
   f.push(ngramContextDiff(sequence, 1));
   f.push(ngramContextDiff(sequence, 2));
   f.push(ngramContextDiff(sequence, 3));
-
   const h = new Date().getHours();
   f.push((h >= 6 && h < 12) ? 1 : 0);
   f.push((h >= 12 && h < 18) ? 1 : 0);
@@ -326,7 +284,7 @@ function buildFeatureVector(sequence, mergedPatterns) {
   return { vector, meta: { baseLen: base.length, patternLen: pat.length, topPatterns: mergedPatterns.slice(0, PATTERN_TOP_N) } };
 }
 
-// ---------- Online logistic ----------
+// ---------------- Online logistic ----------------
 function initModelIfNeeded(db, dim) {
   db.model = db.model || {};
   if (!db.model.weights || db.model.weights.length !== dim) {
@@ -343,9 +301,7 @@ function predictLogit(db, x) {
   for (let i = 0; i < x.length; i++) z += (db.model.weights[i] || 0) * x[i];
   return z;
 }
-function predictProb(db, x) {
-  return sigmoid(predictLogit(db, x));
-}
+function predictProb(db, x) { return sigmoid(predictLogit(db, x)); }
 function clipGradients(gradW, clip = GRAD_CLIP) {
   let norm = 0;
   for (let i = 0; i < gradW.length; i++) norm += gradW[i] * gradW[i];
@@ -372,7 +328,7 @@ function sgdUpdateModel(db, x, labelT) {
   return { pred, err, loss: -(labelT * Math.log(pred + 1e-12) + (1 - labelT) * Math.log(1 - pred + 1e-12)), lr };
 }
 
-// ---------- calibration ----------
+// -------------- Calibration --------------
 function calibrate(db, logit) {
   const a = db.calibration.a || 1.0, b = db.calibration.b || 0.0;
   return sigmoid(a * logit + b);
@@ -395,7 +351,7 @@ function calibrationUpdate(db, logit, labelT) {
   return { pred, err };
 }
 
-// ---------- ensemble + gating ----------
+// -------------- Ensemble & gating --------------
 function computePatternSignal(mergedPatterns) {
   const top = (mergedPatterns || []).slice(0, 6);
   let acc = 0;
@@ -420,11 +376,8 @@ function updateEnsembleWeights(db, losses) {
     w[k] = (w[k] || 1e-6) * Math.exp(-eta * li);
     total += w[k];
   }
-  if (total <= 0) {
-    w.model = 0.34; w.pattern = 0.33; w.markov = 0.33;
-  } else {
-    for (const k of keys) w[k] /= total;
-  }
+  if (total <= 0) { w.model = 0.34; w.pattern = 0.33; w.markov = 0.33; }
+  else for (const k of keys) w[k] /= total;
   db.ensembleWeights = w;
   return w;
 }
@@ -440,7 +393,7 @@ function gatingDecision(calibratedProb, entropy, comps) {
   return { pass: true, reason: 'ok', agree };
 }
 
-// ---------- Bias detection ----------
+// ---------- Bias detection & correction ----------
 function detectAndCorrectBias(db, game) {
   try {
     const LOOK = 60;
@@ -454,19 +407,12 @@ function detectAndCorrectBias(db, game) {
     }
     const total = cntT + cntX;
     if (total < 8) return;
-    const pT = cntT / total;
-    const pX = cntX / total;
+    const pT = cntT / total; const pX = cntX / total;
     if (pT > EXTREME || pX > EXTREME) {
       console.warn(`[BIAS DETECT] game=${game} pT=${pT.toFixed(3)} pX=${pX.toFixed(3)} => correcting`);
       db.ensembleWeights = { model: 0.34, pattern: 0.33, markov: 0.33 };
-      if (db.model && Array.isArray(db.model.weights)) {
-        for (let i = 0; i < db.model.weights.length; i++) db.model.weights[i] *= 0.35;
-        if (typeof db.model.bias === 'number') db.model.bias *= 0.35;
-      } else {
-        db.model = db.model || {};
-        db.model.weights = Array(64).fill(0).map(() => (Math.random() - 0.5) * 0.005);
-        db.model.bias = 0;
-      }
+      if (db.model && Array.isArray(db.model.weights)) for (let i = 0; i < db.model.weights.length; i++) db.model.weights[i] *= 0.35;
+      if (typeof db.model.bias === 'number') db.model.bias *= 0.35;
       db.calibration = { a: 1.0, b: 0.0, iter: 0 };
       db.biasCorrections = db.biasCorrections || [];
       db.biasCorrections.push({ at: now(), pT: Number(pT.toFixed(4)), pX: Number(pX.toFixed(4)) });
@@ -476,7 +422,7 @@ function detectAndCorrectBias(db, game) {
   } catch (err) {}
 }
 
-// ---------- Checkpointing ----------
+// ---------- Checkpointing & backtest ----------
 function maybeCheckpoint(db, game) {
   const window = Math.max(20, Math.min(200, Math.floor(MAX_HISTORY / 2)));
   const completed = db.history.filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI');
@@ -524,23 +470,18 @@ function backtest(db) {
   return { accuracy: total ? (correct / total) : 0, total, correct };
 }
 
-// ---------- Fetch ----------
+// ---------- Fetch with retry ----------
 async function fetchWithRetry(url, attempts = 2) {
   for (let i = 0; i < attempts; i++) {
-    try {
-      return await axios.get(url, { timeout: API_TIMEOUT_MS });
-    } catch (e) {
-      if (i === attempts - 1) throw e;
-      await new Promise(r => setTimeout(r, 200 + i * 150));
-    }
+    try { return await axios.get(url, { timeout: API_TIMEOUT_MS }); }
+    catch (e) { if (i === attempts - 1) throw e; await new Promise(r => setTimeout(r, 200 + i * 150)); }
   }
 }
 
 // ---------- Main tick ----------
 async function processGameTick(game) {
   try {
-    const api = APIS[game];
-    if (!api) return;
+    const api = APIS[game]; if (!api) return;
     const resp = await fetchWithRetry(api, 2);
     const historyList = Array.isArray(resp.data) ? resp.data : (resp.data && (resp.data.data || resp.data.list) ? (resp.data.data || resp.data.list) : []);
     if (!Array.isArray(historyList) || historyList.length === 0) return;
@@ -553,23 +494,16 @@ async function processGameTick(game) {
     if (db.lastProcessedSession === currentSession) return;
 
     const seq = historyList.slice(-MAX_HISTORY).map(itemToResult).filter(Boolean);
-
     const newPatterns = extractFrequentPatterns(seq);
     const merged = mergeAndDecayPatterns(db.patterns.list || [], newPatterns, seq.length);
-    db.patterns.list = merged;
-    db.patterns.lastExtractedAt = now();
+    db.patterns.list = merged; db.patterns.lastExtractedAt = now();
 
-    const fvInfo = buildFeatureVector(seq, merged);
-    const x = fvInfo.vector;
-
+    const fvInfo = buildFeatureVector(seq, merged); const x = fvInfo.vector;
     initModelIfNeeded(db, x.length);
     const logit = predictLogit(db, x);
     const pModel = sigmoid(logit);
-
-    const mm = buildMarkov(seq, MARKOV_MAX_ORDER);
-    const mk = markovPredict(mm, seq);
+    const mm = buildMarkov(seq, MARKOV_MAX_ORDER); const mk = markovPredict(mm, seq);
     const pMarkov = mk.T;
-
     const pPattern = computePatternSignal(merged);
     const combined = combineSignals(db, pModel, pPattern, pMarkov);
     const calibrated = calibrate(db, logit);
@@ -586,24 +520,13 @@ async function processGameTick(game) {
       const actual = itemToResult(latest);
       const lastCode = lastRecorded.DU_DOAN_CODE || ((lastRecorded.DU_DOAN === 'Tài') ? 'T' : (lastRecorded.DU_DOAN === 'Xỉu' ? 'X' : null));
       const wasCorrect = (lastCode === actual);
-      lastRecorded.ketQua = actual;
-      lastRecorded.trangThai = wasCorrect ? 'ĐÚNG' : 'SAI';
+      lastRecorded.ketQua = actual; lastRecorded.trangThai = wasCorrect ? 'ĐÚNG' : 'SAI';
 
-      db.stats.total++;
-      const slot = getCurrentTimeSlot();
+      db.stats.total++; const slot = getCurrentTimeSlot();
       if (!db.timeStats[slot]) db.timeStats[slot] = { total: 0, wins: 0 };
       db.timeStats[slot].total++;
-      if (wasCorrect) {
-        db.stats.wins++;
-        db.timeStats[slot].wins++;
-        db.stats.currentStreak = db.stats.currentStreak >= 0 ? db.stats.currentStreak + 1 : 1;
-        if (db.stats.currentStreak > db.stats.maxWinStreak) db.stats.maxWinStreak = db.stats.currentStreak;
-      } else {
-        db.stats.losses++;
-        db.stats.currentStreak = db.stats.currentStreak <= 0 ? db.stats.currentStreak - 1 : -1;
-        const absLoss = Math.abs(db.stats.currentStreak);
-        if (absLoss > db.stats.maxLossStreak) db.stats.maxLossStreak = absLoss;
-      }
+      if (wasCorrect) { db.stats.wins++; db.timeStats[slot].wins++; db.stats.currentStreak = db.stats.currentStreak >= 0 ? db.stats.currentStreak + 1 : 1; if (db.stats.currentStreak > db.stats.maxWinStreak) db.stats.maxWinStreak = db.stats.currentStreak; }
+      else { db.stats.losses++; db.stats.currentStreak = db.stats.currentStreak <= 0 ? db.stats.currentStreak - 1 : -1; const absLoss = Math.abs(db.stats.currentStreak); if (absLoss > db.stats.maxLossStreak) db.stats.maxLossStreak = absLoss; }
 
       try {
         const storedFV = lastRecorded.meta && Array.isArray(lastRecorded.meta.featureVector) ? lastRecorded.meta.featureVector : null;
@@ -613,7 +536,6 @@ async function processGameTick(game) {
           const upd = sgdUpdateModel(db, storedFV, labelT);
           lastRecorded.meta.modelUpdate = { err: upd.err, loss: upd.loss, lr: upd.lr, at: now() };
           if (storedLogit !== undefined) calibrationUpdate(db, storedLogit, labelT);
-
           const compLosses = {
             model: Math.abs((storedLogit !== undefined ? sigmoid(storedLogit) : 0.5) - labelT),
             pattern: Math.abs((lastRecorded.meta && lastRecorded.meta.components && lastRecorded.meta.components.patternProb) || pPattern - labelT),
@@ -638,17 +560,9 @@ async function processGameTick(game) {
       mauCau: (fvInfo.meta && fvInfo.meta.topPatterns) ? fvInfo.meta.topPatterns.map(p => p.pattern).slice(0, 6).join('; ') : 'Auto',
       trangThai: 'ĐANG CHỜ',
       meta: {
-        featureVector: x,
-        logit,
-        calibratedProb: Number(calibrated.toFixed(4)),
-        combinedProb: Number(finalP.toFixed(4)),
-        rawModelProb: Number(pModel.toFixed(4)),
-        patternProb: Number(pPattern.toFixed(4)),
-        markovProb: Number(pMarkov.toFixed(4)),
-        entropy: Number(entropy.toFixed(6)),
-        components: comps,
-        gate,
-        createdAt: now()
+        featureVector: x, logit, calibratedProb: Number(calibrated.toFixed(4)), combinedProb: Number(finalP.toFixed(4)),
+        rawModelProb: Number(pModel.toFixed(4)), patternProb: Number(pPattern.toFixed(4)), markovProb: Number(pMarkov.toFixed(4)),
+        entropy: Number(entropy.toFixed(6)), components: comps, gate, createdAt: now()
       }
     };
 
@@ -660,23 +574,42 @@ async function processGameTick(game) {
     maybeCheckpoint(db, game);
     saveDatabase(game, db);
   } catch (e) {
-    console.error('[ERR]', e && e.message ? e.message : e);
+    console.error('[ERR processGameTick]', e && e.message ? e.message : e);
   }
 }
 
 // ---------- Polling ----------
 function startPolling() {
   async function tick() {
-    await Promise.all(Object.keys(APIS).map(async g => {
-      try { await processGameTick(g); } catch (_) {}
-    }));
+    await Promise.all(Object.keys(APIS).map(async g => { try { await processGameTick(g); } catch (_) {} }));
     const jitter = Math.floor(Math.random() * 1000);
     setTimeout(tick, POLL_INTERVAL_MS + jitter);
   }
   tick();
 }
 
-// ---------- API ----------
+// ---------- Routes ----------
+
+// SIMPLE JSON endpoint as you requested:
+// { "phien": <number>, "tong": <total>, "ketQua": "T"|"X", "phienDuDoan": <number>, "duDoan": "Tài"|"Xỉu", "tiLe": "NN.N%" }
+app.get('/api/simple/:game', (req, res) => {
+  const game = req.params.game;
+  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
+  const db = loadDatabase(game);
+  const latest = (db.history && db.history.length) ? db.history[db.history.length - 1] : null;
+  if (!latest) return res.status(204).send();
+  const out = {
+    phien: latest.phien || null,
+    tong: db.stats ? (db.stats.total || 0) : 0,
+    ketQua: latest.ketQua || null,
+    phienDuDoan: latest.phienDuDoan || null,
+    duDoan: latest.DU_DOAN || null,
+    tiLe: latest.TI_LE || null
+  };
+  return res.json(out);
+});
+
+// Detailed predict (keeps returning internals)
 app.get('/api/predict/:game', async (req, res) => {
   const game = req.params.game;
   if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
@@ -724,6 +657,7 @@ app.get('/api/predict/:game', async (req, res) => {
   }
 });
 
+// Analyze, export, admin routes (unchanged)
 app.get('/api/analyze/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
@@ -756,175 +690,44 @@ app.get('/api/export/:game', (req, res) => {
   res.send(csv);
 });
 
-// -------------------- New: History JSON APIs --------------------
-app.get('/api/history/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ error: 'Bàn chơi không hợp lệ.' });
-  const db = loadDatabase(game);
-  const limit = Math.max(1, Math.min(2000, Number(req.query.limit) || 200));
-  const slice = db.history.slice(-limit).reverse();
-
-  const items = slice.map(it => ({
-    phien: it.phien,
-    phienDuDoan: it.phienDuDoan,
-    xucXac: Array.isArray(it.xucXac) ? it.xucXac : [],
-    ketQua: it.ketQua || null,
-    duDoan: it.DU_DOAN || null,
-    tiLe: it.TI_LE || null,
-    createdAt: (it.meta && it.meta.createdAt) || null
-  }));
-
-  return res.json({ game, count: items.length, items });
-});
-
-app.get('/api/history/export/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).send('Bàn chơi không hợp lệ.');
-  const db = loadDatabase(game);
-  const exportObj = {
-    game,
-    exportedAt: now(),
-    history: db.history.map(it => ({
-      phien: it.phien,
-      phienDuDoan: it.phienDuDoan,
-      xucXac: it.xucXac || [],
-      ketQua: it.ketQua || null,
-      duDoan: it.DU_DOAN || null,
-      duDoanCode: it.DU_DOAN_CODE || (it.DU_DOAN === 'Tài' ? 'T' : (it.DU_DOAN === 'Xỉu' ? 'X' : null)),
-      tiLe: it.TI_LE || null,
-      trangThai: it.trangThai || null,
-      meta: it.meta || {}
-    }))
-  };
-
-  const fname = `history_${game}_${(new Date()).toISOString().replace(/[:.]/g, '-')}.json`;
-  res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
-  res.setHeader('Content-Type', 'application/json');
-  return res.send(JSON.stringify(exportObj, null, 2));
-});
-
-// ---------- Admin routes ----------
+// Admin / patterns / model / reset / backtest / metrics / config
 app.get('/admin/patterns/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
-  const db = loadDatabase(game);
-  return res.json({ lastExtractedAt: db.patterns.lastExtractedAt, patterns: db.patterns.list.slice(0, 200) });
+  const game = req.params.game; if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
+  const db = loadDatabase(game); return res.json({ lastExtractedAt: db.patterns.lastExtractedAt, patterns: db.patterns.list.slice(0, 200) });
 });
-
 app.get('/admin/model/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
-  const db = loadDatabase(game);
-  return res.json({ model: db.model, calibration: db.calibration, weights: db.ensembleWeights, checkpoints: db.checkpoints.slice(-10), biasCorrections: db.biasCorrections || [] });
+  const game = req.params.game; if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
+  const db = loadDatabase(game); return res.json({ model: db.model, calibration: db.calibration, weights: db.ensembleWeights, checkpoints: db.checkpoints.slice(-10), biasCorrections: db.biasCorrections || [] });
 });
-
 app.post('/admin/reset-model/:game', (req, res) => {
-  const game = req.params.game;
-  const db = loadDatabase(game);
+  const game = req.params.game; const db = loadDatabase(game);
   db.model = { weights: null, bias: 0, iter: 0, version: (db.model.version || 1) + 1, createdAt: now(), bestAcc: db.model.bestAcc || 0 };
-  db.calibration = { a: 1.0, b: 0.0, iter: 0 };
-  db.ensembleWeights = { model: 0.34, pattern: 0.33, markov: 0.33 };
-  saveDatabase(game, db);
+  db.calibration = { a: 1.0, b: 0.0, iter: 0 }; db.ensembleWeights = { model: 0.34, pattern: 0.33, markov: 0.33 }; saveDatabase(game, db);
   return res.json({ ok: true, msg: 'Model reset' });
 });
-
-app.get('/admin/backtest/:game', (req, res) => {
-  const game = req.params.game;
-  const db = loadDatabase(game);
-  const report = backtest(db);
-  return res.json({ ok: true, report });
-});
-
-app.get('/admin/metrics/:game', (req, res) => {
-  const game = req.params.game;
-  const db = loadDatabase(game);
-  const tail = db.history.filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI').slice(-200);
-  const acc = tail.length ? (tail.filter(h => h.trangThai === 'ĐÚNG').length / tail.length) : 0;
-  return res.json({
-    rollingCount: tail.length,
-    rollingAccuracy: acc,
-    totalEvaluations: db.stats.total,
-    globalAccuracy: db.stats.total ? (db.stats.wins / db.stats.total) : 0,
-    biasCorrections: db.biasCorrections ? db.biasCorrections.length : 0
-  });
-});
-
-app.get('/admin/config', (req, res) => {
-  res.json({
-    LR_LEARNING_RATE,
-    LR_REGULARIZATION,
-    MARKOV_MAX_ORDER,
-    PATTERN_MAX_LEN,
-    PATTERN_MIN_SUPPORT,
-    PATTERN_TOP_N,
-    PATTERN_DECAY_HALF_LIFE,
-    CALIBRATION_LR,
-    GRAD_CLIP,
-    CONFIDENCE_THRESHOLD,
-    ENTROPY_THRESHOLD,
-    ENSEMBLE_ETA
-  });
-});
-
-app.post('/admin/config', (req, res) => {
-  const body = req.body || {};
-  if (body.LR_LEARNING_RATE !== undefined) LR_LEARNING_RATE = Number(body.LR_LEARNING_RATE);
-  return res.json({ ok: true, LR_LEARNING_RATE });
-});
+app.get('/admin/backtest/:game', (req, res) => { const game = req.params.game; const db = loadDatabase(game); const report = backtest(db); return res.json({ ok: true, report }); });
+app.get('/admin/metrics/:game', (req, res) => { const game = req.params.game; const db = loadDatabase(game); const tail = db.history.filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI').slice(-200); const acc = tail.length ? (tail.filter(h => h.trangThai === 'ĐÚNG').length / tail.length) : 0; return res.json({ rollingCount: tail.length, rollingAccuracy: acc, totalEvaluations: db.stats.total, globalAccuracy: db.stats.total ? (db.stats.wins / db.stats.total) : 0, biasCorrections: db.biasCorrections ? db.biasCorrections.length : 0 }); });
+app.get('/admin/config', (req, res) => res.json({ LR_LEARNING_RATE, LR_REGULARIZATION, MARKOV_MAX_ORDER, PATTERN_MAX_LEN, PATTERN_MIN_SUPPORT, PATTERN_TOP_N, PATTERN_DECAY_HALF_LIFE, CALIBRATION_LR, GRAD_CLIP, CONFIDENCE_THRESHOLD, ENTROPY_THRESHOLD, ENSEMBLE_ETA }));
+app.post('/admin/config', (req, res) => { const body = req.body || {}; if (body.LR_LEARNING_RATE !== undefined) LR_LEARNING_RATE = Number(body.LR_LEARNING_RATE); return res.json({ ok: true, LR_LEARNING_RATE }); });
 
 // ---------- UI ----------
 app.get('/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.send('Trang không tồn tại.');
-  const db = loadDatabase(game);
-  const winRate = db.stats.total > 0 ? ((db.stats.wins / db.stats.total) * 100).toFixed(2) : '0.00';
+  const game = req.params.game; if (!DB_FILES[game]) return res.send('Trang không tồn tại.');
+  const db = loadDatabase(game); const winRate = db.stats.total > 0 ? ((db.stats.wins / db.stats.total) * 100).toFixed(2) : '0.00';
   const rows = db.history.slice(-30).reverse();
   const html = `
-    <html>
-      <head>
-        <meta charset="utf-8">
-        <title>HOANG VIP ADAPTIVE - ${game.toUpperCase()}</title>
-        <style>
-          body{font-family:Arial;background:#071024;color:#e6eef6;padding:18px}
-          .box{background:#0f172a;padding:14px;border-radius:10px;margin-bottom:14px;border:1px solid #1e293b}
-          table{width:100%;border-collapse:collapse}
-          th,td{padding:8px;border:1px solid #283347;text-align:center}
-          th{background:#0369a1;color:white}
-        </style>
-        <script>setTimeout(()=>location.reload(), 12000)</script>
-      </head>
-      <body>
-        <h1>HOANG VIP ADAPTIVE - BÀN: ${game.toUpperCase()}</h1>
-        <div class="box">Tổng: ${db.stats.total} | Thắng: ${db.stats.wins} | Thua: ${db.stats.losses} | Tỉ lệ: ${winRate}%</div>
-        <div class="box">
-          <table>
-            <tr><th>Phiên</th><th>Dự đoán</th><th>Tỉ lệ</th><th>Mẫu</th><th>KQ</th><th>Trạng thái</th></tr>
-            ${rows.map(it => `
-              <tr>
-                <td>${it.phienDuDoan}</td>
-                <td><b>${it.DU_DOAN || 'Tài'}</b></td>
-                <td>${it.TI_LE}</td>
-                <td><small>${(it.mauCau || '')}</small></td>
-                <td>${it.ketQua || ''}</td>
-                <td>${it.trangThai}</td>
-              </tr>
-            `).join('')}
-          </table>
-        </div>
-      </body>
-    </html>
-  `;
+    <html><head><meta charset="utf-8"><title>HOANG VIP ADAPTIVE - ${game.toUpperCase()}</title>
+    <style>body{font-family:Arial;background:#071024;color:#e6eef6;padding:18px}.box{background:#0f172a;padding:14px;border-radius:10px;margin-bottom:14px;border:1px solid #1e293b}table{width:100%;border-collapse:collapse}th,td{padding:8px;border:1px solid #283347;text-align:center}th{background:#0369a1;color:white}</style>
+    <script>setTimeout(()=>location.reload(),12000)</script></head><body>
+    <h1>HOANG VIP ADAPTIVE - BÀN: ${game.toUpperCase()}</h1>
+    <div class="box">Tổng: ${db.stats.total} | Thắng: ${db.stats.wins} | Thua: ${db.stats.losses} | Tỉ lệ: ${winRate}%</div>
+    <div class="box"><table><tr><th>Phiên</th><th>Dự đoán</th><th>Tỉ lệ</th><th>Mẫu</th><th>KQ</th><th>Trạng thái</th></tr>
+    ${rows.map(it => `<tr><td>${it.phienDuDoan}</td><td><b>${it.DU_DOAN || ''}</b></td><td>${it.TI_LE}</td><td><small>${(it.mauCau||'')}</small></td><td>${it.ketQua||''}</td><td>${it.trangThai}</td></tr>`).join('')}
+    </table></div></body></html>`;
   res.send(html);
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`HOANG VIP ADAPTIVE running on port ${PORT}`);
-  startPolling();
-});
-
-process.on('SIGINT', () => {
-  server.close(() => process.exit(0));
-});
-process.on('SIGTERM', () => {
-  server.close(() => process.exit(0));
-});
+// ---------- Start ----------
+const server = app.listen(PORT, () => { console.log(`HOANG VIP ADAPTIVE running on port ${PORT}`); startPolling(); });
+process.on('SIGINT', () => { server.close(() => process.exit(0)); });
+process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
