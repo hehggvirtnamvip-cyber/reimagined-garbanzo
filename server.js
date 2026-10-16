@@ -1,17 +1,13 @@
 /**
  * ========================================================================
- * HOANG VIP v11 - UNIVERSAL API + WEBHOOK + INTEGRATION
+ * HOANG VIP v11.1 - RENDER-SAFE - UNIVERSAL API
  * ========================================================================
- * TÍNH NĂNG MỚI:
- *   ✅ CORS mở - mọi app gọi được
- *   ✅ Multiple formats: JSON/XML/TXT/CSV
- *   ✅ Webhook push (Telegram/Discord/Slack/custom)
- *   ✅ Telegram Bot built-in
- *   ✅ API Key (optional)
- *   ✅ Rate limiting
- *   ✅ Simple endpoints cho mobile
- *   ✅ RSS feed
- *   ✅ Embed widget
+ * FIX CHO RENDER:
+ *   ✅ Auto-detect Render → /tmp
+ *   ✅ In-memory fallback nếu fs readonly
+ *   ✅ Try/catch mọi fs operation
+ *   ✅ Bind 0.0.0.0
+ *   ✅ Health check + logs rõ ràng
  * ========================================================================
  */
 
@@ -25,7 +21,7 @@ const crypto = require('crypto');
 
 const app = express();
 
-// ============ CORS — CHO PHÉP MỌI APP GỌI ============
+// ============ CORS ============
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -40,6 +36,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ============ CONFIG ============
 const PORT = Number(process.env.PORT || 3000);
+const HOST = '0.0.0.0';
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
 const MAX_HISTORY = 3000;
 const API_TIMEOUT_MS = 8000;
@@ -48,20 +45,17 @@ const MIN_CONFIDENCE = 0.55;
 const MIN_ALGO_TOTAL = 15;
 const SNAPSHOT_INTERVAL = 100;
 
-// Integration config
-const API_KEY = process.env.API_KEY || '';                       // Empty = no auth
+const API_KEY = process.env.API_KEY || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || '';
 const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK || '';
 const CUSTOM_WEBHOOK = process.env.CUSTOM_WEBHOOK || '';
 
-// Rate limiting
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 300);
-const rateLimitStore = new Map();  // ip → { count, resetAt }
+const rateLimitStore = new Map();
 
-// Circuit breaker
 const CB_LOSS_STREAK = 5;
 const CB_COOLDOWN = 10;
 
@@ -70,15 +64,43 @@ const APIS = {
   taixiu: process.env.API_TAIXIU || 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau'
 };
 
-const DB_DIR = process.env.DB_DIR || __dirname;
-try { if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true }); } catch (e) {}
+// ============ ✅ FIX: DB DIR AUTO-DETECT ============
+const IS_RENDER = !!(process.env.RENDER || process.env.RENDER_SERVICE_ID || process.env.RENDER_EXTERNAL_URL);
+let DB_DIR = process.env.DB_DIR || (IS_RENDER ? '/tmp/hoang_vip_data' : __dirname);
+let FILESYSTEM_WRITABLE = true;
+
+function tryInitDir(dir) {
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Test write
+    const testFile = path.join(dir, '.write_test');
+    fs.writeFileSync(testFile, 'ok');
+    fs.unlinkSync(testFile);
+    return true;
+  } catch (e) {
+    console.warn(`[FS] Cannot use ${dir}: ${e.message}`);
+    return false;
+  }
+}
+
+if (!tryInitDir(DB_DIR)) {
+  console.warn(`[FS] Fallback to /tmp`);
+  DB_DIR = '/tmp/hoang_vip_data';
+  if (!tryInitDir(DB_DIR)) {
+    console.warn(`[FS] /tmp not writable either — using IN-MEMORY storage`);
+    FILESYSTEM_WRITABLE = false;
+  }
+}
+
+console.log(`[FS] DB_DIR=${DB_DIR} | Writable=${FILESYSTEM_WRITABLE} | Render=${IS_RENDER}`);
 
 const DB_FILES = {
   md5: path.join(DB_DIR, 'db_md5.json'),
   taixiu: path.join(DB_DIR, 'db_taixiu.json')
 };
-const SNAPSHOT_DIR = path.join(DB_DIR, 'snapshots');
-try { if (!fs.existsSync(SNAPSHOT_DIR)) fs.mkdirSync(SNAPSHOT_DIR, { recursive: true }); } catch (e) {}
+
+// ✅ In-memory fallback
+const MEMORY_STORE = {};
 
 // ============ MIDDLEWARE ============
 function rateLimit(req, res, next) {
@@ -99,48 +121,58 @@ function rateLimit(req, res, next) {
 function checkApiKey(req, res, next) {
   if (!API_KEY) return next();
   const key = req.headers['x-api-key'] || req.query.api_key;
-  // Cho phép public UI/health endpoints
-  const publicPaths = ['/', '/health', '/api/public', '/rss', '/widget'];
-  if (publicPaths.some(p => req.path === p || req.path.startsWith(p))) return next();
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: 'Invalid API key', hint: 'Add ?api_key=YOUR_KEY or X-API-Key header' });
-  }
+  const publicPaths = ['/', '/health', '/api/config'];
+  if (publicPaths.some(p => req.path === p)) return next();
+  if (req.path.startsWith('/api/public/')) return next();
+  if (key !== API_KEY) return res.status(401).json({ error: 'Invalid API key' });
   next();
 }
 
-// Cleanup rate limit map
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of rateLimitStore) {
-    if (now > v.resetAt) rateLimitStore.delete(k);
-  }
+  for (const [k, v] of rateLimitStore) if (now > v.resetAt) rateLimitStore.delete(k);
 }, 60 * 1000);
 
 // ============ HELPERS ============
 function now() { return new Date().toISOString(); }
 function safeInt(x, def = 0) { const n = parseInt(x, 10); return Number.isFinite(n) ? n : def; }
-function safeNum(x, def = 0) { const n = Number(x); return Number.isFinite(n) ? n : def; }
+
 function labelFromTX(code) {
   if (code === 'T') return 'Tài';
   if (code === 'X') return 'Xỉu';
   return null;
 }
+
+// ✅ FIX: Safe read with in-memory fallback
 function safeReadJson(fp, fb = null) {
   try {
+    if (MEMORY_STORE[fp]) return JSON.parse(JSON.stringify(MEMORY_STORE[fp]));
+    if (!FILESYSTEM_WRITABLE) return fb;
     if (!fs.existsSync(fp)) return fb;
     const raw = fs.readFileSync(fp, 'utf8');
     if (!raw || !raw.trim()) return fb;
     return JSON.parse(raw);
-  } catch (e) { return fb; }
+  } catch (e) {
+    console.warn(`[READ] ${fp}: ${e.message}`);
+    return fb;
+  }
 }
+
+// ✅ FIX: Safe write with in-memory fallback
 function safeAtomicWrite(fp, data) {
   try {
+    MEMORY_STORE[fp] = JSON.parse(JSON.stringify(data));
+    if (!FILESYSTEM_WRITABLE) return true;
     const tmp = fp + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
     fs.renameSync(tmp, fp);
     return true;
-  } catch (e) { return false; }
+  } catch (e) {
+    console.warn(`[WRITE] ${fp}: ${e.message}`);
+    return true;  // Still return true because memory store succeeded
+  }
 }
+
 function sigmoid(z) {
   if (!Number.isFinite(z)) return 0.5;
   if (z >= 0) { const e = Math.exp(-z); return Number.isFinite(e) ? 1 / (1 + e) : 1; }
@@ -198,7 +230,7 @@ function detectRegime(seq) {
   return { type: 'HỖN_HỢP', confidence: 0.5, maxStreak, transitionRate, entropy };
 }
 
-// ============ ALGOS (rút gọn - giữ 15) ============
+// ============ ALGOS ============
 function algoStreak(seq) {
   if (!seq || seq.length < 4) return { code: null, conf: 0, reason: 'no_data' };
   const last = seq[seq.length - 1];
@@ -609,7 +641,7 @@ function runAllAlgorithms(seq, db) {
     CHAOS: algoChaos(seq), FOURIER: algoFourier(seq), ENTROPY: algoEntropy(seq)
   };
   const regime = detectRegime(seq);
-  baseResults.META_LEARNER = algoMetaLearner(seq, baseResults, regime, db.algoStats);
+  baseResults.META_LEARNER = algoMetaLearner(seq, baseResults, regime, db.algoStats || {});
 
   const votes = { T: 0, X: 0 };
   const details = [];
@@ -617,7 +649,7 @@ function runAllAlgorithms(seq, db) {
     if (name === 'META_LEARNER') continue;
     const r = baseResults[name];
     if (!r.code) continue;
-    const stat = db.algoStats[name] || { total: 0, wins: 0 };
+    const stat = (db.algoStats && db.algoStats[name]) || { total: 0, wins: 0 };
     const acc = stat.total >= MIN_ALGO_TOTAL ? stat.wins / stat.total : 0.5;
     const w = r.conf * Math.max(0.3, acc);
     votes[r.code] += w;
@@ -640,7 +672,7 @@ function runAllAlgorithms(seq, db) {
 async function fetchWithRetry(url, attempts = FETCH_RETRIES) {
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
-    try { return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVip/11.0' } }); }
+    try { return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVip/11.1' } }); }
     catch (e) { lastErr = e; if (i < attempts - 1) await new Promise(r => setTimeout(r, 200 + i * 200)); }
   }
   throw lastErr || new Error('Fetch failed');
@@ -668,7 +700,7 @@ function defaultDB() {
   const algoStats = {};
   for (const name of ALL_ALGOS) algoStats[name] = { total: 0, wins: 0, losses: 0, skips: 0, brierSum: 0, brierCount: 0 };
   return {
-    version: 11,
+    version: 11.1,
     createdAt: now(), updatedAt: now(),
     history: [],
     algoStats,
@@ -699,7 +731,7 @@ function migrateDB(db) {
   if (!db.circuitBreaker) db.circuitBreaker = { active: false, until: 0 };
   if (!Array.isArray(db.snapshots)) db.snapshots = [];
   if (!db.currentRegime) db.currentRegime = { type: 'unknown' };
-  if (!db.version) db.version = 11;
+  if (!db.version) db.version = 11.1;
   db.history = db.history.filter(h => h && typeof h === 'object' && h.phien !== undefined);
   return db;
 }
@@ -708,8 +740,12 @@ function loadDatabase(game) {
   return migrateDB(safeReadJson(DB_FILES[game]) || defaultDB());
 }
 function saveDatabase(game, db) {
-  db.updatedAt = now();
-  safeAtomicWrite(DB_FILES[game], db);
+  try {
+    db.updatedAt = now();
+    safeAtomicWrite(DB_FILES[game], db);
+  } catch (e) {
+    console.warn(`[SAVE] ${game}: ${e.message}`);
+  }
 }
 
 // ============ PREDICT ============
@@ -728,7 +764,6 @@ function predict(db, seq) {
   let final = meta.code && meta.conf >= MIN_CONFIDENCE ? meta : ens;
   let shouldPredict = final.code && final.conf >= MIN_CONFIDENCE;
 
-  // Circuit breaker
   const recent = (db.history || []).slice(-20).filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI');
   let lossStreak = 0;
   for (let i = recent.length - 1; i >= 0; i--) {
@@ -751,23 +786,14 @@ function predict(db, seq) {
   }
 
   if (!shouldPredict) {
-    return {
-      code: null, label: null, tiLe: 'CHỜ',
-      algorithms, regime, shouldPredict: false,
-      streak: { type: lastType, length: streakLen }
-    };
+    return { code: null, label: null, tiLe: 'CHỜ', algorithms, regime, shouldPredict: false, streak: { type: lastType, length: streakLen } };
   }
-
   return {
-    code: final.code, label: labelFromTX(final.code),
-    tiLe: (final.conf * 100).toFixed(1) + '%',
-    algorithms, regime, shouldPredict: true,
-    streak: { type: lastType, length: streakLen },
-    reason: final.reason
+    code: final.code, label: labelFromTX(final.code), tiLe: (final.conf * 100).toFixed(1) + '%',
+    algorithms, regime, shouldPredict: true, streak: { type: lastType, length: streakLen }, reason: final.reason
   };
 }
 
-// ============ UPDATE WEIGHTS ============
 function updateWeights(db) {
   for (const name of ALL_ALGOS) {
     const s = db.algoStats[name];
@@ -777,61 +803,16 @@ function updateWeights(db) {
   }
 }
 
-// ============ SNAPSHOT ============
-function takeSnapshot(db, game) {
-  if (db.history.length % SNAPSHOT_INTERVAL !== 0) return;
-  const snap = {
-    at: now(), historyLength: db.history.length,
-    algoStats: JSON.parse(JSON.stringify(db.algoStats)),
-    algoWeights: { ...db.algoWeights },
-    byType: JSON.parse(JSON.stringify(db.byType)),
-    byRegime: JSON.parse(JSON.stringify(db.byRegime))
-  };
-  db.snapshots.push(snap);
-  if (db.snapshots.length > 10) db.snapshots = db.snapshots.slice(-10);
-  try { safeAtomicWrite(path.join(SNAPSHOT_DIR, `${game}_snap_${Date.now()}.json`), snap); } catch (e) {}
-}
-
 // ============ WEBHOOK ============
 async function sendWebhook(entry, game) {
-  const text = `🎯 [${game.toUpperCase()}] Phiên #${entry.phienDuDoan}\n` +
-    `KQ phiên trước: ${entry.ketQuaLabel || '?'} (Sum ${entry.tong})\n` +
-    `Dự đoán: **${entry.DU_DOAN}** ${entry.TI_LE !== 'CHỜ' ? `(${entry.TI_LE})` : ''}\n` +
-    `Lý do: ${entry.ensReason || 'N/A'}\n` +
-    `Regime: ${entry.regimeType || 'unknown'}`;
-
+  const text = `🎯 [${game.toUpperCase()}] Phiên #${entry.phienDuDoan}\nKQ: ${entry.ketQuaLabel || '?'} (Sum ${entry.tong})\nDự đoán: **${entry.DU_DOAN}** ${entry.TI_LE !== 'CHỜ' ? `(${entry.TI_LE})` : ''}\nLý do: ${entry.ensReason || 'N/A'}\nRegime: ${entry.regimeType || 'unknown'}`;
   const tasks = [];
-
-  // Telegram
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-    tasks.push(axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      chat_id: TELEGRAM_CHAT_ID,
-      text,
-      parse_mode: 'Markdown',
-      disable_web_page_preview: true
-    }).catch(e => console.error('[TG]', e.message)));
+    tasks.push(axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown' }).catch(e => console.error('[TG]', e.message)));
   }
-
-  // Discord
-  if (DISCORD_WEBHOOK) {
-    tasks.push(axios.post(DISCORD_WEBHOOK, {
-      content: text,
-      username: `HOANG VIP ${game.toUpperCase()}`
-    }).catch(e => console.error('[DISCORD]', e.message)));
-  }
-
-  // Slack
-  if (SLACK_WEBHOOK) {
-    tasks.push(axios.post(SLACK_WEBHOOK, { text }).catch(e => console.error('[SLACK]', e.message)));
-  }
-
-  // Custom
-  if (CUSTOM_WEBHOOK) {
-    tasks.push(axios.post(CUSTOM_WEBHOOK, {
-      game, entry, timestamp: now()
-    }, { timeout: 5000 }).catch(e => console.error('[CUSTOM]', e.message)));
-  }
-
+  if (DISCORD_WEBHOOK) tasks.push(axios.post(DISCORD_WEBHOOK, { content: text }).catch(e => console.error('[DISCORD]', e.message)));
+  if (SLACK_WEBHOOK) tasks.push(axios.post(SLACK_WEBHOOK, { text }).catch(e => console.error('[SLACK]', e.message)));
+  if (CUSTOM_WEBHOOK) tasks.push(axios.post(CUSTOM_WEBHOOK, { game, entry, timestamp: now() }, { timeout: 5000 }).catch(e => console.error('[CUSTOM]', e.message)));
   await Promise.all(tasks);
 }
 
@@ -856,7 +837,6 @@ async function processGameTick(game) {
 
     const pred = predict(db, seq);
 
-    // Evaluate previous
     const lastRec = db.history[db.history.length - 1];
     if (lastRec && safeInt(lastRec.phienDuDoan, 0) === currentSession) {
       const actual = itemToResult(latest);
@@ -899,10 +879,8 @@ async function processGameTick(game) {
       }
 
       updateWeights(db);
-      takeSnapshot(db, game);
     }
 
-    // New entry
     const algoPreds = {};
     for (const name of Object.keys(pred.algorithms)) {
       const a = pred.algorithms[name];
@@ -933,7 +911,6 @@ async function processGameTick(game) {
     db.currentRegime = pred.regime;
     saveDatabase(game, db);
 
-    // ✅ WEBHOOK PUSH — chỉ gửi khi có dự đoán mới
     if (pred.shouldPredict && db.lastNotified !== newEntry.phienDuDoan) {
       db.lastNotified = newEntry.phienDuDoan;
       sendWebhook(newEntry, game).catch(e => console.error('[WEBHOOK]', e.message));
@@ -951,355 +928,15 @@ let pollingActive = true;
 function startPolling() {
   async function tick() {
     if (!pollingActive) return;
-    await Promise.all(Object.keys(APIS).map(async g => { try { await processGameTick(g); } catch (_) {} }));
+    try {
+      await Promise.all(Object.keys(APIS).map(async g => { try { await processGameTick(g); } catch (_) {} }));
+    } catch (e) {
+      console.error('[POLL]', e.message);
+    }
     if (pollingActive) setTimeout(tick, POLL_INTERVAL_MS);
   }
   tick();
 }
-
-// ============ FORMAT CONVERTERS ============
-function toJSON(data) { return JSON.stringify(data, null, 2); }
-
-function toXML(obj, rootName = 'response') {
-  function esc(s) { return String(s).replace(/[<>&'"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c])); }
-  function walk(o, indent = '') {
-    if (o === null || o === undefined) return '';
-    if (Array.isArray(o)) return o.map(item => `${indent}<item>${walk(item, indent + '  ')}</item>`).join('\n');
-    if (typeof o === 'object') {
-      return Object.entries(o).map(([k, v]) => {
-        const key = k.replace(/[^a-zA-Z0-9_]/g, '_');
-        if (typeof v === 'object' && v !== null) return `${indent}<${key}>\n${walk(v, indent + '  ')}\n${indent}</${key}>`;
-        return `${indent}<${key}>${esc(v)}</${key}>`;
-      }).join('\n');
-    }
-    return esc(o);
-  }
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<${rootName}>\n${walk(obj, '  ')}\n</${rootName}>`;
-}
-
-function toPlainText(prediction) {
-  const p = prediction;
-  return [
-    `🎯 ${p.game} - Phiên #${p.phien}`,
-    `📊 KQ phiên trước: ${p.ketQua || '?'} (Sum: ${p.tong})`,
-    `🎲 Xúc xắc: ${p.xucXac.join('-')}`,
-    `💡 Dự đoán phiên #${p.phienDuDoan}: ${p.duDoan} (${p.tiLe})`,
-    `📌 Lý do: ${p.reason || 'Chờ'}`,
-    `🔮 Regime: ${p.regime ? p.regime.type : 'unknown'}`,
-    `⏰ ${p.thoiGian}`
-  ].join('\n');
-}
-
-function toCSV(items) {
-  if (!items.length) return 'no data';
-  const headers = ['phien', 'xucXac', 'tong', 'ketQua', 'phienDuDoan', 'duDoan', 'tiLe', 'reason', 'regime', 'trangThai'];
-  const rows = items.map(it => {
-    const dice = Array.isArray(it.xucXac) ? it.xucXac.join('-') : '';
-    return [
-      it.phien, `"${dice}"`, it.tong || '', it.ketQuaLabel || '',
-      it.phienDuDoan, it.DU_DOAN || '', it.TI_LE || '',
-      `"${it.ensReason || ''}"`, `"${it.regimeType || ''}"`, it.trangThai || ''
-    ].join(',');
-  });
-  return headers.join(',') + '\n' + rows.join('\n');
-}
-
-// ============ API ENDPOINTS ============
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    version: 11,
-    uptime: process.uptime(),
-    timestamp: now(),
-    endpoints: Object.keys(APIS)
-  });
-});
-
-// Config info
-app.get('/api/config', (req, res) => {
-  res.json({
-    version: 11,
-    algorithms: ALL_ALGOS,
-    minConfidence: MIN_CONFIDENCE,
-    rateLimit: { windowMs: RATE_LIMIT_WINDOW_MS, max: RATE_LIMIT_MAX },
-    apiKeyRequired: !!API_KEY,
-    webhooks: {
-      telegram: !!TELEGRAM_BOT_TOKEN,
-      discord: !!DISCORD_WEBHOOK,
-      slack: !!SLACK_WEBHOOK,
-      custom: !!CUSTOM_WEBHOOK
-    }
-  });
-});
-
-// Main predict — supports ?format=json|xml|txt|csv
-app.get('/api/predict/:game', rateLimit, checkApiKey, async (req, res) => {
-  const game = req.params.game;
-  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game', valid: Object.keys(APIS) });
-  const format = (req.query.format || 'json').toLowerCase();
-
-  try {
-    const r = await fetchWithRetry(APIS[game]);
-    const list = parseHistoryResponse(r.data);
-    if (!list.length) return res.status(204).send();
-
-    const seq = list.slice(-MAX_HISTORY).map(itemToResult).filter(Boolean);
-    const db = loadDatabase(game);
-    const pred = predict(db, seq);
-    const latest = list[list.length - 1];
-    const cs = safeInt(latest.SessionId || latest.session, 0);
-
-    const algoDetail = {};
-    for (const name of Object.keys(pred.algorithms)) {
-      const a = pred.algorithms[name];
-      const stat = db.algoStats[name] || {};
-      algoDetail[name] = {
-        code: a.code,
-        label: a.code ? labelFromTX(a.code) : null,
-        confidence: a.conf,
-        reason: a.reason,
-        accuracy: stat.total > 0 ? Number((stat.wins / stat.total * 100).toFixed(2)) : 0,
-        brier: stat.brierCount > 0 ? Number((stat.brierSum / stat.brierCount).toFixed(4)) : null,
-        total: stat.total || 0,
-        skips: stat.skips || 0
-      };
-    }
-
-    const response = {
-      success: true,
-      game: game.toUpperCase(),
-      phien: cs,
-      xucXac: itemToDice(latest),
-      tong: itemToSum(latest),
-      ketQua: itemToResult(latest),
-      ketQuaLabel: labelFromTX(itemToResult(latest)),
-      phienDuDoan: cs + 1,
-      duDoan: pred.shouldPredict ? pred.label : 'CHỜ',
-      duDoanCode: pred.shouldPredict ? pred.code : null,
-      tiLe: pred.tiLe,
-      reason: pred.reason,
-      regime: pred.regime,
-      shouldPredict: pred.shouldPredict,
-      kelly: pred.shouldPredict ? Number(Math.max(0, Math.min(0.25, ((pred.algorithms.ENSEMBLE.conf * 1 - (1 - pred.algorithms.ENSEMBLE.conf)) / 1)).toFixed(4)) : 0,
-      algorithms: algoDetail,
-      thoiGian: now()
-    };
-
-    if (format === 'xml') {
-      res.type('application/xml').send(toXML(response, 'prediction'));
-    } else if (format === 'txt') {
-      res.type('text/plain').send(toPlainText(response));
-    } else if (format === 'csv') {
-      res.type('text/csv').send(toCSV([{ ...response, DU_DOAN: response.duDoan, TI_LE: response.tiLe, ensReason: response.reason, regimeType: response.regime.type }]));
-    } else {
-      res.json(response);
-    }
-  } catch (e) {
-    res.status(500).json({ error: e.message || 'fetch error' });
-  }
-});
-
-// Simple endpoint cho mobile app
-app.get('/api/simple/:game', rateLimit, checkApiKey, async (req, res) => {
-  const game = req.params.game;
-  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
-
-  // Nếu có history trong DB, trả về prediction đã lưu
-  const db = loadDatabase(game);
-  const last = db.history[db.history.length - 1];
-  if (last) {
-    return res.json({
-      game: game.toUpperCase(),
-      phien: last.phienDuDoan,
-      duDoan: last.DU_DOAN,
-      duDoanCode: last.DU_DOAN_CODE,
-      tiLe: last.TI_LE,
-      regime: last.regimeType,
-      reason: last.ensReason,
-      updated: last.thoiGian
-    });
-  }
-  res.status(202).json({ message: 'Chưa có dự đoán, đang chờ data...' });
-});
-
-// Public — không cần API key
-app.get('/api/public/predict/:game', rateLimit, async (req, res) => {
-  const game = req.params.game;
-  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
-  const db = loadDatabase(game);
-  const last = db.history[db.history.length - 1];
-  if (!last) return res.status(204).send();
-  res.json({
-    game: game.toUpperCase(),
-    phien: last.phienDuDoan,
-    duDoan: last.DU_DOAN,
-    tiLe: last.TI_LE,
-    regime: last.regimeType,
-    updated: last.thoiGian
-  });
-});
-
-app.get('/api/history/:game', rateLimit, checkApiKey, (req, res) => {
-  const game = req.params.game;
-  if (game === 'all') return handleHistoryAll(req, res);
-  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
-  const format = (req.query.format || 'json').toLowerCase();
-  const db = loadDatabase(game);
-  const limit = Math.max(1, Math.min(2000, safeInt(req.query.limit, 200)));
-  const slice = db.history.slice(-limit).reverse();
-
-  if (format === 'csv') {
-    res.type('text/csv').send(toCSV(slice));
-  } else {
-    res.json({
-      game, count: slice.length, exportedAt: now(),
-      items: slice.map(formatHistoryItem).filter(Boolean)
-    });
-  }
-});
-
-function handleHistoryAll(req, res) {
-  const limit = Math.max(1, Math.min(2000, safeInt(req.query.limit, 500)));
-  const result = { exportedAt: now(), limit, games: {} };
-  for (const game of Object.keys(DB_FILES)) {
-    try {
-      const db = loadDatabase(game);
-      const slice = db.history.slice(-limit).reverse();
-      const algosReport = {};
-      for (const name of Object.keys(db.algoStats)) {
-        const s = db.algoStats[name];
-        algosReport[name] = {
-          total: s.total, wins: s.wins, losses: s.losses, skips: s.skips,
-          accuracy: s.total > 0 ? Number((s.wins / s.total * 100).toFixed(2)) : 0,
-          brier: s.brierCount > 0 ? Number((s.brierSum / s.brierCount).toFixed(4)) : null
-        };
-      }
-      result.games[game] = {
-        count: slice.length,
-        algoStats: algosReport,
-        algoWeights: db.algoWeights,
-        byType: db.byType,
-        byRegime: db.byRegime,
-        currentRegime: db.currentRegime,
-        items: slice.map(formatHistoryItem).filter(Boolean)
-      };
-    } catch (e) {
-      result.games[game] = { error: e.message };
-    }
-  }
-  res.json(result);
-}
-
-app.get('/api/history/all', rateLimit, checkApiKey, handleHistoryAll);
-
-// ✅ RSS feed
-app.get('/rss/:game', rateLimit, (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).send('Invalid game');
-  const db = loadDatabase(game);
-  const items = db.history.slice(-30).reverse();
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
-
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
-  <channel>
-    <title>HOANG VIP - ${game.toUpperCase()}</title>
-    <link>${baseUrl}/${game}</link>
-    <description>Dự đoán Tài Xỉu ${game.toUpperCase()}</description>
-    <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
-    ${items.map(it => `
-    <item>
-      <title>Phiên #${it.phienDuDoan}: ${it.DU_DOAN} (${it.TI_LE})</title>
-      <link>${baseUrl}/${game}</link>
-      <guid>${game}-${it.phien}</guid>
-      <pubDate>${new Date(it.thoiGian).toUTCString()}</pubDate>
-      <description><![CDATA[
-        KQ phiên trước: ${it.ketQuaLabel || '?'} (Sum ${it.tong})<br>
-        Dự đoán: <b>${it.DU_DOAN}</b> ${it.TI_LE}<br>
-        Lý do: ${it.ensReason || 'N/A'}<br>
-        Regime: ${it.regimeType || 'unknown'}
-      ]]></description>
-    </item>`).join('')}
-  </channel>
-</rss>`;
-  res.type('application/rss+xml').send(xml);
-});
-
-// ✅ Embed widget (iframe-friendly)
-app.get('/widget/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.send('Invalid game');
-  const db = loadDatabase(game);
-  const last = db.history[db.history.length - 1];
-  if (!last) return res.send('<div>Chưa có data</div>');
-
-  const cls = last.DU_DOAN_CODE === 'T' ? '#22c55e' : (last.DU_DOAN_CODE === 'X' ? '#ef4444' : '#eab308');
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-  body{margin:0;font-family:Arial;background:transparent}
-  .widget{background:linear-gradient(135deg,#0f172a,#1e293b);padding:14px;border-radius:10px;color:#e6eef6;text-align:center;border:1px solid #334155}
-  .title{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:1px}
-  .pred{font-size:28px;font-weight:800;color:${cls};margin:6px 0}
-  .meta{font-size:10px;color:#64748b}
-  </style><script>setTimeout(()=>location.reload(),10000)</script></head>
-  <body>
-    <div class="widget">
-      <div class="title">🎯 ${game.toUpperCase()} — Phiên #${last.phienDuDoan}</div>
-      <div class="pred">${last.DU_DOAN} ${last.TI_LE !== 'CHỜ' ? last.TI_LE : ''}</div>
-      <div class="meta">${last.ensReason || 'N/A'} • ${last.regimeType || ''}</div>
-    </div>
-  </body></html>`;
-  res.send(html);
-});
-
-// CSV export
-app.get('/api/export/:game', rateLimit, checkApiKey, (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).send('Invalid game');
-  const db = loadDatabase(game);
-  const csv = toCSV(db.history.slice().reverse());
-  res.header('Content-Type', 'text/csv; charset=utf-8');
-  res.attachment(`history_${game}.csv`);
-  res.send('\uFEFF' + csv);
-});
-
-// Admin — không cần key nhưng có thể bảo vệ riêng
-app.get('/admin/metrics/:game', rateLimit, (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
-  const db = loadDatabase(game);
-  const report = {};
-  for (const name of Object.keys(db.algoStats)) {
-    const s = db.algoStats[name];
-    report[name] = {
-      total: s.total, wins: s.wins, losses: s.losses, skips: s.skips,
-      accuracy: s.total > 0 ? Number((s.wins / s.total * 100).toFixed(2)) : 0,
-      brier: s.brierCount > 0 ? Number((s.brierSum / s.brierCount).toFixed(4)) : null
-    };
-  }
-  const ranking = Object.entries(report).filter(([_, v]) => v.total >= 5).sort((a, b) => b[1].accuracy - a[1].accuracy).map(([name, v]) => ({ name, ...v }));
-  res.json({ game, algorithms: report, ranking, byType: db.byType, byRegime: db.byRegime, weights: db.algoWeights, currentRegime: db.currentRegime });
-});
-
-// POST webhook — test
-app.post('/admin/test-webhook', async (req, res) => {
-  try {
-    const testEntry = {
-      phienDuDoan: 999999,
-      ketQuaLabel: 'Tài',
-      tong: 13,
-      DU_DOAN: 'Xỉu',
-      TI_LE: '68.5%',
-      ensReason: 'TEST_WEBHOOK',
-      regimeType: 'TEST'
-    };
-    await sendWebhook(testEntry, 'test');
-    res.json({ ok: true, sent: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // ============ FORMAT ============
 function formatHistoryItem(it) {
@@ -1322,10 +959,153 @@ function formatHistoryItem(it) {
   };
 }
 
+// ============ API ============
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true, version: 11.1, uptime: process.uptime(), timestamp: now(),
+    fs: { dir: DB_DIR, writable: FILESYSTEM_WRITABLE, isRender: IS_RENDER },
+    endpoints: Object.keys(APIS)
+  });
+});
+
+app.get('/api/config', (req, res) => {
+  res.json({
+    version: 11.1,
+    algorithms: ALL_ALGOS,
+    minConfidence: MIN_CONFIDENCE,
+    apiKeyRequired: !!API_KEY,
+    webhooks: { telegram: !!TELEGRAM_BOT_TOKEN, discord: !!DISCORD_WEBHOOK, slack: !!SLACK_WEBHOOK, custom: !!CUSTOM_WEBHOOK }
+  });
+});
+
+app.get('/api/predict/:game', rateLimit, checkApiKey, async (req, res) => {
+  const game = req.params.game;
+  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game', valid: Object.keys(APIS) });
+  const format = (req.query.format || 'json').toLowerCase();
+  try {
+    const r = await fetchWithRetry(APIS[game]);
+    const list = parseHistoryResponse(r.data);
+    if (!list.length) return res.status(204).send();
+
+    const seq = list.slice(-MAX_HISTORY).map(itemToResult).filter(Boolean);
+    const db = loadDatabase(game);
+    const pred = predict(db, seq);
+    const latest = list[list.length - 1];
+    const cs = safeInt(latest.SessionId || latest.session, 0);
+
+    const algoDetail = {};
+    for (const name of Object.keys(pred.algorithms)) {
+      const a = pred.algorithms[name];
+      const stat = db.algoStats[name] || {};
+      algoDetail[name] = {
+        code: a.code, label: a.code ? labelFromTX(a.code) : null,
+        confidence: a.conf, reason: a.reason,
+        accuracy: stat.total > 0 ? Number((stat.wins / stat.total * 100).toFixed(2)) : 0,
+        brier: stat.brierCount > 0 ? Number((stat.brierSum / stat.brierCount).toFixed(4)) : null,
+        total: stat.total || 0, skips: stat.skips || 0
+      };
+    }
+
+    const response = {
+      success: true, game: game.toUpperCase(),
+      phien: cs, xucXac: itemToDice(latest), tong: itemToSum(latest),
+      ketQua: itemToResult(latest), ketQuaLabel: labelFromTX(itemToResult(latest)),
+      phienDuDoan: cs + 1,
+      duDoan: pred.shouldPredict ? pred.label : 'CHỜ',
+      duDoanCode: pred.shouldPredict ? pred.code : null,
+      tiLe: pred.tiLe, reason: pred.reason, regime: pred.regime,
+      shouldPredict: pred.shouldPredict,
+      algorithms: algoDetail, thoiGian: now()
+    };
+    res.json(response);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'fetch error' });
+  }
+});
+
+app.get('/api/simple/:game', rateLimit, checkApiKey, async (req, res) => {
+  const game = req.params.game;
+  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
+  const db = loadDatabase(game);
+  const last = db.history[db.history.length - 1];
+  if (last) {
+    return res.json({
+      game: game.toUpperCase(), phien: last.phienDuDoan,
+      duDoan: last.DU_DOAN, duDoanCode: last.DU_DOAN_CODE, tiLe: last.TI_LE,
+      regime: last.regimeType, reason: last.ensReason, updated: last.thoiGian
+    });
+  }
+  res.status(202).json({ message: 'Chưa có dự đoán, đang chờ data...' });
+});
+
+app.get('/api/public/predict/:game', rateLimit, async (req, res) => {
+  const game = req.params.game;
+  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
+  const db = loadDatabase(game);
+  const last = db.history[db.history.length - 1];
+  if (!last) return res.status(204).send();
+  res.json({ game: game.toUpperCase(), phien: last.phienDuDoan, duDoan: last.DU_DOAN, tiLe: last.TI_LE, regime: last.regimeType, updated: last.thoiGian });
+});
+
+app.get('/api/history/:game', rateLimit, checkApiKey, (req, res) => {
+  const game = req.params.game;
+  if (game === 'all') return handleHistoryAll(req, res);
+  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
+  const db = loadDatabase(game);
+  const limit = Math.max(1, Math.min(2000, safeInt(req.query.limit, 200)));
+  const slice = db.history.slice(-limit).reverse();
+  res.json({ game, count: slice.length, exportedAt: now(), items: slice.map(formatHistoryItem).filter(Boolean) });
+});
+
+function handleHistoryAll(req, res) {
+  const limit = Math.max(1, Math.min(2000, safeInt(req.query.limit, 500)));
+  const result = { exportedAt: now(), limit, games: {} };
+  for (const game of Object.keys(DB_FILES)) {
+    try {
+      const db = loadDatabase(game);
+      const slice = db.history.slice(-limit).reverse();
+      const algosReport = {};
+      for (const name of Object.keys(db.algoStats)) {
+        const s = db.algoStats[name];
+        algosReport[name] = {
+          total: s.total, wins: s.wins, losses: s.losses, skips: s.skips,
+          accuracy: s.total > 0 ? Number((s.wins / s.total * 100).toFixed(2)) : 0,
+          brier: s.brierCount > 0 ? Number((s.brierSum / s.brierCount).toFixed(4)) : null
+        };
+      }
+      result.games[game] = {
+        count: slice.length, algoStats: algosReport, algoWeights: db.algoWeights,
+        byType: db.byType, byRegime: db.byRegime, currentRegime: db.currentRegime,
+        items: slice.map(formatHistoryItem).filter(Boolean)
+      };
+    } catch (e) { result.games[game] = { error: e.message }; }
+  }
+  res.json(result);
+}
+
+app.get('/api/history/all', rateLimit, checkApiKey, handleHistoryAll);
+
+app.get('/admin/metrics/:game', rateLimit, (req, res) => {
+  const game = req.params.game;
+  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
+  const db = loadDatabase(game);
+  const report = {};
+  for (const name of Object.keys(db.algoStats)) {
+    const s = db.algoStats[name];
+    report[name] = {
+      total: s.total, wins: s.wins, losses: s.losses, skips: s.skips,
+      accuracy: s.total > 0 ? Number((s.wins / s.total * 100).toFixed(2)) : 0,
+      brier: s.brierCount > 0 ? Number((s.brierSum / s.brierCount).toFixed(4)) : null
+    };
+  }
+  const ranking = Object.entries(report).filter(([_, v]) => v.total >= 5).sort((a, b) => b[1].accuracy - a[1].accuracy).map(([name, v]) => ({ name, ...v }));
+  res.json({ game, algorithms: report, ranking, byType: db.byType, byRegime: db.byRegime, weights: db.algoWeights, currentRegime: db.currentRegime });
+});
+
 // ============ UI ============
 app.get('/:game', (req, res) => {
   const game = req.params.game;
-  if (!DB_FILES[game]) return res.send('Trang không tồn tại.');
+  if (!DB_FILES[game]) return res.send('Trang không tồn tại. Dùng /md5 hoặc /taixiu');
 
   const db = loadDatabase(game);
   const rows = db.history.slice(-40).reverse();
@@ -1358,21 +1138,15 @@ app.get('/:game', (req, res) => {
   }).join('');
 
   const baseUrl = `${req.protocol}://${req.get('host')}`;
-  const html = `<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HOANG VIP v11 - ${game.toUpperCase()}</title>
+  const html = `<!DOCTYPE html><html lang="vi"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HOANG VIP v11.1 - ${game.toUpperCase()}</title>
 <style>
-  *{box-sizing:border-box}
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27,#0f172a 50%,#1a1f3a);color:#e6eef6;padding:12px;margin:0;min-height:100vh}
+  *{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27,#0f172a 50%,#1a1f3a);color:#e6eef6;padding:12px;margin:0;min-height:100vh}
   .header{background:linear-gradient(135deg,#1e3a8a,#3b82f6);padding:16px;border-radius:14px;margin-bottom:14px;box-shadow:0 8px 24px rgba(59,130,246,0.3)}
-  h1{color:#fff;font-size:17px;margin:0}
-  .subtitle{color:#bfdbfe;font-size:11px;margin-top:4px}
+  h1{color:#fff;font-size:17px;margin:0}.subtitle{color:#bfdbfe;font-size:11px;margin-top:4px}
   .hero{background:linear-gradient(135deg,#7c3aed,#4f46e5);padding:20px;border-radius:14px;margin-bottom:14px;text-align:center}
-  .hero .label{font-size:11px;color:#ddd6fe;text-transform:uppercase;letter-spacing:1px}
-  .hero .pred{font-size:36px;font-weight:800;margin:8px 0}
+  .hero .label{font-size:11px;color:#ddd6fe;text-transform:uppercase}.hero .pred{font-size:36px;font-weight:800;margin:8px 0}
   .hero .pred.tai{color:#86efac}.hero .pred.xiu{color:#fca5a5}.hero .pred.cho{color:#fde047}
   .hero .meta{font-size:11px;color:#ddd6fe;margin-top:6px}
   .hero .regime{display:inline-block;margin-top:8px;padding:4px 10px;background:rgba(0,0,0,0.3);border-radius:20px;font-size:10px;color:#c4b5fd}
@@ -1394,16 +1168,9 @@ app.get('/:game', (req, res) => {
   .link-row span{word-break:break-all;flex:1}
   .copy-btn{background:#10b981;color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:10px;font-weight:600;cursor:pointer}
 </style>
-<script>
-  setTimeout(()=>location.reload(),10000);
-  function copyText(text, btn){const done=()=>{const old=btn.textContent;btn.textContent='✓';setTimeout(()=>btn.textContent=old,1500)};if(navigator.clipboard){navigator.clipboard.writeText(text).then(done).catch(done)}else{const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done()}}
-</script>
-</head>
-<body>
-  <div class="header">
-    <h1>🎯 HOANG VIP v11 — UNIVERSAL API</h1>
-    <div class="subtitle">15 algos + CORS + Webhook + Telegram + RSS + XML/CSV/TXT</div>
-  </div>
+<script>setTimeout(()=>location.reload(),10000);function copyText(t,b){const d=()=>{const o=b.textContent;b.textContent='✓';setTimeout(()=>b.textContent=o,1500)};if(navigator.clipboard){navigator.clipboard.writeText(t).then(d).catch(d)}else{const ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);d()}}</script>
+</head><body>
+  <div class="header"><h1>🎯 HOANG VIP v11.1 — RENDER-SAFE</h1><div class="subtitle">Bàn: ${game.toUpperCase()} • FS: ${FILESYSTEM_WRITABLE ? 'OK' : 'MEMORY'}</div></div>
 
   <div class="hero">
     <div class="label">Dự đoán phiên tiếp theo</div>
@@ -1413,73 +1180,65 @@ app.get('/:game', (req, res) => {
   </div>
 
   <div class="link-box">
-    <div class="title">🔗 API Endpoints cho mọi app</div>
+    <div class="title">🔗 API cho mọi app</div>
     <div class="link-row"><span>${baseUrl}/api/predict/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}',this)">Copy</button></div>
-    <div class="link-row"><span>${baseUrl}/api/predict/${game}?format=xml</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}?format=xml',this)">Copy</button></div>
-    <div class="link-row"><span>${baseUrl}/api/predict/${game}?format=txt</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}?format=txt',this)">Copy</button></div>
     <div class="link-row"><span>${baseUrl}/api/simple/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/simple/${game}',this)">Copy</button></div>
     <div class="link-row"><span>${baseUrl}/api/history/all</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/history/all',this)">Copy</button></div>
-    <div class="link-row"><span>${baseUrl}/rss/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/rss/${game}',this)">Copy</button></div>
-    <div class="link-row"><span>${baseUrl}/widget/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/widget/${game}',this)">Copy</button></div>
+    <div class="link-row"><span>${baseUrl}/health</span><button class="copy-btn" onclick="copyText('${baseUrl}/health',this)">Copy</button></div>
   </div>
 
   <div class="section-title">📊 16 Thuật toán</div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>Algo</th><th>T</th><th>W</th><th>L</th><th>Skip</th><th>Acc</th><th>Brier</th></tr></thead>
-      <tbody>${algoRows}</tbody>
-    </table>
-  </div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Algo</th><th>T</th><th>W</th><th>L</th><th>Skip</th><th>Acc</th><th>Brier</th></tr></thead>
+    <tbody>${algoRows}</tbody>
+  </table></div>
 
   <div class="section-title">📜 40 phiên gần nhất</div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>Phiên</th><th>XX</th><th>Tổng</th><th>KQ</th><th>Dự đoán</th><th>Tỉ lệ</th><th>Reason</th><th>Regime</th><th>TT</th></tr></thead>
-      <tbody>
-        ${rows.map(it => {
-          const dice = (it.xucXac || []).join('-');
-          const kq = it.ketQuaLabel || '';
-          const kqCls = it.ketQua === 'T' ? 'tai' : (it.ketQua === 'X' ? 'xiu' : '');
-          const isWait = !it.DU_DOAN_CODE;
-          const ddCls = isWait ? 'wait' : (it.DU_DOAN_CODE === 'T' ? 'tai' : 'xiu');
-          const ttCls = it.trangThai === 'ĐÚNG' ? 'dung' : (it.trangThai === 'SAI' ? 'sai' : (it.trangThai === 'BỎ QUA' ? 'wait' : 'cho'));
-          return `<tr>
-            <td style="font-family:monospace;font-size:10px;color:#94a3b8">${it.phien}</td>
-            <td style="color:#fbbf24;font-weight:600">${dice}</td>
-            <td>${it.tong || ''}</td>
-            <td class="${kqCls}">${kq}</td>
-            <td class="${ddCls}">${isWait ? 'CHỜ' : it.DU_DOAN}</td>
-            <td style="color:#a5b4fc;font-size:10px">${it.TI_LE || 'CHỜ'}</td>
-            <td>${it.ensReason ? `<span class="ens-badge">${it.ensReason}</span>` : '—'}</td>
-            <td><span class="regime-badge">${it.regimeType || '—'}</span></td>
-            <td class="${ttCls}">${it.trangThai === 'ĐANG CHỜ' ? '...' : it.trangThai}</td>
-          </tr>`;
-        }).join('')}
-      </tbody>
-    </table>
-  </div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Phiên</th><th>XX</th><th>Tổng</th><th>KQ</th><th>Dự đoán</th><th>Tỉ lệ</th><th>Reason</th><th>Regime</th><th>TT</th></tr></thead>
+    <tbody>${rows.map(it => {
+      const dice = (it.xucXac || []).join('-');
+      const kq = it.ketQuaLabel || '';
+      const kqCls = it.ketQua === 'T' ? 'tai' : (it.ketQua === 'X' ? 'xiu' : '');
+      const isWait = !it.DU_DOAN_CODE;
+      const ddCls = isWait ? 'wait' : (it.DU_DOAN_CODE === 'T' ? 'tai' : 'xiu');
+      const ttCls = it.trangThai === 'ĐÚNG' ? 'dung' : (it.trangThai === 'SAI' ? 'sai' : (it.trangThai === 'BỎ QUA' ? 'wait' : 'cho'));
+      return `<tr>
+        <td style="font-family:monospace;font-size:10px;color:#94a3b8">${it.phien}</td>
+        <td style="color:#fbbf24;font-weight:600">${dice}</td>
+        <td>${it.tong || ''}</td>
+        <td class="${kqCls}">${kq}</td>
+        <td class="${ddCls}">${isWait ? 'CHỜ' : it.DU_DOAN}</td>
+        <td style="color:#a5b4fc;font-size:10px">${it.TI_LE || 'CHỜ'}</td>
+        <td>${it.ensReason ? `<span class="ens-badge">${it.ensReason}</span>` : '—'}</td>
+        <td><span class="regime-badge">${it.regimeType || '—'}</span></td>
+        <td class="${ttCls}">${it.trangThai === 'ĐANG CHỜ' ? '...' : it.trangThai}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table></div>
 
-  <div style="text-align:center;font-size:10px;color:#475569;margin-top:14px">
-    HOANG VIP v11 • Universal API • CORS enabled
-  </div>
-</body>
-</html>`;
+  <div style="text-align:center;font-size:10px;color:#475569;margin-top:14px">HOANG VIP v11.1 • Render-Safe</div>
+</body></html>`;
   res.send(html);
 });
 
 // ============ SERVER ============
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, HOST, () => {
   console.log(`========================================`);
-  console.log(`🚀 HOANG VIP v11 - UNIVERSAL API`);
+  console.log(`🚀 HOANG VIP v11.1 - RENDER-SAFE`);
   console.log(`========================================`);
-  console.log(`Port: ${PORT} | Polling: ${POLL_INTERVAL_MS}ms`);
-  console.log(`✅ CORS mở - mọi app gọi được`);
-  console.log(`✅ Formats: json/xml/txt/csv`);
-  console.log(`✅ Endpoints: /api/predict, /api/simple, /api/public, /rss, /widget`);
-  console.log(`✅ API Key: ${API_KEY ? 'CÓ (' + API_KEY.slice(0, 4) + '...)' : 'KHÔNG (public)'}`);
-  console.log(`✅ Webhooks: Telegram=${!!TELEGRAM_BOT_TOKEN}, Discord=${!!DISCORD_WEBHOOK}, Slack=${!!SLACK_WEBHOOK}, Custom=${!!CUSTOM_WEBHOOK}`);
+  console.log(`Server: http://${HOST}:${PORT}`);
+  console.log(`FS Dir: ${DB_DIR}`);
+  console.log(`FS Writable: ${FILESYSTEM_WRITABLE}`);
+  console.log(`Is Render: ${IS_RENDER}`);
+  console.log(`API Key: ${API_KEY ? 'SET' : 'NONE'}`);
   console.log(`========================================`);
   startPolling();
+});
+
+server.on('error', (e) => {
+  console.error('[SERVER ERROR]', e.message);
+  process.exit(1);
 });
 
 function shutdown(signal) {
@@ -1490,3 +1249,5 @@ function shutdown(signal) {
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('uncaughtException', (e) => console.error('[UNCAUGHT]', e.message, e.stack));
+process.on('unhandledRejection', (e) => console.error('[UNHANDLED]', e && e.message ? e.message : e));
