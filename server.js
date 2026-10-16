@@ -1,17 +1,16 @@
 /**
  * ========================================================================
- * HOANG VIP ADAPTIVE v6 - FULL FIX
+ * HOANG VIP ADAPTIVE v7 - FULL FIX
  * ========================================================================
- * ✅ FIX 2 BUG CHÍNH:
- *    1. BẮT BỆT: streak override 3-4-5-6-7+ phiên
- *    2. NHẬN DIỆN CẦU: 1-1, 2-2, 3-3, 1-2-1, 2-1-2
- * ✅ Giữ nguyên fix v5:
- *    - Bỏ debias shift (nguyên nhân collapse)
- *    - Blend 4 nguồn cân bằng
- *    - Floor weight 15%
- *    - Sum>=11 Tài, Sum<=10 Xỉu
- *    - Deterministic 100%
+ * ✅ FIX BUG CHÍNH:
+ *    1. SAI KẾT QUẢ: LUÔN tính từ DiceSum, BỎ HOÀN TOÀN BetSide
+ *       - DiceSum 3-10 → XỈU
+ *       - DiceSum 11-18 → TÀI
+ *    2. SAI PHIÊN: mỗi game có session riêng biệt (đã verify)
+ *    3. BẮT BỆT: streak override
+ *    4. NHẬN DIỆN CẦU: 1-1, 2-2, 3-3, 1-2-1, 2-1-2, 1-3-1, 4-4
  * ✅ UI đẹp + badge BỆT/CAU
+ * ✅ Deterministic 100%
  * ========================================================================
  */
 
@@ -69,10 +68,7 @@ const WILSON_Z = 1.96;
 const MIN_CONFIDENCE = 0.03;
 const MIN_SIGNAL_WEIGHT = 0.15;
 const MAX_SIGNAL_WEIGHT = 0.55;
-
-// ✅ NEW: Bệt thresholds
 const STREAK_MIN = 3;
-const STREAK_BREAK = 10;
 
 // ============ HELPERS ============
 function now() { return new Date().toISOString(); }
@@ -132,26 +128,59 @@ function getCurrentTimeSlot(date = new Date()) {
   return 'Dem';
 }
 
-// ============ FIX: LUÔN TÍNH TỪ 3 XÚC XẮC ============
+// ========================================================================
+// ✅ FIX BUG CHÍNH: LUÔN TÍNH TỪ DICESUM, BỎ HOÀN TOÀN BETSIDE
+// ========================================================================
 function itemToDice(item) {
   if (!item) return [0, 0, 0];
-  return [safeInt(item.FirstDice, 0), safeInt(item.SecondDice, 0), safeInt(item.ThirdDice, 0)];
+  return [
+    safeInt(item.FirstDice, 0),
+    safeInt(item.SecondDice, 0),
+    safeInt(item.ThirdDice, 0)
+  ];
 }
 
+/**
+ * ✅ Tổng xúc xắc - ưu tiên tính từ 3 dice, fallback DiceSum
+ */
 function itemToSum(item) {
   if (!item) return 0;
   const d = itemToDice(item);
-  const s = d[0] + d[1] + d[2];
-  if (s > 0 && s <= 18) return s;
-  if (item.DiceSum !== undefined) return safeInt(item.DiceSum, 0);
+  const sumFromDice = d[0] + d[1] + d[2];
+  // Ưu tiên tính từ dice nếu hợp lệ
+  if (sumFromDice >= 3 && sumFromDice <= 18) return sumFromDice;
+  // Fallback: dùng DiceSum từ API
+  if (item.DiceSum !== undefined) {
+    const ds = safeInt(item.DiceSum, 0);
+    if (ds >= 3 && ds <= 18) return ds;
+  }
   return 0;
 }
 
+/**
+ * ✅✅✅ FIX CỰC QUAN TRỌNG:
+ * Tài/Xỉu = f(sum), KHÔNG phụ thuộc BetSide (API trả ngược)
+ * 
+ * Quy tắc chuẩn Tài Xỉu:
+ * - Tổng 3-10 → XỈU
+ * - Tổng 11-18 → TÀI
+ */
 function itemToResult(item) {
   if (!item) return null;
   const sum = itemToSum(item);
-  if (sum >= 3 && sum <= 18) return sum >= 11 ? 'T' : 'X';
-  if (item.BetSide !== undefined) return safeInt(item.BetSide, 0) === 1 ? 'T' : 'X';
+  if (sum >= 3 && sum <= 18) {
+    return sum >= 11 ? 'T' : 'X';
+  }
+  // Nếu không có dice/DiceSum → trả về null (KHÔNG dùng BetSide)
+  return null;
+}
+
+/**
+ * ✅ Helper: mã hóa DiceSum thành result để debug
+ */
+function diceSumToResult(sum) {
+  if (sum >= 3 && sum <= 10) return 'X';
+  if (sum >= 11 && sum <= 18) return 'T';
   return null;
 }
 
@@ -170,7 +199,7 @@ function deterministicInitWeights(dim, seed = 'default') {
 // ============ DB ============
 function defaultDB() {
   return {
-    version: 6,
+    version: 7,
     createdAt: now(), updatedAt: now(),
     history: [],
     stats: { total: 0, wins: 0, losses: 0, currentStreak: 0, maxWinStreak: 0, maxLossStreak: 0 },
@@ -179,7 +208,7 @@ function defaultDB() {
       Toi: { total: 0, wins: 0 }, Dem: { total: 0, wins: 0 }
     },
     lastProcessedSession: null,
-    model: { weights: null, bias: 0, iter: 0, createdAt: now(), version: 1, bestAcc: 0, seed: 'hoang_vip_v6' },
+    model: { weights: null, bias: 0, iter: 0, createdAt: now(), version: 1, bestAcc: 0, seed: 'hoang_vip_v7' },
     calibration: { a: 1.0, b: 0.0, iter: 0 },
     optimizer: { m: null, v: null, t: 0 },
     ensembleRegret: { model: 0, pattern: 0, markov: 0 },
@@ -217,8 +246,25 @@ function migrateDB(db) {
   if (!Array.isArray(db.patterns.list)) db.patterns.list = [];
   if (!db.ensembleWeights) db.ensembleWeights = { model: 0.34, pattern: 0.33, markov: 0.33 };
   if (typeof db._strictUnbiased !== 'boolean') db._strictUnbiased = true;
-  if (!db.version) db.version = 6;
-  db.history = db.history.filter(h => h && typeof h === 'object' && h.phien !== undefined);
+  if (!db.version) db.version = 7;
+
+  // ✅ FIX: Re-evaluate tất cả history cũ bằng công thức mới
+  db.history = db.history
+    .filter(h => h && typeof h === 'object' && h.phien !== undefined)
+    .map(h => {
+      // Re-tính ketQua từ xucXac nếu có
+      if (Array.isArray(h.xucXac) && h.xucXac.length === 3) {
+        const s = h.xucXac[0] + h.xucXac[1] + h.xucXac[2];
+        if (s >= 3 && s <= 18) {
+          const correctResult = s >= 11 ? 'T' : 'X';
+          h.ketQua = correctResult;
+          h.ketQuaLabel = labelFromTX(correctResult);
+          h.tong = s;
+        }
+      }
+      return h;
+    });
+
   return db;
 }
 
@@ -236,7 +282,7 @@ function saveDatabase(game, db) {
   safeAtomicWrite(BACKUP_FILES[game], db);
 }
 
-// ============ DEBIAS (ĐÃ BỎ SHIFT) ============
+// ============ DEBIAS ============
 function getRecentMeanPred(db, windowSize = 200) {
   const hist = (db.history || []).slice(-windowSize);
   if (!hist.length) return 0.5;
@@ -265,7 +311,7 @@ function forceBalance(db, p) {
   return pc;
 }
 
-// ============ ✅ NEW #1: BẮT BỆT (STREAK) ============
+// ============ BẮT BỆT ============
 function detectStreak(seq) {
   if (!seq || seq.length < 2) return { type: 'none', length: 0 };
   const last = seq[seq.length - 1];
@@ -281,39 +327,30 @@ function applyStreakOverride(db, finalP, seq) {
   if (streak.length < STREAK_MIN) {
     return { p: finalP, applied: false, streak, reason: 'none' };
   }
-
   const isTai = streak.type === 'T';
 
-  // Bệt 3-4: override 60%
   if (streak.length <= 4) {
     const target = isTai ? 0.62 : 0.38;
     return { p: clamp(0.6 * target + 0.4 * finalP), applied: true, streak, reason: `bệt${streak.length}` };
   }
-
-  // Bệt 5-6: override 75%
   if (streak.length <= 6) {
     const target = isTai ? 0.68 : 0.32;
     return { p: clamp(0.75 * target + 0.25 * finalP), applied: true, streak, reason: `bệt${streak.length}` };
   }
-
-  // Bệt 7-9: override 85%
   if (streak.length <= 9) {
     const target = isTai ? 0.72 : 0.28;
     return { p: clamp(0.85 * target + 0.15 * finalP), applied: true, streak, reason: `bệt${streak.length}` };
   }
-
-  // Bệt 10+: nghiêng gãy (vì bệt dài dễ gãy)
   const breakTarget = isTai ? 0.45 : 0.55;
   return { p: clamp(0.55 * breakTarget + 0.45 * finalP), applied: true, streak, reason: `bệt${streak.length}_gãy` };
 }
 
-// ============ ✅ NEW #2: NHẬN DIỆN CẦU ============
+// ============ NHẬN DIỆN CẦU ============
 function detectPattern(seq) {
-  if (!seq || seq.length < 6) return { type: 'none', confidence: 0, next: null, length: 0 };
-
+  if (!seq || seq.length < 5) return { type: 'none', confidence: 0, next: null, length: 0 };
   const n = seq.length;
 
-  // === Cầu 1-1: T-X-T-X-T-X (đảo liên tục) ===
+  // Cầu 1-1: T-X-T-X-T-X
   {
     const recent = seq.slice(-12);
     let match11 = 0;
@@ -323,29 +360,23 @@ function detectPattern(seq) {
     }
     if (match11 >= 5) {
       const next = recent[recent.length - 1] === 'T' ? 'X' : 'T';
-      return {
-        type: 'cau_1_1', next,
-        confidence: Math.min(0.60 + match11 * 0.04, 0.85),
-        length: match11
-      };
+      return { type: 'cau_1_1', next, confidence: Math.min(0.60 + match11 * 0.04, 0.85), length: match11 };
     }
   }
 
-  // === Cầu 2-2: TT-XX-TT-XX ===
+  // Cầu 2-2: TT-XX-TT-XX
   if (n >= 8) {
     const p8 = seq.slice(-8).join('');
     if (p8 === 'TTXXTTXX') return { type: 'cau_2_2', next: 'T', confidence: 0.75, length: 8 };
     if (p8 === 'XXTTXXTT') return { type: 'cau_2_2', next: 'X', confidence: 0.75, length: 8 };
-    if (p8 === 'TTXXTTXX') return { type: 'cau_2_2', next: 'T', confidence: 0.75, length: 8 };
   }
   if (n >= 6) {
     const p6 = seq.slice(-6).join('');
     if (p6 === 'TTXXTT') return { type: 'cau_2_2', next: 'X', confidence: 0.68, length: 6 };
     if (p6 === 'XXTTXX') return { type: 'cau_2_2', next: 'T', confidence: 0.68, length: 6 };
-    if (p6 === 'TTXXTT') return { type: 'cau_2_2', next: 'X', confidence: 0.68, length: 6 };
   }
 
-  // === Cầu 3-3: TTT-XXX-TTT ===
+  // Cầu 3-3
   if (n >= 6) {
     const p6 = seq.slice(-6).join('');
     if (p6 === 'TTTXXX') return { type: 'cau_3_3', next: 'T', confidence: 0.72, length: 6 };
@@ -357,7 +388,7 @@ function detectPattern(seq) {
     if (p9 === 'XXXTTTXXX') return { type: 'cau_3_3', next: 'T', confidence: 0.78, length: 9 };
   }
 
-  // === Cầu 1-2-1: T-XX-T-XX-T ===
+  // Cầu 1-2-1
   if (n >= 5) {
     const p5 = seq.slice(-5).join('');
     if (p5 === 'TXXTX') return { type: 'cau_1_2_1', next: 'X', confidence: 0.62, length: 5 };
@@ -369,21 +400,21 @@ function detectPattern(seq) {
     if (p8 === 'XTTXTTXT') return { type: 'cau_1_2_1', next: 'X', confidence: 0.70, length: 8 };
   }
 
-  // === Cầu 2-1-2: TT-X-TT-X ===
+  // Cầu 2-1-2
   if (n >= 6) {
     const p6 = seq.slice(-6).join('');
     if (p6 === 'TTXTTX') return { type: 'cau_2_1_2', next: 'T', confidence: 0.65, length: 6 };
     if (p6 === 'XXTXXT') return { type: 'cau_2_1_2', next: 'X', confidence: 0.65, length: 6 };
   }
 
-  // === Cầu 1-3-1 ===
+  // Cầu 1-3-1
   if (n >= 5) {
     const p5 = seq.slice(-5).join('');
     if (p5 === 'TXXXT') return { type: 'cau_1_3_1', next: 'X', confidence: 0.60, length: 5 };
     if (p5 === 'XTTTX') return { type: 'cau_1_3_1', next: 'T', confidence: 0.60, length: 5 };
   }
 
-  // === Cầu 4-4 ===
+  // Cầu 4-4
   if (n >= 8) {
     const p8 = seq.slice(-8).join('');
     if (p8 === 'TTTTXXXX') return { type: 'cau_4_4', next: 'T', confidence: 0.70, length: 8 };
@@ -398,7 +429,6 @@ function applyCauDetection(db, finalP, seq) {
   if (cau.type === 'none' || !cau.next) {
     return { p: finalP, applied: false, cau };
   }
-
   const target = cau.next === 'T'
     ? (0.5 + cau.confidence * 0.4)
     : (0.5 - cau.confidence * 0.4);
@@ -843,7 +873,7 @@ async function fetchWithRetry(url, attempts = FETCH_RETRIES) {
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
     try {
-      return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVipAdaptive/6.0' } });
+      return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVipAdaptive/7.0' } });
     } catch (e) {
       lastErr = e;
       if (i < attempts - 1) await new Promise(r => setTimeout(r, 200 + i * 200));
@@ -852,15 +882,29 @@ async function fetchWithRetry(url, attempts = FETCH_RETRIES) {
   throw lastErr || new Error('Fetch failed');
 }
 
+/**
+ * ✅ FIX: API trả về MỚI NHẤT Ở ĐẦU → REVERSE để cũ→mới
+ */
 function parseHistoryResponse(data) {
-  if (Array.isArray(data)) return data;
-  if (data && Array.isArray(data.data)) return data.data;
-  if (data && Array.isArray(data.list)) return data.list;
-  if (data && data.data && Array.isArray(data.data.list)) return data.data.list;
-  return [];
+  let arr = [];
+  if (Array.isArray(data)) arr = data;
+  else if (data && Array.isArray(data.data)) arr = data.data;
+  else if (data && Array.isArray(data.list)) arr = data.list;
+  else if (data && data.data && Array.isArray(data.data.list)) arr = data.data.list;
+  else return [];
+
+  // Detect thứ tự: nếu SessionId đầu > SessionId cuối → mới nhất ở đầu → reverse
+  if (arr.length >= 2) {
+    const first = Number(arr[0].SessionId || arr[0].session || 0);
+    const last = Number(arr[arr.length - 1].SessionId || arr[arr.length - 1].session || 0);
+    if (first > last) {
+      arr = arr.slice().reverse();
+    }
+  }
+  return arr;
 }
 
-// ============ ✅ FULL FIX v6: RUN PREDICTION ============
+// ============ RUN PREDICTION ============
 function runPrediction(db, seq, game = 'default') {
   if (!Array.isArray(seq) || seq.length === 0) {
     return {
@@ -893,7 +937,6 @@ function runPrediction(db, seq, game = 'default') {
   const combined = combineSignals(db, pModel, pPattern, pMarkov);
   const calibrated = calibrate(db, logit);
 
-  // ===== BASE BLEND =====
   let finalP = clamp(
     0.35 * calibrated +
     0.25 * pModel +
@@ -903,18 +946,14 @@ function runPrediction(db, seq, game = 'default') {
 
   finalP = debiasProbability(db, finalP);
 
-  // ===== ✅ NEW: STREAK OVERRIDE =====
   const streakResult = applyStreakOverride(db, finalP, seq);
   if (streakResult.applied) finalP = streakResult.p;
 
-  // ===== ✅ NEW: CẦU DETECTION =====
   const cauResult = applyCauDetection(db, finalP, seq);
   if (cauResult.applied) finalP = cauResult.p;
 
-  // ===== FORCE BALANCE =====
   finalP = forceBalance(db, finalP);
 
-  // ===== ANCHOR =====
   const avgSignal = (pModel + pPattern + pMarkov) / 3;
   if (!streakResult.applied && !cauResult.applied) {
     if (Math.abs(finalP - avgSignal) > 0.15) {
@@ -925,22 +964,17 @@ function runPrediction(db, seq, game = 'default') {
   const entropy = entropyFromProb(finalP);
   const comps = { modelProb: pModel, patternProb: pPattern, markovProb: pMarkov };
 
-  // ===== GATING + BYPASS =====
   let gate = gatingDecision(db, finalP, entropy, comps);
 
-  // Bypass gating nếu bệt >= 5
   if (streakResult.applied && streakResult.streak.length >= 5 && !streakResult.reason.includes('gãy')) {
     gate = { pass: true, reason: `streak_${streakResult.streak.length}`, agree: 3, confThresh: 0, entThresh: 0 };
-  }
-  // Bypass gating nếu cầu confidence >= 0.68
-  else if (cauResult.applied && cauResult.cau.confidence >= 0.68) {
+  } else if (cauResult.applied && cauResult.cau.confidence >= 0.68) {
     gate = { pass: true, reason: `cau_${cauResult.cau.type}`, agree: 3, confThresh: 0, entThresh: 0 };
   }
 
   const predCode = finalP >= 0.5 ? 'T' : 'X';
   const predLabel = labelFromTX(predCode);
 
-  // Build tỉ lệ label
   let tiLeLabel = (Math.max(finalP, 1 - finalP) * 100).toFixed(1) + '%';
   if (streakResult.applied) tiLeLabel += ` [BỆT${streakResult.streak.length}]`;
   else if (cauResult.applied) tiLeLabel += ` [${cauResult.cau.type.toUpperCase()}]`;
@@ -967,6 +1001,7 @@ async function processGameTick(game) {
     const historyList = parseHistoryResponse(resp.data);
     if (!Array.isArray(historyList) || !historyList.length) return;
 
+    // ✅ Sau parseHistoryResponse, cuối mảng là MỚI NHẤT
     const latest = historyList[historyList.length - 1];
     const currentSession = safeInt(latest.SessionId || latest.session, 0);
     if (!currentSession) return;
@@ -1029,7 +1064,6 @@ async function processGameTick(game) {
       if (b !== null && Number.isFinite(b)) db.brierHistory.push({ at: now(), brier: Number(b.toFixed(4)) });
     }
 
-    // New entry
     const newEntry = {
       phien: currentSession,
       xucXac: itemToDice(latest),
@@ -1150,7 +1184,6 @@ app.get('/api/predict/:game', async (req, res) => {
   }
 });
 
-// ============ API: LINK RIÊNG ============
 app.get('/api/link/:game', async (req, res) => {
   const game = req.params.game;
   if (!APIS[game]) return res.status(400).json({ error: 'Bàn chơi không hợp lệ.' });
@@ -1164,21 +1197,16 @@ app.get('/api/link/:game', async (req, res) => {
     const pred = runPrediction(db, seq, game);
     const latest = list[list.length - 1];
     const cs = safeInt(latest.SessionId || latest.session, 0);
-
     const baseUrl = `${req.protocol}://${req.get('host')}`;
 
     return res.json({
-      ok: true,
-      game: game.toUpperCase(),
-      phienHienTai: cs,
-      phienDuDoan: cs + 1,
-      duDoan: pred.predLabel,
-      duDoanCode: pred.predCode,
+      ok: true, game: game.toUpperCase(),
+      phienHienTai: cs, phienDuDoan: cs + 1,
+      duDoan: pred.predLabel, duDoanCode: pred.predCode,
       tiLe: pred.tiLe,
       doTinCay: pred.gate.pass ? 'CAO' : 'THẤP',
       lyDo: pred.gate.reason,
-      streak: pred.streak,
-      cau: pred.cau,
+      streak: pred.streak, cau: pred.cau,
       thoiGian: now(),
       links: {
         ui: `${baseUrl}/${game}`,
@@ -1189,13 +1217,6 @@ app.get('/api/link/:game', async (req, res) => {
         exportJson: `${baseUrl}/api/history/export/${game}`,
         exportCsv: `${baseUrl}/api/export/${game}`,
         metrics: `${baseUrl}/admin/metrics/${game}`
-      },
-      chiTiet: {
-        modelProb: Number(pred.pModel.toFixed(4)),
-        patternProb: Number(pred.pPattern.toFixed(4)),
-        markovProb: Number(pred.pMarkov.toFixed(4)),
-        calibrated: Number(pred.calibrated.toFixed(4)),
-        finalProb: Number(pred.combined.toFixed(4))
       }
     });
   } catch (e) {
@@ -1203,7 +1224,6 @@ app.get('/api/link/:game', async (req, res) => {
   }
 });
 
-// ============ API: HISTORY ============
 app.get('/api/history/:game', (req, res) => {
   const game = req.params.game;
   if (game === 'all') return handleHistoryAll(req, res);
@@ -1234,13 +1254,11 @@ function handleHistoryAll(req, res) {
           maxLossStreak: db.stats.maxLossStreak
         },
         model: {
-          version: db.model.version || 1,
-          bestAcc: db.model.bestAcc || 0,
+          version: db.model.version || 1, bestAcc: db.model.bestAcc || 0,
           iter: db.model.iter || 0,
           weightCount: Array.isArray(db.model.weights) ? db.model.weights.length : 0
         },
         ensembleWeights: db.ensembleWeights,
-        ensembleRegret: db.ensembleRegret,
         brierScore: computeBrierScore(db, 200),
         items: slice.map(formatHistoryItem).filter(Boolean)
       };
@@ -1253,7 +1271,6 @@ function handleHistoryAll(req, res) {
 
 app.get('/api/history/all', handleHistoryAll);
 
-// ============ API: EXPORT ============
 app.get('/api/history/export/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).send('Bàn chơi không hợp lệ.');
@@ -1261,7 +1278,7 @@ app.get('/api/history/export/:game', (req, res) => {
   const exportObj = {
     game, exportedAt: now(), version: db.version,
     stats: db.stats, timeStats: db.timeStats,
-    ensembleWeights: db.ensembleWeights, ensembleRegret: db.ensembleRegret,
+    ensembleWeights: db.ensembleWeights,
     model: {
       version: db.model.version, bestAcc: db.model.bestAcc,
       iter: db.model.iter,
@@ -1269,7 +1286,6 @@ app.get('/api/history/export/:game', (req, res) => {
     },
     calibration: db.calibration,
     brierScore: computeBrierScore(db, 200),
-    brierHistory: db.brierHistory || [],
     biasCorrections: db.biasCorrections || [],
     history: db.history.map(formatHistoryItem).filter(Boolean)
   };
@@ -1283,19 +1299,17 @@ app.get('/api/export/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).send('Bàn chơi không hợp lệ.');
   const db = loadDatabase(game);
-  let csv = 'Phiên,XúcXắc,Tổng,KếtQuả,PhiênDựĐoán,DựĐoán,TỉLệ,MẫuCầu,Bệt,TrạngThái,ThờiGian\n';
+  let csv = 'Phiên,XúcXắc,Tổng,KếtQuả,PhiênDựĐoán,DựĐoán,TỉLệ,Bệt,TrạngThái,ThờiGian\n';
   db.history.forEach(item => {
     const dice = (item.xucXac || []).join('-');
-    const mc = (item.mauCau || '').replace(/"/g, '\'');
     const streak = item.streak && item.streak.length > 0 ? `${item.streak.type}${item.streak.length}` : '';
-    csv += `${item.phien},"${dice}",${item.tong || ''},${item.ketQuaLabel || ''},${item.phienDuDoan},${item.DU_DOAN || ''},${item.TI_LE || ''},"${mc}",${streak},${item.trangThai || ''},${item.thoiGian || ''}\n`;
+    csv += `${item.phien},"${dice}",${item.tong || ''},${item.ketQuaLabel || ''},${item.phienDuDoan},${item.DU_DOAN || ''},${item.TI_LE || ''},${streak},${item.trangThai || ''},${item.thoiGian || ''}\n`;
   });
   res.header('Content-Type', 'text/csv; charset=utf-8');
   res.attachment(`lich_su_${game}.csv`);
   res.send('\uFEFF' + csv);
 });
 
-// ============ API: ANALYZE ============
 app.get('/api/analyze/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ error: 'Bàn chơi không hợp lệ.' });
@@ -1313,7 +1327,7 @@ app.get('/api/analyze/:game', (req, res) => {
       bestAcc: db.model.bestAcc || 0, iter: db.model.iter || 0
     },
     calibration: db.calibration,
-    weights: db.ensembleWeights, regret: db.ensembleRegret,
+    weights: db.ensembleWeights,
     brierScore: computeBrierScore(db, 200),
     patterns: Array.isArray(db.patterns.list) ? db.patterns.list.slice(0, 60) : [],
     biasCorrections: db.biasCorrections || []
@@ -1327,7 +1341,6 @@ app.get('/admin/metrics/:game', (req, res) => {
   const db = loadDatabase(game);
   const tail = (db.history || []).filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI').slice(-200);
   const acc = tail.length ? (tail.filter(h => h.trangThai === 'ĐÚNG').length / tail.length) : 0;
-
   const recent = (db.history || []).slice(-50);
   let cntT = 0, cntX = 0, cntStreak = 0, cntCau = 0;
   for (const h of recent) {
@@ -1336,7 +1349,6 @@ app.get('/admin/metrics/:game', (req, res) => {
     if (h.TI_LE && h.TI_LE.includes('BỆT')) cntStreak++;
     if (h.TI_LE && h.TI_LE.includes('CAU_')) cntCau++;
   }
-
   return res.json({
     rollingCount: tail.length,
     rollingAccuracy: Number(acc.toFixed(4)),
@@ -1346,21 +1358,20 @@ app.get('/admin/metrics/:game', (req, res) => {
     distribution: { tai: cntT, xiu: cntX, ratio: cntT + cntX > 0 ? `${cntT}/${cntX}` : 'N/A' },
     recentDetections: { streakCount: cntStreak, cauCount: cntCau },
     ensembleWeights: db.ensembleWeights,
-    ensembleRegret: db.ensembleRegret,
     biasCorrections: db.biasCorrections ? db.biasCorrections.length : 0,
     modelVersion: db.model.version || 1,
-    bestAcc: db.model.bestAcc || 0
+    bestAcc: db.model.bestAcc || 0,
+    lastProcessedSession: db.lastProcessedSession
   });
 });
 
 app.get('/admin/config', (req, res) => {
   res.json({
-    LR_LEARNING_RATE, LR_REGULARIZATION,
-    MARKOV_MAX_ORDER, PATTERN_TOP_N,
+    VERSION: 7, DETERMINISTIC: true,
+    LR_LEARNING_RATE, MARKOV_MAX_ORDER, PATTERN_TOP_N,
     CONFIDENCE_THRESHOLD, ENTROPY_THRESHOLD,
-    MIN_CONFIDENCE, MIN_SIGNAL_WEIGHT, MAX_SIGNAL_WEIGHT,
-    STREAK_MIN, STREAK_BREAK,
-    DETERMINISTIC: true, VERSION: 6
+    STREAK_MIN, MIN_SIGNAL_WEIGHT, MAX_SIGNAL_WEIGHT,
+    RESULT_RULE: 'DiceSum 3-10 → Xỉu, 11-18 → Tài'
   });
 });
 
@@ -1379,7 +1390,7 @@ app.get('/:game', (req, res) => {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>HOANG VIP v6 - ${game.toUpperCase()}</title>
+<title>HOANG VIP v7 - ${game.toUpperCase()}</title>
 <style>
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   body{
@@ -1391,17 +1402,9 @@ app.get('/:game', (req, res) => {
     background:linear-gradient(135deg,#1e3a8a,#3b82f6);
     padding:16px;border-radius:14px;margin-bottom:14px;
     box-shadow:0 8px 24px rgba(59,130,246,0.3);
-    position:relative;overflow:hidden;
   }
-  .header::before{
-    content:'';position:absolute;top:-50%;right:-50%;
-    width:200%;height:200%;
-    background:radial-gradient(circle,rgba(255,255,255,0.1) 0%,transparent 70%);
-    animation:shine 3s infinite linear;
-  }
-  @keyframes shine{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
-  h1{color:#fff;font-size:17px;margin:0;font-weight:700;position:relative;z-index:1}
-  .subtitle{color:#bfdbfe;font-size:11px;margin-top:4px;position:relative;z-index:1}
+  h1{color:#fff;font-size:17px;margin:0;font-weight:700}
+  .subtitle{color:#bfdbfe;font-size:11px;margin-top:4px}
 
   .stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px}
   .stat-card{
@@ -1409,7 +1412,7 @@ app.get('/:game', (req, res) => {
     padding:10px;border-radius:10px;text-align:center;
     border:1px solid #334155;box-shadow:0 4px 12px rgba(0,0,0,0.3);
   }
-  .stat-card .label{font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px}
+  .stat-card .label{font-size:10px;color:#94a3b8;text-transform:uppercase}
   .stat-card .value{font-size:20px;font-weight:700;margin-top:2px}
   .value.green{color:#22c55e}.value.red{color:#ef4444}
   .value.blue{color:#38bdf8}.value.yellow{color:#eab308}
@@ -1417,7 +1420,7 @@ app.get('/:game', (req, res) => {
   .link-box{
     background:linear-gradient(135deg,#064e3b,#065f46);
     padding:12px;border-radius:12px;margin-bottom:14px;
-    border:1px solid #10b981;box-shadow:0 4px 12px rgba(16,185,129,0.2);
+    border:1px solid #10b981;
   }
   .link-box .title{font-size:12px;color:#6ee7b7;font-weight:600;margin-bottom:6px}
   .link-row{
@@ -1431,21 +1434,19 @@ app.get('/:game', (req, res) => {
     padding:4px 10px;border-radius:6px;
     font-size:10px;font-weight:600;cursor:pointer;white-space:nowrap;
   }
-  .copy-btn:active{background:#059669}
 
   .table-wrap{
     background:linear-gradient(135deg,#0f172a,#1e293b);
     border-radius:12px;overflow:hidden;
-    border:1px solid #334155;box-shadow:0 8px 24px rgba(0,0,0,0.4);
+    border:1px solid #334155;
   }
   table{width:100%;border-collapse:collapse;font-size:11px}
   th{
     background:linear-gradient(135deg,#1e40af,#3b82f6);
     color:#fff;padding:8px 4px;font-weight:600;
-    text-transform:uppercase;font-size:9px;letter-spacing:0.3px;
+    text-transform:uppercase;font-size:9px;
   }
   td{padding:8px 4px;text-align:center;border-bottom:1px solid #1e293b}
-  tr:last-child td{border-bottom:none}
   tr:hover{background:rgba(59,130,246,0.08)}
   .tai{color:#22c55e;font-weight:700;text-shadow:0 0 8px rgba(34,197,94,0.4)}
   .xiu{color:#ef4444;font-weight:700;text-shadow:0 0 8px rgba(239,68,68,0.4)}
@@ -1460,24 +1461,13 @@ app.get('/:game', (req, res) => {
   }
   .session{font-family:'Courier New',monospace;font-size:10px;color:#94a3b8}
   .ti-le{font-size:10px;color:#a5b4fc}
-  .low-badge{
+  .low-badge, .streak-badge, .cau-badge{
     display:inline-block;font-size:8px;
-    background:#7c2d12;color:#fdba74;
-    padding:1px 4px;border-radius:3px;margin-left:2px;
+    padding:1px 4px;border-radius:3px;margin-left:2px;font-weight:700;
   }
-  .streak-badge{
-    display:inline-block;font-size:8px;
-    background:#7c2d12;color:#fdba74;
-    padding:1px 4px;border-radius:3px;margin-left:2px;
-    font-weight:700;
-  }
-  .cau-badge{
-    display:inline-block;font-size:8px;
-    background:#1e40af;color:#93c5fd;
-    padding:1px 4px;border-radius:3px;margin-left:2px;
-    font-weight:700;
-  }
-  .mau{font-size:9px;color:#64748b;max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .low-badge{background:#7c2d12;color:#fdba74}
+  .streak-badge{background:#7c2d12;color:#fdba74}
+  .cau-badge{background:#1e40af;color:#93c5fd}
   .footer{text-align:center;margin-top:14px;font-size:10px;color:#475569}
 </style>
 <script>
@@ -1495,8 +1485,8 @@ app.get('/:game', (req, res) => {
 </head>
 <body>
   <div class="header">
-    <h1>🎯 HOANG VIP ADAPTIVE v6</h1>
-    <div class="subtitle">Bàn: ${game.toUpperCase()} • Bắt bệt + Nhận diện cầu</div>
+    <h1>🎯 HOANG VIP ADAPTIVE v7</h1>
+    <div class="subtitle">Bàn: ${game.toUpperCase()} • Fix: DiceSum 3-10=Xỉu, 11-18=Tài</div>
   </div>
 
   <div class="stats-grid">
@@ -1518,10 +1508,6 @@ app.get('/:game', (req, res) => {
       <span>${baseUrl}/api/link/${game}</span>
       <button class="copy-btn" onclick="copyText('${baseUrl}/api/link/${game}', this)">Copy</button>
     </div>
-    <div class="link-row">
-      <span>${baseUrl}/api/history/all</span>
-      <button class="copy-btn" onclick="copyText('${baseUrl}/api/history/all', this)">Copy</button>
-    </div>
   </div>
 
   <div class="table-wrap">
@@ -1529,7 +1515,7 @@ app.get('/:game', (req, res) => {
       <thead>
         <tr>
           <th>Phiên</th><th>XX</th><th>Tổng</th><th>KQ</th>
-          <th>Phiên DĐ</th><th>Dự đoán</th><th>Tỉ lệ</th><th>Mẫu</th><th>TT</th>
+          <th>Phiên DĐ</th><th>Dự đoán</th><th>Tỉ lệ</th><th>TT</th>
         </tr>
       </thead>
       <tbody>
@@ -1557,7 +1543,6 @@ app.get('/:game', (req, res) => {
               ${cauMatch ? `<span class="cau-badge">${cauMatch[1]}</span>` : ''}
               ${isLow && !streakMatch && !cauMatch ? '<span class="low-badge">LOW</span>' : ''}
             </td>
-            <td class="mau">${it.mauCau || ''}</td>
             <td class="${ttCls}">${it.trangThai === 'ĐANG CHỜ' ? '...' : it.trangThai}</td>
           </tr>`;
         }).join('')}
@@ -1565,7 +1550,7 @@ app.get('/:game', (req, res) => {
     </table>
   </div>
 
-  <div class="footer">Auto refresh 12s • HOANG VIP v6 • Bắt bệt + Cầu</div>
+  <div class="footer">Auto refresh 12s • HOANG VIP v7 • DiceSum: 3-10=Xỉu, 11-18=Tài</div>
 </body>
 </html>`;
   res.send(html);
@@ -1574,13 +1559,13 @@ app.get('/:game', (req, res) => {
 // ============ SERVER ============
 const server = app.listen(PORT, () => {
   console.log(`========================================`);
-  console.log(`🚀 HOANG VIP ADAPTIVE v6 - BẮT BỆT + CẦU`);
+  console.log(`🚀 HOANG VIP ADAPTIVE v7 - FULL FIX`);
   console.log(`========================================`);
   console.log(`Port: ${PORT} | Polling: ${POLL_INTERVAL_MS}ms`);
+  console.log(`✅ FIX KẾT QUẢ: DiceSum 3-10=Xỉu, 11-18=Tài`);
+  console.log(`✅ BỎ HOÀN TOÀN BetSide (API trả sai)`);
   console.log(`✅ BẮT BỆT: 3-4 (60%) | 5-6 (75%) | 7-9 (85%) | 10+ (gãy)`);
   console.log(`✅ NHẬN CẦU: 1-1 | 2-2 | 3-3 | 1-2-1 | 2-1-2 | 1-3-1 | 4-4`);
-  console.log(`✅ Bypass gating khi bệt>=5 hoặc cầu>=0.68`);
-  console.log(`✅ UI có badge BỆT/CAU`);
   console.log(`========================================`);
   startPolling();
 });
