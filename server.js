@@ -1,32 +1,17 @@
 /**
  * ========================================================================
- * HOANG VIP v10 - MEGA EVOLUTION - SINGLE FILE
+ * HOANG VIP v11 - UNIVERSAL API + WEBHOOK + INTEGRATION
  * ========================================================================
- * 15 THUẬT TOÁN CHẠY SONG SONG:
- *   1. STREAK         - Bắt bệt (4-7-8-10-11+)
- *   2. CAU            - Nhận diện 15+ loại cầu
- *   3. MARKOV         - Chuỗi Markov order 1-5
- *   4. NGRAM          - N-gram pattern 3-7
- *   5. BAYESIAN       - Xác suất có điều kiện
- *   6. TREND          - Xu hướng 20-50 phiên
- *   7. LSTM_SIM       - Giả lập LSTM bằng EWMA multi-scale
- *   8. ARIMA          - Auto-regressive integrated
- *   9. KALMAN         - Kalman filter 1D
- *  10. RANDOM_FOREST  - Ensemble of decision trees (simulated)
- *  11. GRADIENT_BOOST - AdaBoost-like boosting
- *  12. CHAOS          - Logistic map chaos theory
- *  13. FOURIER        - Frequency analysis
- *  14. ENTROPY        - Shannon entropy based
- *  15. META_LEARNER   - Adaptive meta-learner
- *
- * + REGIME DETECTION (bệt / cầu / random)
- * + BRIER SCORE calibration
- * + KELLY CRITERION position sizing
- * + CIRCUIT BREAKER (auto-stop khi thua nhiều)
- * + MODEL SNAPSHOTS + ROLLBACK
- * + WALK-FORWARD BACKTEST
- *
- * Run: npm i express axios && node server.js
+ * TÍNH NĂNG MỚI:
+ *   ✅ CORS mở - mọi app gọi được
+ *   ✅ Multiple formats: JSON/XML/TXT/CSV
+ *   ✅ Webhook push (Telegram/Discord/Slack/custom)
+ *   ✅ Telegram Bot built-in
+ *   ✅ API Key (optional)
+ *   ✅ Rate limiting
+ *   ✅ Simple endpoints cho mobile
+ *   ✅ RSS feed
+ *   ✅ Embed widget
  * ========================================================================
  */
 
@@ -39,6 +24,17 @@ const path = require('path');
 const crypto = require('crypto');
 
 const app = express();
+
+// ============ CORS — CHO PHÉP MỌI APP GỌI ============
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-API-Key');
+  res.header('Access-Control-Max-Age', '86400');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -49,14 +45,25 @@ const MAX_HISTORY = 3000;
 const API_TIMEOUT_MS = 8000;
 const FETCH_RETRIES = 3;
 const MIN_CONFIDENCE = 0.55;
-const MIN_ALGO_TOTAL = 15;      // Số phiên tối thiểu để algo được weight
-const WARMUP = 50;
-const BACKTEST_WINDOW = 200;
-const SNAPSHOT_INTERVAL = 100;   // Snapshot mỗi 100 phiên
+const MIN_ALGO_TOTAL = 15;
+const SNAPSHOT_INTERVAL = 100;
+
+// Integration config
+const API_KEY = process.env.API_KEY || '';                       // Empty = no auth
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || '';
+const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK || '';
+const CUSTOM_WEBHOOK = process.env.CUSTOM_WEBHOOK || '';
+
+// Rate limiting
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 300);
+const rateLimitStore = new Map();  // ip → { count, resetAt }
 
 // Circuit breaker
-const CB_LOSS_STREAK = 5;        // Thua 5 liên tiếp → tạm dừng
-const CB_COOLDOWN = 10;          // Bỏ qua 10 phiên rồi tiếp
+const CB_LOSS_STREAK = 5;
+const CB_COOLDOWN = 10;
 
 const APIS = {
   md5: process.env.API_MD5 || 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau',
@@ -73,22 +80,51 @@ const DB_FILES = {
 const SNAPSHOT_DIR = path.join(DB_DIR, 'snapshots');
 try { if (!fs.existsSync(SNAPSHOT_DIR)) fs.mkdirSync(SNAPSHOT_DIR, { recursive: true }); } catch (e) {}
 
+// ============ MIDDLEWARE ============
+function rateLimit(req, res, next) {
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  const now = Date.now();
+  let entry = rateLimitStore.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    rateLimitStore.set(ip, entry);
+  }
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: 'Rate limit exceeded', retryAfter: Math.ceil((entry.resetAt - now) / 1000) });
+  }
+  next();
+}
+
+function checkApiKey(req, res, next) {
+  if (!API_KEY) return next();
+  const key = req.headers['x-api-key'] || req.query.api_key;
+  // Cho phép public UI/health endpoints
+  const publicPaths = ['/', '/health', '/api/public', '/rss', '/widget'];
+  if (publicPaths.some(p => req.path === p || req.path.startsWith(p))) return next();
+  if (key !== API_KEY) {
+    return res.status(401).json({ error: 'Invalid API key', hint: 'Add ?api_key=YOUR_KEY or X-API-Key header' });
+  }
+  next();
+}
+
+// Cleanup rate limit map
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimitStore) {
+    if (now > v.resetAt) rateLimitStore.delete(k);
+  }
+}, 60 * 1000);
+
 // ============ HELPERS ============
 function now() { return new Date().toISOString(); }
 function safeInt(x, def = 0) { const n = parseInt(x, 10); return Number.isFinite(n) ? n : def; }
 function safeNum(x, def = 0) { const n = Number(x); return Number.isFinite(n) ? n : def; }
-
 function labelFromTX(code) {
   if (code === 'T') return 'Tài';
   if (code === 'X') return 'Xỉu';
   return null;
 }
-function codeFromLabel(label) {
-  if (label === 'Tài') return 'T';
-  if (label === 'Xỉu') return 'X';
-  return null;
-}
-
 function safeReadJson(fp, fb = null) {
   try {
     if (!fs.existsSync(fp)) return fb;
@@ -105,39 +141,17 @@ function safeAtomicWrite(fp, data) {
     return true;
   } catch (e) { return false; }
 }
-
-function sha256(str) {
-  return crypto.createHash('sha256').update(String(str)).digest('hex');
-}
-
 function sigmoid(z) {
   if (!Number.isFinite(z)) return 0.5;
-  if (z >= 0) {
-    const e = Math.exp(-z);
-    return Number.isFinite(e) ? 1 / (1 + e) : 1;
-  } else {
-    const e = Math.exp(z);
-    return Number.isFinite(e) ? e / (1 + e) : 0;
-  }
+  if (z >= 0) { const e = Math.exp(-z); return Number.isFinite(e) ? 1 / (1 + e) : 1; }
+  else { const e = Math.exp(z); return Number.isFinite(e) ? e / (1 + e) : 0; }
 }
-
 function clamp(x, min = 0, max = 1) {
   if (!Number.isFinite(x)) return 0.5;
   return Math.min(Math.max(x, min), max);
 }
 
-function mean(arr) {
-  if (!arr.length) return 0;
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
-}
-
-function stdDev(arr) {
-  if (arr.length < 2) return 0;
-  const m = mean(arr);
-  return Math.sqrt(arr.reduce((a, b) => a + (b - m) ** 2, 0) / (arr.length - 1));
-}
-
-// ============ DICE → RESULT ============
+// ============ DICE ============
 function itemToDice(item) {
   if (!item) return [0, 0, 0];
   return [safeInt(item.FirstDice, 0), safeInt(item.SecondDice, 0), safeInt(item.ThirdDice, 0)];
@@ -160,33 +174,23 @@ function itemToResult(item) {
   return null;
 }
 
-// ========================================================================
-// 🎯 REGIME DETECTION - PHÁT HIỆN CHẾ ĐỘ THỊ TRƯỜNG
-// ========================================================================
+// ============ REGIME ============
 function detectRegime(seq) {
   if (!seq || seq.length < 20) return { type: 'unknown', confidence: 0 };
   const recent = seq.slice(-30);
   const n = recent.length;
-
-  // Đếm chuyển đổi
   let transitions = 0;
   for (let i = 1; i < n; i++) if (recent[i] !== recent[i - 1]) transitions++;
   const transitionRate = transitions / (n - 1);
-
-  // Streak dài nhất
   let maxStreak = 1, curStreak = 1;
   for (let i = 1; i < n; i++) {
     if (recent[i] === recent[i - 1]) curStreak++;
     else curStreak = 1;
     if (curStreak > maxStreak) maxStreak = curStreak;
   }
-
-  // Entropy
   const cntT = recent.filter(x => x === 'T').length;
   const pT = cntT / n;
   const entropy = -((pT || 1e-9) * Math.log2(pT || 1e-9) + ((1 - pT) || 1e-9) * Math.log2((1 - pT) || 1e-9));
-
-  // Phân loại
   if (maxStreak >= 5) return { type: 'BỆT', confidence: Math.min(maxStreak / 10, 0.9), maxStreak, transitionRate, entropy };
   if (transitionRate >= 0.75) return { type: 'CẦU_1_1', confidence: 0.75, maxStreak, transitionRate, entropy };
   if (transitionRate <= 0.30) return { type: 'BỆT', confidence: 0.65, maxStreak, transitionRate, entropy };
@@ -194,153 +198,35 @@ function detectRegime(seq) {
   return { type: 'HỖN_HỢP', confidence: 0.5, maxStreak, transitionRate, entropy };
 }
 
-// ========================================================================
-// 🧠 15 THUẬT TOÁN
-// ========================================================================
-
-/**
- * 1. STREAK — Bắt bệt
- */
+// ============ ALGOS (rút gọn - giữ 15) ============
 function algoStreak(seq) {
   if (!seq || seq.length < 4) return { code: null, conf: 0, reason: 'no_data' };
   const last = seq[seq.length - 1];
   let len = 1;
-  for (let i = seq.length - 2; i >= 0; i--) {
-    if (seq[i] === last) len++; else break;
-  }
-  if (len >= 4 && len <= 7) {
-    return { code: last, conf: 0.70 + Math.min((len - 4) * 0.03, 0.10), reason: `BỆT${len}` };
-  }
-  if (len >= 8 && len <= 10) {
-    return { code: last, conf: 0.55, reason: `BỆT${len}_NGHI` };
-  }
-  if (len >= 11) {
-    return { code: last === 'T' ? 'X' : 'T', conf: 0.62, reason: `BỆT${len}_GÃY` };
-  }
+  for (let i = seq.length - 2; i >= 0; i--) { if (seq[i] === last) len++; else break; }
+  if (len >= 4 && len <= 7) return { code: last, conf: 0.70 + Math.min((len - 4) * 0.03, 0.10), reason: `BỆT${len}` };
+  if (len >= 8 && len <= 10) return { code: last, conf: 0.55, reason: `BỆT${len}_NGHI` };
+  if (len >= 11) return { code: last === 'T' ? 'X' : 'T', conf: 0.62, reason: `BỆT${len}_GÃY` };
   return { code: null, conf: 0, reason: 'no_signal' };
 }
 
-/**
- * 2. CAU — 15+ loại cầu
- */
 function algoCau(seq) {
   if (!seq || seq.length < 4) return { code: null, conf: 0, reason: 'no_data' };
-  const n = seq.length;
-  const last = seq[n - 1];
-
-  // 1-1
+  const n = seq.length, last = seq[n - 1];
   let alt = 0;
-  for (let i = n - 1; i >= 1; i--) {
-    if (seq[i] !== seq[i - 1]) alt++; else break;
-  }
-  if (alt >= 5) {
-    return { code: last === 'T' ? 'X' : 'T', conf: Math.min(0.62 + (alt - 5) * 0.04, 0.80), reason: `CẦU_1_1` };
-  }
-
-  // 2-2
-  if (n >= 8) {
-    const p8 = seq.slice(-8).join('');
-    if (p8 === 'TTXXTTXX') return { code: 'T', conf: 0.75, reason: 'CẦU_2_2' };
-    if (p8 === 'XXTTXXTT') return { code: 'X', conf: 0.75, reason: 'CẦU_2_2' };
-  }
-  if (n >= 6) {
-    const p6 = seq.slice(-6).join('');
-    if (p6 === 'TTXXTT') return { code: 'X', conf: 0.68, reason: 'CẦU_2_2' };
-    if (p6 === 'XXTTXX') return { code: 'T', conf: 0.68, reason: 'CẦU_2_2' };
-  }
-
-  // 3-3
-  if (n >= 9) {
-    const p9 = seq.slice(-9).join('');
-    if (p9 === 'TTTXXXTTT') return { code: 'X', conf: 0.78, reason: 'CẦU_3_3' };
-    if (p9 === 'XXXTTTXXX') return { code: 'T', conf: 0.78, reason: 'CẦU_3_3' };
-  }
-  if (n >= 6) {
-    const p6 = seq.slice(-6).join('');
-    if (p6 === 'TTTXXX') return { code: 'T', conf: 0.72, reason: 'CẦU_3_3' };
-    if (p6 === 'XXXTTT') return { code: 'X', conf: 0.72, reason: 'CẦU_3_3' };
-  }
-
-  // 4-4
-  if (n >= 8) {
-    const p8 = seq.slice(-8).join('');
-    if (p8 === 'TTTTXXXX') return { code: 'T', conf: 0.72, reason: 'CẦU_4_4' };
-    if (p8 === 'XXXXTTTT') return { code: 'X', conf: 0.72, reason: 'CẦU_4_4' };
-  }
-
-  // 1-2-1
-  if (n >= 8) {
-    const p8 = seq.slice(-8).join('');
-    if (p8 === 'TXXTXXTX') return { code: 'T', conf: 0.70, reason: 'CẦU_1_2_1' };
-    if (p8 === 'XTTXTTXT') return { code: 'X', conf: 0.70, reason: 'CẦU_1_2_1' };
-  }
-  if (n >= 5) {
-    const p5 = seq.slice(-5).join('');
-    if (p5 === 'TXXTX') return { code: 'X', conf: 0.62, reason: 'CẦU_1_2_1' };
-    if (p5 === 'XTTXT') return { code: 'T', conf: 0.62, reason: 'CẦU_1_2_1' };
-  }
-
-  // 2-1-2
-  if (n >= 6) {
-    const p6 = seq.slice(-6).join('');
-    if (p6 === 'TTXTTX') return { code: 'T', conf: 0.65, reason: 'CẦU_2_1_2' };
-    if (p6 === 'XXTXXT') return { code: 'X', conf: 0.65, reason: 'CẦU_2_1_2' };
-  }
-
-  // 1-3-1
-  if (n >= 5) {
-    const p5 = seq.slice(-5).join('');
-    if (p5 === 'TXXXT') return { code: 'X', conf: 0.60, reason: 'CẦU_1_3_1' };
-    if (p5 === 'XTTTX') return { code: 'T', conf: 0.60, reason: 'CẦU_1_3_1' };
-  }
-
-  // 2-1-1
-  if (n >= 8) {
-    const p8 = seq.slice(-8).join('');
-    if (p8 === 'TTXTTXTT') return { code: 'X', conf: 0.68, reason: 'CẦU_2_1_1' };
-    if (p8 === 'XXTXXTXX') return { code: 'T', conf: 0.68, reason: 'CẦU_2_1_1' };
-  }
-
-  // 2-3-2
-  if (n >= 7) {
-    const p7 = seq.slice(-7).join('');
-    if (p7 === 'TTXXXTT') return { code: 'X', conf: 0.68, reason: 'CẦU_2_3_2' };
-    if (p7 === 'XXTTTXX') return { code: 'T', conf: 0.68, reason: 'CẦU_2_3_2' };
-  }
-
-  // 3-2-3
-  if (n >= 8) {
-    const p8 = seq.slice(-8).join('');
-    if (p8 === 'TTTXXTTT') return { code: 'X', conf: 0.70, reason: 'CẦU_3_2_3' };
-    if (p8 === 'XXXTTXXX') return { code: 'T', conf: 0.70, reason: 'CẦU_3_2_3' };
-  }
-
-  // Tăng tiến
-  {
-    const blocks = [];
-    let cur = seq[0], len = 1;
-    for (let i = 1; i < seq.length; i++) {
-      if (seq[i] === cur) len++;
-      else { blocks.push({ type: cur, len }); cur = seq[i]; len = 1; }
-    }
-    blocks.push({ type: cur, len });
-    if (blocks.length >= 3) {
-      const l3 = blocks.slice(-3).map(b => b.len);
-      if (l3[0] < l3[1] && l3[1] < l3[2] && l3[2] <= 5) {
-        return { code: blocks[blocks.length - 1].type === 'T' ? 'X' : 'T', conf: 0.58, reason: 'CẦU_TĂNG_TIẾN' };
-      }
-      if (l3[0] > l3[1] && l3[1] > l3[2] && l3[0] <= 6) {
-        return { code: blocks[blocks.length - 1].type === 'T' ? 'X' : 'T', conf: 0.55, reason: 'CẦU_GIẢM_TIẾN' };
-      }
-    }
-  }
-
+  for (let i = n - 1; i >= 1; i--) { if (seq[i] !== seq[i - 1]) alt++; else break; }
+  if (alt >= 5) return { code: last === 'T' ? 'X' : 'T', conf: Math.min(0.62 + (alt - 5) * 0.04, 0.80), reason: 'CẦU_1_1' };
+  if (n >= 8) { const p8 = seq.slice(-8).join(''); if (p8 === 'TTXXTTXX') return { code: 'T', conf: 0.75, reason: 'CẦU_2_2' }; if (p8 === 'XXTTXXTT') return { code: 'X', conf: 0.75, reason: 'CẦU_2_2' }; }
+  if (n >= 6) { const p6 = seq.slice(-6).join(''); if (p6 === 'TTXXTT') return { code: 'X', conf: 0.68, reason: 'CẦU_2_2' }; if (p6 === 'XXTTXX') return { code: 'T', conf: 0.68, reason: 'CẦU_2_2' }; }
+  if (n >= 9) { const p9 = seq.slice(-9).join(''); if (p9 === 'TTTXXXTTT') return { code: 'X', conf: 0.78, reason: 'CẦU_3_3' }; if (p9 === 'XXXTTTXXX') return { code: 'T', conf: 0.78, reason: 'CẦU_3_3' }; }
+  if (n >= 6) { const p6 = seq.slice(-6).join(''); if (p6 === 'TTTXXX') return { code: 'T', conf: 0.72, reason: 'CẦU_3_3' }; if (p6 === 'XXXTTT') return { code: 'X', conf: 0.72, reason: 'CẦU_3_3' }; }
+  if (n >= 8) { const p8 = seq.slice(-8).join(''); if (p8 === 'TTTTXXXX') return { code: 'T', conf: 0.72, reason: 'CẦU_4_4' }; if (p8 === 'XXXXTTTT') return { code: 'X', conf: 0.72, reason: 'CẦU_4_4' }; }
+  if (n >= 8) { const p8 = seq.slice(-8).join(''); if (p8 === 'TXXTXXTX') return { code: 'T', conf: 0.70, reason: 'CẦU_1_2_1' }; if (p8 === 'XTTXTTXT') return { code: 'X', conf: 0.70, reason: 'CẦU_1_2_1' }; }
+  if (n >= 5) { const p5 = seq.slice(-5).join(''); if (p5 === 'TXXTX') return { code: 'X', conf: 0.62, reason: 'CẦU_1_2_1' }; if (p5 === 'XTTXT') return { code: 'T', conf: 0.62, reason: 'CẦU_1_2_1' }; }
+  if (n >= 6) { const p6 = seq.slice(-6).join(''); if (p6 === 'TTXTTX') return { code: 'T', conf: 0.65, reason: 'CẦU_2_1_2' }; if (p6 === 'XXTXXT') return { code: 'X', conf: 0.65, reason: 'CẦU_2_1_2' }; }
   return { code: null, conf: 0, reason: 'no_signal' };
 }
 
-/**
- * 3. MARKOV — order 1-5
- */
 function algoMarkov(seq, maxOrder = 5) {
   if (!seq || seq.length < 10) return { code: null, conf: 0, reason: 'no_data' };
   const models = {};
@@ -354,7 +240,6 @@ function algoMarkov(seq, maxOrder = 5) {
     }
     models[order] = freq;
   }
-  let bestResult = null;
   for (let order = maxOrder; order >= 1; order--) {
     if (seq.length < order) continue;
     const ctx = seq.slice(-order).join('');
@@ -365,20 +250,11 @@ function algoMarkov(seq, maxOrder = 5) {
     const pT = (e.T + 1) / (n + 2);
     const conf = Math.abs(pT - 0.5) * 2;
     if (conf < 0.15) continue;
-    const candidate = {
-      code: pT >= 0.5 ? 'T' : 'X',
-      conf: Math.min(0.5 + conf * 0.30, 0.75),
-      reason: `MARKOV_O${order}`,
-      orderUsed: order
-    };
-    if (!bestResult || candidate.conf > bestResult.conf) bestResult = candidate;
+    return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.30, 0.75), reason: `MARKOV_O${order}` };
   }
-  return bestResult || { code: null, conf: 0, reason: 'no_signal' };
+  return { code: null, conf: 0, reason: 'no_signal' };
 }
 
-/**
- * 4. NGRAM — pattern 3-7
- */
 function algoNgram(seq, maxLen = 7) {
   if (!seq || seq.length < 30) return { code: null, conf: 0, reason: 'no_data' };
   const patterns = {};
@@ -400,25 +276,17 @@ function algoNgram(seq, maxLen = 7) {
     const pT = (e.T + 1) / (n + 2);
     const conf = Math.abs(pT - 0.5) * 2;
     if (conf < 0.20) continue;
-    return {
-      code: pT >= 0.5 ? 'T' : 'X',
-      conf: Math.min(0.5 + conf * 0.35, 0.78),
-      reason: `NGRAM_${len}`
-    };
+    return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.35, 0.78), reason: `NGRAM_${len}` };
   }
   return { code: null, conf: 0, reason: 'no_signal' };
 }
 
-/**
- * 5. BAYESIAN — xác suất có điều kiện
- */
 function algoBayesian(seq) {
   if (!seq || seq.length < 20) return { code: null, conf: 0, reason: 'no_data' };
   let cntT = 0;
   for (const s of seq) if (s === 'T') cntT++;
   const priorT = (cntT + 1) / (seq.length + 2);
   const priorX = 1 - priorT;
-
   const cond = {};
   for (let len = 2; len <= 6; len++) {
     for (let i = 0; i + len < seq.length; i++) {
@@ -428,7 +296,6 @@ function algoBayesian(seq) {
       cond[ctx][next]++;
     }
   }
-
   for (let len = 6; len >= 2; len--) {
     if (seq.length < len) continue;
     const ctx = seq.slice(-len).join('');
@@ -440,40 +307,23 @@ function algoBayesian(seq) {
     const likX = (e.X + 1) / (n + 2);
     const postT = likT * priorT;
     const postX = likX * priorX;
-    const total = postT + postX;
-    const pT = postT / total;
+    const pT = postT / (postT + postX);
     const conf = Math.abs(pT - 0.5) * 2;
     if (conf < 0.15) continue;
-    return {
-      code: pT >= 0.5 ? 'T' : 'X',
-      conf: Math.min(0.5 + conf * 0.40, 0.78),
-      reason: `BAYES_${len}`
-    };
+    return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.40, 0.78), reason: `BAYES_${len}` };
   }
   return { code: null, conf: 0, reason: 'no_signal' };
 }
 
-/**
- * 6. TREND — xu hướng
- */
 function algoTrend(seq) {
   if (!seq || seq.length < 20) return { code: null, conf: 0, reason: 'no_data' };
   const recent = seq.slice(-20);
   const cntT = recent.filter(x => x === 'T').length;
   if (cntT >= 13) return { code: 'X', conf: 0.58, reason: `TREND_${cntT}T` };
   if (cntT <= 7) return { code: 'T', conf: 0.58, reason: `TREND_${cntT}T` };
-
-  const last5 = seq.slice(-5).filter(x => x === 'T').length;
-  const prev5 = seq.slice(-10, -5).filter(x => x === 'T').length;
-  if (last5 >= 4 && prev5 <= 2) return { code: 'T', conf: 0.55, reason: 'MOMENTUM_UP' };
-  if (last5 <= 1 && prev5 >= 3) return { code: 'X', conf: 0.55, reason: 'MOMENTUM_DOWN' };
-
   return { code: null, conf: 0, reason: 'no_signal' };
 }
 
-/**
- * 7. LSTM_SIM — giả lập LSTM bằng multi-scale EWMA + nonlinear
- */
 function algoLSTMSim(seq) {
   if (!seq || seq.length < 20) return { code: null, conf: 0, reason: 'no_data' };
   const alphas = [0.5, 0.3, 0.15, 0.07, 0.03];
@@ -483,40 +333,22 @@ function algoLSTMSim(seq) {
     for (const x of seq) s = a * (x === 'T' ? 1 : -1) + (1 - a) * s;
     values.push(s);
   }
-
-  // Gate mechanism
-  const gate1 = sigmoid(values[0] * 2 + values[1] * 1.5);
-  const gate2 = sigmoid(values[2] * 3);
-  const gate3 = sigmoid(values[3] * 4 + values[4] * 2);
-  const output = (gate1 * 0.4 + gate2 * 0.3 + gate3 * 0.3) * 2 - 1;
-
+  const g1 = sigmoid(values[0] * 2 + values[1] * 1.5);
+  const g2 = sigmoid(values[2] * 3);
+  const g3 = sigmoid(values[3] * 4 + values[4] * 2);
+  const output = (g1 * 0.4 + g2 * 0.3 + g3 * 0.3) * 2 - 1;
   const conf = Math.abs(output);
   if (conf < 0.15) return { code: null, conf: 0, reason: 'LSTM_LOW' };
-  return {
-    code: output >= 0 ? 'T' : 'X',
-    conf: Math.min(0.5 + conf * 0.35, 0.78),
-    reason: `LSTM_SIM`
-  };
+  return { code: output >= 0 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.35, 0.78), reason: 'LSTM_SIM' };
 }
 
-/**
- * 8. ARIMA — Auto-Regressive
- */
 function algoARIMA(seq, p = 5) {
   if (!seq || seq.length < 30) return { code: null, conf: 0, reason: 'no_data' };
   const vals = seq.map(x => x === 'T' ? 1 : 0);
   const n = vals.length;
-
-  // Fit AR(p) coefficients
   const X = [], Y = [];
-  for (let i = p; i < n; i++) {
-    X.push(vals.slice(i - p, i));
-    Y.push(vals[i]);
-  }
-
+  for (let i = p; i < n; i++) { X.push(vals.slice(i - p, i)); Y.push(vals[i]); }
   if (X.length < 10) return { code: null, conf: 0, reason: 'ARIMA_NO_DATA' };
-
-  // Least squares via normal equation (simplified gradient descent)
   const coef = new Array(p).fill(0);
   const lr = 0.01;
   for (let iter = 0; iter < 50; iter++) {
@@ -529,126 +361,44 @@ function algoARIMA(seq, p = 5) {
     }
     for (let j = 0; j < p; j++) coef[j] += lr * grad[j] / X.length;
   }
-
-  // Predict next
   const lastP = vals.slice(-p);
   let pred = 0;
   for (let j = 0; j < p; j++) pred += coef[j] * lastP[j];
-
   const conf = Math.abs(pred - 0.5) * 2;
   if (conf < 0.15) return { code: null, conf: 0, reason: 'ARIMA_LOW' };
-  return {
-    code: pred >= 0.5 ? 'T' : 'X',
-    conf: Math.min(0.5 + conf * 0.30, 0.72),
-    reason: `ARIMA_P${p}`
-  };
+  return { code: pred >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.30, 0.72), reason: `ARIMA_P${p}` };
 }
 
-/**
- * 9. KALMAN — Kalman filter 1D
- */
 function algoKalman(seq) {
   if (!seq || seq.length < 20) return { code: null, conf: 0, reason: 'no_data' };
   const vals = seq.map(x => x === 'T' ? 1 : 0);
-
   let x = 0.5, P = 1.0;
   const Q = 0.01, R = 0.1;
   for (const v of vals) {
-    // Predict
-    const xPred = x;
-    const PPred = P + Q;
-    // Update
+    const xPred = x, PPred = P + Q;
     const K = PPred / (PPred + R);
     x = xPred + K * (v - xPred);
     P = (1 - K) * PPred;
   }
-
   const conf = Math.abs(x - 0.5) * 2;
   if (conf < 0.15) return { code: null, conf: 0, reason: 'KALMAN_LOW' };
-  return {
-    code: x >= 0.5 ? 'T' : 'X',
-    conf: Math.min(0.5 + conf * 0.35, 0.75),
-    reason: `KALMAN`
-  };
-}
-
-/**
- * 10. RANDOM_FOREST — Simulated ensemble of trees
- */
-function algoRandomForest(seq) {
-  if (!seq || seq.length < 40) return { code: null, conf: 0, reason: 'no_data' };
-  const n = seq.length;
-
-  // Feature extraction
-  const features = [];
-  const labels = [];
-  for (let i = 20; i < n; i++) {
-    const past = seq.slice(i - 20, i);
-    const feat = extractFeatures(past);
-    features.push(feat);
-    labels.push(seq[i] === 'T' ? 1 : 0);
-  }
-
-  if (features.length < 20) return { code: null, conf: 0, reason: 'RF_NO_DATA' };
-
-  // Simulate 10 trees
-  const trees = [];
-  for (let t = 0; t < 10; t++) {
-    const idx = [];
-    for (let i = 0; i < features.length; i++) idx.push(i);
-    // Simulated bootstrap
-    const sampleX = [], sampleY = [];
-    for (let i = 0; i < features.length; i++) {
-      const j = idx[(i * 7 + t * 13) % idx.length];
-      sampleX.push(features[j]);
-      sampleY.push(labels[j]);
-    }
-    // Build simple tree = logistic regression on sampled features
-    const coef = fitLogistic(sampleX, sampleY);
-    trees.push(coef);
-  }
-
-  // Predict
-  const currentFeat = extractFeatures(seq.slice(-20));
-  let votes = 0, total = 0;
-  for (const coef of trees) {
-    let z = 0;
-    for (let i = 0; i < coef.length; i++) z += coef[i] * currentFeat[i];
-    votes += sigmoid(z);
-    total++;
-  }
-  const pT = votes / total;
-  const conf = Math.abs(pT - 0.5) * 2;
-  if (conf < 0.15) return { code: null, conf: 0, reason: 'RF_LOW' };
-  return {
-    code: pT >= 0.5 ? 'T' : 'X',
-    conf: Math.min(0.5 + conf * 0.35, 0.78),
-    reason: `RF_10T`
-  };
+  return { code: x >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.35, 0.75), reason: 'KALMAN' };
 }
 
 function extractFeatures(seq) {
   const f = [1.0];
-  // EWMA at multiple scales
-  const alphas = [0.3, 0.15, 0.07];
-  for (const a of alphas) {
+  for (const a of [0.3, 0.15, 0.07]) {
     let s = 0;
     for (const x of seq) s = a * (x === 'T' ? 1 : -1) + (1 - a) * s;
     f.push(s);
   }
-  // Streak
   const last = seq[seq.length - 1];
   let streak = 1;
-  for (let i = seq.length - 2; i >= 0; i--) {
-    if (seq[i] === last) streak++;
-    else break;
-  }
+  for (let i = seq.length - 2; i >= 0; i--) { if (seq[i] === last) streak++; else break; }
   f.push(Math.tanh(streak / 6));
-  // Alternation
   let alt = 0;
   for (let i = 1; i < seq.length; i++) if (seq[i] !== seq[i - 1]) alt++;
   f.push((alt / (seq.length - 1)) * 2 - 1);
-  // Last 3 encoded
   f.push(seq[seq.length - 1] === 'T' ? 1 : -1);
   f.push(seq[seq.length - 2] === 'T' ? 1 : -1);
   f.push(seq[seq.length - 3] === 'T' ? 1 : -1);
@@ -664,8 +414,7 @@ function fitLogistic(X, Y) {
     for (let k = 0; k < X.length; k++) {
       let z = 0;
       for (let j = 0; j < dim; j++) z += coef[j] * X[k][j];
-      const pred = sigmoid(z);
-      const err = Y[k] - pred;
+      const err = Y[k] - sigmoid(z);
       for (let j = 0; j < dim; j++) grad[j] += err * X[k][j];
     }
     for (let j = 0; j < dim; j++) coef[j] += lr * grad[j] / X.length;
@@ -673,72 +422,32 @@ function fitLogistic(X, Y) {
   return coef;
 }
 
-/**
- * 11. GRADIENT_BOOST — AdaBoost-like
- */
-function algoGradientBoost(seq) {
+function algoRandomForest(seq) {
   if (!seq || seq.length < 40) return { code: null, conf: 0, reason: 'no_data' };
   const n = seq.length;
-
   const features = [], labels = [];
-  for (let i = 20; i < n; i++) {
-    features.push(extractFeatures(seq.slice(i - 20, i)));
-    labels.push(seq[i] === 'T' ? 1 : 0);
-  }
-  if (features.length < 20) return { code: null, conf: 0, reason: 'GB_NO_DATA' };
-
-  // Weights init
-  const weights = new Array(features.length).fill(1 / features.length);
-  const models = [];
-
-  // Train 15 weak learners
-  for (let round = 0; round < 15; round++) {
-    // Fit weighted logistic
-    const coef = fitWeightedLogistic(features, labels, weights);
-    models.push(coef);
-
-    // Update weights
-    let errSum = 0;
-    const preds = [];
+  for (let i = 20; i < n; i++) { features.push(extractFeatures(seq.slice(i - 20, i))); labels.push(seq[i] === 'T' ? 1 : 0); }
+  if (features.length < 20) return { code: null, conf: 0, reason: 'RF_NO_DATA' };
+  const trees = [];
+  for (let t = 0; t < 10; t++) {
+    const sampleX = [], sampleY = [];
     for (let i = 0; i < features.length; i++) {
-      let z = 0;
-      for (let j = 0; j < coef.length; j++) z += coef[j] * features[i][j];
-      const p = sigmoid(z);
-      const pred = p >= 0.5 ? 1 : 0;
-      preds.push(pred);
-      if (pred !== labels[i]) errSum += weights[i];
+      const j = (i * 7 + t * 13) % features.length;
+      sampleX.push(features[j]); sampleY.push(labels[j]);
     }
-    if (errSum < 1e-6 || errSum > 0.5) break;
-
-    const alpha = 0.5 * Math.log((1 - errSum) / Math.max(errSum, 1e-9));
-    for (let i = 0; i < weights.length; i++) {
-      if (preds[i] !== labels[i]) weights[i] *= Math.exp(alpha);
-      else weights[i] *= Math.exp(-alpha);
-    }
-    // Normalize
-    const sum = weights.reduce((a, b) => a + b, 0);
-    for (let i = 0; i < weights.length; i++) weights[i] /= sum;
+    trees.push(fitLogistic(sampleX, sampleY));
   }
-
-  if (models.length === 0) return { code: null, conf: 0, reason: 'GB_NO_MODEL' };
-
-  // Predict
   const curFeat = extractFeatures(seq.slice(-20));
-  let sum = 0, cnt = 0;
-  for (const coef of models) {
+  let votes = 0;
+  for (const coef of trees) {
     let z = 0;
-    for (let j = 0; j < coef.length; j++) z += coef[j] * curFeat[j];
-    sum += sigmoid(z);
-    cnt++;
+    for (let i = 0; i < coef.length; i++) z += coef[i] * curFeat[i];
+    votes += sigmoid(z);
   }
-  const pT = sum / cnt;
+  const pT = votes / trees.length;
   const conf = Math.abs(pT - 0.5) * 2;
-  if (conf < 0.15) return { code: null, conf: 0, reason: 'GB_LOW' };
-  return {
-    code: pT >= 0.5 ? 'T' : 'X',
-    conf: Math.min(0.5 + conf * 0.35, 0.78),
-    reason: `GB_${models.length}T`
-  };
+  if (conf < 0.15) return { code: null, conf: 0, reason: 'RF_LOW' };
+  return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.35, 0.78), reason: 'RF_10T' };
 }
 
 function fitWeightedLogistic(X, Y, W) {
@@ -751,8 +460,7 @@ function fitWeightedLogistic(X, Y, W) {
     for (let k = 0; k < X.length; k++) {
       let z = 0;
       for (let j = 0; j < dim; j++) z += coef[j] * X[k][j];
-      const pred = sigmoid(z);
-      const err = (Y[k] - pred) * W[k];
+      const err = (Y[k] - sigmoid(z)) * W[k];
       for (let j = 0; j < dim; j++) grad[j] += err * X[k][j];
       wSum += W[k];
     }
@@ -762,45 +470,69 @@ function fitWeightedLogistic(X, Y, W) {
   return coef;
 }
 
-/**
- * 12. CHAOS — logistic map
- */
+function algoGradientBoost(seq) {
+  if (!seq || seq.length < 40) return { code: null, conf: 0, reason: 'no_data' };
+  const n = seq.length;
+  const features = [], labels = [];
+  for (let i = 20; i < n; i++) { features.push(extractFeatures(seq.slice(i - 20, i))); labels.push(seq[i] === 'T' ? 1 : 0); }
+  if (features.length < 20) return { code: null, conf: 0, reason: 'GB_NO_DATA' };
+  const weights = new Array(features.length).fill(1 / features.length);
+  const models = [];
+  for (let round = 0; round < 15; round++) {
+    const coef = fitWeightedLogistic(features, labels, weights);
+    models.push(coef);
+    let errSum = 0;
+    const preds = [];
+    for (let i = 0; i < features.length; i++) {
+      let z = 0;
+      for (let j = 0; j < coef.length; j++) z += coef[j] * features[i][j];
+      const pred = sigmoid(z) >= 0.5 ? 1 : 0;
+      preds.push(pred);
+      if (pred !== labels[i]) errSum += weights[i];
+    }
+    if (errSum < 1e-6 || errSum > 0.5) break;
+    const alpha = 0.5 * Math.log((1 - errSum) / Math.max(errSum, 1e-9));
+    for (let i = 0; i < weights.length; i++) {
+      if (preds[i] !== labels[i]) weights[i] *= Math.exp(alpha);
+      else weights[i] *= Math.exp(-alpha);
+    }
+    const sum = weights.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < weights.length; i++) weights[i] /= sum;
+  }
+  if (models.length === 0) return { code: null, conf: 0, reason: 'GB_NO_MODEL' };
+  const curFeat = extractFeatures(seq.slice(-20));
+  let sum = 0;
+  for (const coef of models) {
+    let z = 0;
+    for (let j = 0; j < coef.length; j++) z += coef[j] * curFeat[j];
+    sum += sigmoid(z);
+  }
+  const pT = sum / models.length;
+  const conf = Math.abs(pT - 0.5) * 2;
+  if (conf < 0.15) return { code: null, conf: 0, reason: 'GB_LOW' };
+  return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.35, 0.78), reason: `GB_${models.length}T` };
+}
+
 function algoChaos(seq) {
   if (!seq || seq.length < 30) return { code: null, conf: 0, reason: 'no_data' };
-  // Map T/X → 0.1/0.9
   const vals = seq.map(x => x === 'T' ? 0.9 : 0.1);
-
-  // Try different r values
   let bestR = 3.9, bestErr = 1e9;
   for (let r = 3.5; r <= 4.0; r += 0.05) {
     let err = 0;
-    for (let i = 1; i < vals.length; i++) {
-      const pred = r * vals[i - 1] * (1 - vals[i - 1]);
-      err += Math.abs(pred - vals[i]);
-    }
+    for (let i = 1; i < vals.length; i++) err += Math.abs(r * vals[i - 1] * (1 - vals[i - 1]) - vals[i]);
     if (err < bestErr) { bestErr = err; bestR = r; }
   }
-
   const last = vals[vals.length - 1];
   const pred = bestR * last * (1 - last);
   const conf = Math.abs(pred - 0.5) * 2;
   if (conf < 0.20) return { code: null, conf: 0, reason: 'CHAOS_LOW' };
-  return {
-    code: pred >= 0.5 ? 'T' : 'X',
-    conf: Math.min(0.5 + conf * 0.30, 0.72),
-    reason: `CHAOS_R${bestR.toFixed(2)}`
-  };
+  return { code: pred >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.30, 0.72), reason: `CHAOS_R${bestR.toFixed(2)}` };
 }
 
-/**
- * 13. FOURIER — frequency analysis
- */
 function algoFourier(seq) {
   if (!seq || seq.length < 40) return { code: null, conf: 0, reason: 'no_data' };
   const N = Math.min(64, seq.length);
   const vals = seq.slice(-N).map(x => x === 'T' ? 1 : -1);
-
-  // Simple DFT - find dominant frequency
   const freqs = [];
   for (let k = 1; k <= 8; k++) {
     let real = 0, imag = 0;
@@ -809,101 +541,52 @@ function algoFourier(seq) {
       real += vals[n] * Math.cos(angle);
       imag -= vals[n] * Math.sin(angle);
     }
-    const mag = Math.sqrt(real * real + imag * imag) / N;
-    freqs.push({ k, mag, phase: Math.atan2(imag, real) });
+    freqs.push({ k, mag: Math.sqrt(real * real + imag * imag) / N, phase: Math.atan2(imag, real) });
   }
-
   freqs.sort((a, b) => b.mag - a.mag);
-  const dominant = freqs[0];
-  if (dominant.mag < 0.2) return { code: null, conf: 0, reason: 'FOURIER_LOW' };
-
-  // Predict next using dominant freq
-  const n = N;
-  const angle = (2 * Math.PI * dominant.k * n) / N;
-  const pred = dominant.mag * 2 * Math.cos(angle + dominant.phase);
-
+  const d = freqs[0];
+  if (d.mag < 0.2) return { code: null, conf: 0, reason: 'FOURIER_LOW' };
+  const angle = (2 * Math.PI * d.k * N) / N;
+  const pred = d.mag * 2 * Math.cos(angle + d.phase);
   const conf = Math.min(Math.abs(pred), 0.75);
   if (conf < 0.15) return { code: null, conf: 0, reason: 'FOURIER_LOW2' };
-  return {
-    code: pred >= 0 ? 'T' : 'X',
-    conf,
-    reason: `FOURIER_K${dominant.k}`
-  };
+  return { code: pred >= 0 ? 'T' : 'X', conf, reason: `FOURIER_K${d.k}` };
 }
 
-/**
- * 14. ENTROPY — Shannon entropy based
- */
 function algoEntropy(seq) {
   if (!seq || seq.length < 20) return { code: null, conf: 0, reason: 'no_data' };
   const recent = seq.slice(-20);
   const cntT = recent.filter(x => x === 'T').length;
   const pT = cntT / recent.length;
-
-  // High entropy = random, low entropy = biased
   const entropy = -(pT * Math.log2(pT || 1e-9) + (1 - pT) * Math.log2((1 - pT) || 1e-9));
-
-  // Nếu entropy thấp → predict phía chiếm ưu thế
-  if (entropy < 0.75) {
-    return {
-      code: pT >= 0.5 ? 'T' : 'X',
-      conf: Math.min(0.5 + (1 - entropy) * 0.5, 0.72),
-      reason: `ENTROPY_LOW_${entropy.toFixed(2)}`
-    };
-  }
-
-  // Entropy cao → predict đảo chiều gần đây
-  if (entropy > 0.95) {
-    const last = seq[seq.length - 1];
-    return {
-      code: last === 'T' ? 'X' : 'T',
-      conf: 0.55,
-      reason: `ENTROPY_HIGH`
-    };
-  }
-
+  if (entropy < 0.75) return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + (1 - entropy) * 0.5, 0.72), reason: `ENTROPY_LOW_${entropy.toFixed(2)}` };
+  if (entropy > 0.95) return { code: seq[seq.length - 1] === 'T' ? 'X' : 'T', conf: 0.55, reason: 'ENTROPY_HIGH' };
   return { code: null, conf: 0, reason: 'no_signal' };
 }
 
-/**
- * 15. META_LEARNER — chọn algo tốt nhất theo regime
- */
 function algoMetaLearner(seq, allAlgoResults, regime, algoStats) {
   if (!allAlgoResults) return { code: null, conf: 0, reason: 'no_data' };
-
-  // Filter theo regime
   const weights = {};
   for (const name of Object.keys(allAlgoResults)) {
     const r = allAlgoResults[name];
     if (!r.code) { weights[name] = 0; continue; }
-
     const stats = algoStats[name] || { total: 0, wins: 0 };
     const acc = stats.total > 0 ? stats.wins / stats.total : 0.5;
     const regWeight = regimeWeight(name, regime.type);
-
     weights[name] = r.conf * acc * regWeight;
   }
-
   const votes = { T: 0, X: 0 };
   for (const name of Object.keys(allAlgoResults)) {
     const r = allAlgoResults[name];
     if (!r.code) continue;
     votes[r.code] += weights[name];
   }
-
   const total = votes.T + votes.X;
   if (total < 0.1) return { code: null, conf: 0, reason: 'META_NO_SIGNAL' };
-
   const pT = votes.T / total;
   const conf = Math.abs(pT - 0.5) * 2;
   if (conf < 0.10) return { code: null, conf: 0, reason: 'META_TOO_CLOSE' };
-
-  return {
-    code: pT >= 0.5 ? 'T' : 'X',
-    conf: Math.min(0.55 + conf * 0.30, 0.80),
-    reason: `META_${regime.type}`,
-    votes
-  };
+  return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.55 + conf * 0.30, 0.80), reason: `META_${regime.type}` };
 }
 
 function regimeWeight(algo, regimeType) {
@@ -911,41 +594,27 @@ function regimeWeight(algo, regimeType) {
     'BỆT': { STREAK: 2.5, CAU: 1.0, MARKOV: 1.5, NGRAM: 1.2, BAYESIAN: 1.0, TREND: 0.8, LSTM_SIM: 1.3, ARIMA: 1.0, KALMAN: 0.8, RANDOM_FOREST: 1.2, GRADIENT_BOOST: 1.3, CHAOS: 0.5, FOURIER: 0.7, ENTROPY: 1.5 },
     'CẦU_1_1': { STREAK: 0.5, CAU: 3.0, MARKOV: 1.0, NGRAM: 1.5, BAYESIAN: 1.2, TREND: 0.6, LSTM_SIM: 1.0, ARIMA: 1.0, KALMAN: 0.8, RANDOM_FOREST: 1.2, GRADIENT_BOOST: 1.2, CHAOS: 0.5, FOURIER: 2.0, ENTROPY: 0.7 },
     'RANDOM': { STREAK: 0.5, CAU: 0.5, MARKOV: 1.0, NGRAM: 1.2, BAYESIAN: 1.5, TREND: 0.5, LSTM_SIM: 1.0, ARIMA: 1.2, KALMAN: 1.3, RANDOM_FOREST: 1.5, GRADIENT_BOOST: 1.5, CHAOS: 1.0, FOURIER: 0.8, ENTROPY: 1.5 },
-    'HỖN_HỢP': { STREAK: 1.0, CAU: 1.0, MARKOV: 1.0, NGRAM: 1.0, BAYESIAN: 1.0, TREND: 1.0, LSTM_SIM: 1.0, ARIMA: 1.0, KALMAN: 1.0, RANDOM_FOREST: 1.0, GRADIENT_BOOST: 1.0, CHAOS: 1.0, FOURIER: 1.0, ENTROPY: 1.0 },
-    'unknown': { STREAK: 1.0, CAU: 1.0, MARKOV: 1.0, NGRAM: 1.0, BAYESIAN: 1.0, TREND: 1.0, LSTM_SIM: 1.0, ARIMA: 1.0, KALMAN: 1.0, RANDOM_FOREST: 1.0, GRADIENT_BOOST: 1.0, CHAOS: 1.0, FOURIER: 1.0, ENTROPY: 1.0 }
+    'HỖN_HỢP': { STREAK: 1, CAU: 1, MARKOV: 1, NGRAM: 1, BAYESIAN: 1, TREND: 1, LSTM_SIM: 1, ARIMA: 1, KALMAN: 1, RANDOM_FOREST: 1, GRADIENT_BOOST: 1, CHAOS: 1, FOURIER: 1, ENTROPY: 1 },
+    'unknown': { STREAK: 1, CAU: 1, MARKOV: 1, NGRAM: 1, BAYESIAN: 1, TREND: 1, LSTM_SIM: 1, ARIMA: 1, KALMAN: 1, RANDOM_FOREST: 1, GRADIENT_BOOST: 1, CHAOS: 1, FOURIER: 1, ENTROPY: 1 }
   };
   return (map[regimeType] && map[regimeType][algo]) || 1.0;
 }
 
-// ============ CHẠY TẤT CẢ ALGO ============
 function runAllAlgorithms(seq, db) {
   const baseResults = {
-    STREAK: algoStreak(seq),
-    CAU: algoCau(seq),
-    MARKOV: algoMarkov(seq),
-    NGRAM: algoNgram(seq),
-    BAYESIAN: algoBayesian(seq),
-    TREND: algoTrend(seq),
-    LSTM_SIM: algoLSTMSim(seq),
-    ARIMA: algoARIMA(seq),
-    KALMAN: algoKalman(seq),
-    RANDOM_FOREST: algoRandomForest(seq),
-    GRADIENT_BOOST: algoGradientBoost(seq),
-    CHAOS: algoChaos(seq),
-    FOURIER: algoFourier(seq),
-    ENTROPY: algoEntropy(seq)
+    STREAK: algoStreak(seq), CAU: algoCau(seq), MARKOV: algoMarkov(seq),
+    NGRAM: algoNgram(seq), BAYESIAN: algoBayesian(seq), TREND: algoTrend(seq),
+    LSTM_SIM: algoLSTMSim(seq), ARIMA: algoARIMA(seq), KALMAN: algoKalman(seq),
+    RANDOM_FOREST: algoRandomForest(seq), GRADIENT_BOOST: algoGradientBoost(seq),
+    CHAOS: algoChaos(seq), FOURIER: algoFourier(seq), ENTROPY: algoEntropy(seq)
   };
-
   const regime = detectRegime(seq);
-
-  // Meta learner với tất cả results + regime
   baseResults.META_LEARNER = algoMetaLearner(seq, baseResults, regime, db.algoStats);
 
-  // Ensemble = weighted vote based on accuracy
   const votes = { T: 0, X: 0 };
   const details = [];
   for (const name of Object.keys(baseResults)) {
-    if (name === 'META_LEARNER' || name === 'ENSEMBLE') continue;
+    if (name === 'META_LEARNER') continue;
     const r = baseResults[name];
     if (!r.code) continue;
     const stat = db.algoStats[name] || { total: 0, wins: 0 };
@@ -956,82 +625,23 @@ function runAllAlgorithms(seq, db) {
   }
   const total = votes.T + votes.X;
   let ensembleResult;
-  if (total < 0.5) {
-    ensembleResult = { code: null, conf: 0, reason: 'ENSEMBLE_NO_SIGNAL' };
-  } else {
+  if (total < 0.5) ensembleResult = { code: null, conf: 0, reason: 'ENSEMBLE_NO_SIGNAL' };
+  else {
     const pT = votes.T / total;
     const conf = Math.abs(pT - 0.5) * 2;
-    if (conf < 0.10) {
-      ensembleResult = { code: null, conf: 0, reason: 'ENSEMBLE_TOO_CLOSE' };
-    } else {
-      ensembleResult = {
-        code: pT >= 0.5 ? 'T' : 'X',
-        conf: Math.min(0.55 + conf * 0.30, 0.82),
-        reason: `ENSEMBLE_${details.length}v`,
-        details,
-        votes
-      };
-    }
+    if (conf < 0.10) ensembleResult = { code: null, conf: 0, reason: 'ENSEMBLE_TOO_CLOSE' };
+    else ensembleResult = { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.55 + conf * 0.30, 0.82), reason: `ENSEMBLE_${details.length}v`, details, votes };
   }
   baseResults.ENSEMBLE = ensembleResult;
-
   return { algorithms: baseResults, regime };
-}
-
-// ========================================================================
-// 🎯 BRIER SCORE
-// ========================================================================
-function brierScore(predictions) {
-  // predictions: [{ prob: 0-1, actual: 0 or 1 }]
-  if (!predictions.length) return 0;
-  let sum = 0;
-  for (const p of predictions) sum += Math.pow(p.prob - p.actual, 2);
-  return sum / predictions.length;
-}
-
-// ========================================================================
-// 🎯 KELLY CRITERION
-// ========================================================================
-function kellyFraction(winProb, winLossRatio = 1) {
-  // f* = (p * b - q) / b  với b = winLossRatio
-  const p = clamp(winProb, 0.01, 0.99);
-  const q = 1 - p;
-  const f = (p * winLossRatio - q) / winLossRatio;
-  return Math.max(0, Math.min(f, 0.25));  // cap 25% bankroll
-}
-
-// ========================================================================
-// 🎯 CIRCUIT BREAKER
-// ========================================================================
-function checkCircuitBreaker(db) {
-  const recent = (db.history || []).slice(-20).filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI');
-  if (recent.length < CB_LOSS_STREAK) return false;
-
-  let lossStreak = 0;
-  for (let i = recent.length - 1; i >= 0; i--) {
-    if (recent[i].trangThai === 'SAI') lossStreak++;
-    else break;
-  }
-  if (lossStreak >= CB_LOSS_STREAK) {
-    const cooldownEnd = recent[recent.length - 1].phien + CB_COOLDOWN;
-    if (db.lastProcessedSession < cooldownEnd) {
-      console.warn(`[CIRCUIT BREAKER] game active, loss streak ${lossStreak}, cooldown until #${cooldownEnd}`);
-      return true;
-    }
-  }
-  return false;
 }
 
 // ============ FETCH ============
 async function fetchWithRetry(url, attempts = FETCH_RETRIES) {
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
-    try {
-      return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVip/10.0' } });
-    } catch (e) {
-      lastErr = e;
-      if (i < attempts - 1) await new Promise(r => setTimeout(r, 200 + i * 200));
-    }
+    try { return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVip/11.0' } }); }
+    catch (e) { lastErr = e; if (i < attempts - 1) await new Promise(r => setTimeout(r, 200 + i * 200)); }
   }
   throw lastErr || new Error('Fetch failed');
 }
@@ -1052,30 +662,23 @@ function parseHistoryResponse(data) {
 }
 
 // ============ DB ============
-const ALL_ALGOS = [
-  'STREAK', 'CAU', 'MARKOV', 'NGRAM', 'BAYESIAN', 'TREND',
-  'LSTM_SIM', 'ARIMA', 'KALMAN', 'RANDOM_FOREST', 'GRADIENT_BOOST',
-  'CHAOS', 'FOURIER', 'ENTROPY', 'META_LEARNER', 'ENSEMBLE'
-];
+const ALL_ALGOS = ['STREAK', 'CAU', 'MARKOV', 'NGRAM', 'BAYESIAN', 'TREND', 'LSTM_SIM', 'ARIMA', 'KALMAN', 'RANDOM_FOREST', 'GRADIENT_BOOST', 'CHAOS', 'FOURIER', 'ENTROPY', 'META_LEARNER', 'ENSEMBLE'];
 
 function defaultDB() {
   const algoStats = {};
-  for (const name of ALL_ALGOS) {
-    algoStats[name] = { total: 0, wins: 0, losses: 0, skips: 0, brierSum: 0, brierCount: 0 };
-  }
+  for (const name of ALL_ALGOS) algoStats[name] = { total: 0, wins: 0, losses: 0, skips: 0, brierSum: 0, brierCount: 0 };
   return {
-    version: 10,
+    version: 11,
     createdAt: now(), updatedAt: now(),
     history: [],
     algoStats,
     algoWeights: Object.fromEntries(ALL_ALGOS.map(a => [a, 1.0])),
-    byType: {},
-    byRegime: {},
+    byType: {}, byRegime: {},
     lastProcessedSession: null,
     currentRegime: { type: 'unknown' },
     circuitBreaker: { active: false, until: 0 },
     snapshots: [],
-    backtest: null
+    lastNotified: null
   };
 }
 
@@ -1096,16 +699,14 @@ function migrateDB(db) {
   if (!db.circuitBreaker) db.circuitBreaker = { active: false, until: 0 };
   if (!Array.isArray(db.snapshots)) db.snapshots = [];
   if (!db.currentRegime) db.currentRegime = { type: 'unknown' };
-  if (!db.version) db.version = 10;
+  if (!db.version) db.version = 11;
   db.history = db.history.filter(h => h && typeof h === 'object' && h.phien !== undefined);
   return db;
 }
 
 function loadDatabase(game) {
-  let db = safeReadJson(DB_FILES[game]) || defaultDB();
-  return migrateDB(db);
+  return migrateDB(safeReadJson(DB_FILES[game]) || defaultDB());
 }
-
 function saveDatabase(game, db) {
   db.updatedAt = now();
   safeAtomicWrite(DB_FILES[game], db);
@@ -1118,26 +719,30 @@ function predict(db, seq) {
       code: null, label: null, tiLe: 'CHỜ',
       algorithms: runAllAlgorithms(seq || [], db).algorithms,
       regime: { type: 'unknown' },
-      shouldPredict: false,
-      circuitBreaker: false
+      shouldPredict: false
     };
   }
-
   const { algorithms, regime } = runAllAlgorithms(seq, db);
   const meta = algorithms.META_LEARNER;
   const ens = algorithms.ENSEMBLE;
-
-  // Chọn signal cuối cùng: ưu tiên META nếu pass, ngược lại ENSEMBLE
   let final = meta.code && meta.conf >= MIN_CONFIDENCE ? meta : ens;
   let shouldPredict = final.code && final.conf >= MIN_CONFIDENCE;
 
-  const cb = checkCircuitBreaker(db);
-  if (cb) {
-    shouldPredict = false;
-    final = { code: null, conf: 0, reason: 'CIRCUIT_BREAKER' };
+  // Circuit breaker
+  const recent = (db.history || []).slice(-20).filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI');
+  let lossStreak = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].trangThai === 'SAI') lossStreak++;
+    else break;
+  }
+  if (lossStreak >= CB_LOSS_STREAK) {
+    const cooldownEnd = recent[recent.length - 1].phien + CB_COOLDOWN;
+    if (db.lastProcessedSession < cooldownEnd) {
+      shouldPredict = false;
+      final = { code: null, conf: 0, reason: 'CIRCUIT_BREAKER' };
+    }
   }
 
-  // Streak info
   const lastType = seq[seq.length - 1];
   let streakLen = 1;
   for (let i = seq.length - 2; i >= 0; i--) {
@@ -1149,21 +754,16 @@ function predict(db, seq) {
     return {
       code: null, label: null, tiLe: 'CHỜ',
       algorithms, regime, shouldPredict: false,
-      streak: { type: lastType, length: streakLen },
-      circuitBreaker: cb
+      streak: { type: lastType, length: streakLen }
     };
   }
 
   return {
-    code: final.code,
-    label: labelFromTX(final.code),
+    code: final.code, label: labelFromTX(final.code),
     tiLe: (final.conf * 100).toFixed(1) + '%',
-    algorithms,
-    regime,
-    shouldPredict: true,
+    algorithms, regime, shouldPredict: true,
     streak: { type: lastType, length: streakLen },
-    reason: final.reason,
-    circuitBreaker: false
+    reason: final.reason
   };
 }
 
@@ -1181,19 +781,58 @@ function updateWeights(db) {
 function takeSnapshot(db, game) {
   if (db.history.length % SNAPSHOT_INTERVAL !== 0) return;
   const snap = {
-    at: now(),
-    historyLength: db.history.length,
+    at: now(), historyLength: db.history.length,
     algoStats: JSON.parse(JSON.stringify(db.algoStats)),
     algoWeights: { ...db.algoWeights },
     byType: JSON.parse(JSON.stringify(db.byType)),
     byRegime: JSON.parse(JSON.stringify(db.byRegime))
   };
-  db.snapshots = db.snapshots || [];
   db.snapshots.push(snap);
   if (db.snapshots.length > 10) db.snapshots = db.snapshots.slice(-10);
-  try {
-    safeAtomicWrite(path.join(SNAPSHOT_DIR, `${game}_snap_${Date.now()}.json`), snap);
-  } catch (e) {}
+  try { safeAtomicWrite(path.join(SNAPSHOT_DIR, `${game}_snap_${Date.now()}.json`), snap); } catch (e) {}
+}
+
+// ============ WEBHOOK ============
+async function sendWebhook(entry, game) {
+  const text = `🎯 [${game.toUpperCase()}] Phiên #${entry.phienDuDoan}\n` +
+    `KQ phiên trước: ${entry.ketQuaLabel || '?'} (Sum ${entry.tong})\n` +
+    `Dự đoán: **${entry.DU_DOAN}** ${entry.TI_LE !== 'CHỜ' ? `(${entry.TI_LE})` : ''}\n` +
+    `Lý do: ${entry.ensReason || 'N/A'}\n` +
+    `Regime: ${entry.regimeType || 'unknown'}`;
+
+  const tasks = [];
+
+  // Telegram
+  if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+    tasks.push(axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true
+    }).catch(e => console.error('[TG]', e.message)));
+  }
+
+  // Discord
+  if (DISCORD_WEBHOOK) {
+    tasks.push(axios.post(DISCORD_WEBHOOK, {
+      content: text,
+      username: `HOANG VIP ${game.toUpperCase()}`
+    }).catch(e => console.error('[DISCORD]', e.message)));
+  }
+
+  // Slack
+  if (SLACK_WEBHOOK) {
+    tasks.push(axios.post(SLACK_WEBHOOK, { text }).catch(e => console.error('[SLACK]', e.message)));
+  }
+
+  // Custom
+  if (CUSTOM_WEBHOOK) {
+    tasks.push(axios.post(CUSTOM_WEBHOOK, {
+      game, entry, timestamp: now()
+    }, { timeout: 5000 }).catch(e => console.error('[CUSTOM]', e.message)));
+  }
+
+  await Promise.all(tasks);
 }
 
 // ============ MAIN TICK ============
@@ -1224,27 +863,17 @@ async function processGameTick(game) {
       lastRec.ketQua = actual;
       lastRec.ketQuaLabel = labelFromTX(actual);
 
-      // Update từng algo
       if (lastRec.algoPreds) {
         for (const name of Object.keys(lastRec.algoPreds)) {
           const predData = lastRec.algoPreds[name];
           const predCode = predData.code;
           const stat = db.algoStats[name];
           if (!stat) continue;
-
-          if (predCode === null || predCode === undefined) {
-            stat.skips++;
-            lastRec.algoResults = lastRec.algoResults || {};
-            lastRec.algoResults[name] = 'SKIP';
-          } else {
+          if (predCode === null || predCode === undefined) stat.skips++;
+          else {
             stat.total++;
             const correct = predCode === actual;
-            if (correct) stat.wins++;
-            else stat.losses++;
-            lastRec.algoResults = lastRec.algoResults || {};
-            lastRec.algoResults[name] = correct ? 'WIN' : 'LOSE';
-
-            // Brier
+            if (correct) stat.wins++; else stat.losses++;
             const prob = predCode === 'T' ? predData.conf : (1 - predData.conf);
             const actualVal = actual === 'T' ? 1 : 0;
             stat.brierSum += Math.pow(prob - actualVal, 2);
@@ -1253,23 +882,15 @@ async function processGameTick(game) {
         }
       }
 
-      // Trạng thái tổng
       const finalCode = lastRec.DU_DOAN_CODE;
-      if (finalCode) {
-        lastRec.trangThai = (finalCode === actual) ? 'ĐÚNG' : 'SAI';
-      } else {
-        lastRec.trangThai = 'BỎ QUA';
-      }
+      lastRec.trangThai = finalCode ? (finalCode === actual ? 'ĐÚNG' : 'SAI') : 'BỎ QUA';
 
-      // Track by type
       const pType = lastRec.ensReason || 'NONE';
       if (finalCode) {
         if (!db.byType[pType]) db.byType[pType] = { total: 0, wins: 0 };
         db.byType[pType].total++;
         if (finalCode === actual) db.byType[pType].wins++;
       }
-
-      // Track by regime
       const regime = lastRec.regimeType || 'unknown';
       if (finalCode) {
         if (!db.byRegime[regime]) db.byRegime[regime] = { total: 0, wins: 0 };
@@ -1312,8 +933,14 @@ async function processGameTick(game) {
     db.currentRegime = pred.regime;
     saveDatabase(game, db);
 
-    const extra = pred.shouldPredict ? `[${pred.reason}]` : '[CHỜ]';
-    console.log(`[TICK] ${game} #${currentSession} sum=${newEntry.tong} kq=${newEntry.ketQuaLabel} → ${newEntry.DU_DOAN} ${extra} regime=${pred.regime.type}`);
+    // ✅ WEBHOOK PUSH — chỉ gửi khi có dự đoán mới
+    if (pred.shouldPredict && db.lastNotified !== newEntry.phienDuDoan) {
+      db.lastNotified = newEntry.phienDuDoan;
+      sendWebhook(newEntry, game).catch(e => console.error('[WEBHOOK]', e.message));
+      saveDatabase(game, db);
+    }
+
+    console.log(`[TICK] ${game} #${currentSession} → ${newEntry.DU_DOAN} ${pred.shouldPredict ? `[${pred.reason}]` : '[CHỜ]'}`);
   } catch (e) {
     console.error(`[TICK ERR] ${game}`, e && e.message ? e.message : e);
   }
@@ -1330,33 +957,89 @@ function startPolling() {
   tick();
 }
 
-// ============ FORMAT ============
-function formatHistoryItem(it) {
-  if (!it) return null;
-  return {
-    phien: it.phien,
-    xucXac: Array.isArray(it.xucXac) ? it.xucXac : [0, 0, 0],
-    tong: it.tong || 0,
-    ketQua: it.ketQua || null,
-    ketQuaLabel: it.ketQuaLabel || (it.ketQua ? labelFromTX(it.ketQua) : null),
-    phienDuDoan: it.phienDuDoan,
-    duDoan: it.DU_DOAN || 'CHỜ',
-    duDoanCode: it.DU_DOAN_CODE || null,
-    tiLe: it.TI_LE || 'CHỜ',
-    ensReason: it.ensReason || null,
-    regimeType: it.regimeType || null,
-    algoPreds: it.algoPreds || {},
-    algoResults: it.algoResults || {},
-    streak: it.streak || null,
-    trangThai: it.trangThai || null,
-    thoiGian: it.thoiGian || null
-  };
+// ============ FORMAT CONVERTERS ============
+function toJSON(data) { return JSON.stringify(data, null, 2); }
+
+function toXML(obj, rootName = 'response') {
+  function esc(s) { return String(s).replace(/[<>&'"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c])); }
+  function walk(o, indent = '') {
+    if (o === null || o === undefined) return '';
+    if (Array.isArray(o)) return o.map(item => `${indent}<item>${walk(item, indent + '  ')}</item>`).join('\n');
+    if (typeof o === 'object') {
+      return Object.entries(o).map(([k, v]) => {
+        const key = k.replace(/[^a-zA-Z0-9_]/g, '_');
+        if (typeof v === 'object' && v !== null) return `${indent}<${key}>\n${walk(v, indent + '  ')}\n${indent}</${key}>`;
+        return `${indent}<${key}>${esc(v)}</${key}>`;
+      }).join('\n');
+    }
+    return esc(o);
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<${rootName}>\n${walk(obj, '  ')}\n</${rootName}>`;
 }
 
-// ============ API ============
-app.get('/api/predict/:game', async (req, res) => {
+function toPlainText(prediction) {
+  const p = prediction;
+  return [
+    `🎯 ${p.game} - Phiên #${p.phien}`,
+    `📊 KQ phiên trước: ${p.ketQua || '?'} (Sum: ${p.tong})`,
+    `🎲 Xúc xắc: ${p.xucXac.join('-')}`,
+    `💡 Dự đoán phiên #${p.phienDuDoan}: ${p.duDoan} (${p.tiLe})`,
+    `📌 Lý do: ${p.reason || 'Chờ'}`,
+    `🔮 Regime: ${p.regime ? p.regime.type : 'unknown'}`,
+    `⏰ ${p.thoiGian}`
+  ].join('\n');
+}
+
+function toCSV(items) {
+  if (!items.length) return 'no data';
+  const headers = ['phien', 'xucXac', 'tong', 'ketQua', 'phienDuDoan', 'duDoan', 'tiLe', 'reason', 'regime', 'trangThai'];
+  const rows = items.map(it => {
+    const dice = Array.isArray(it.xucXac) ? it.xucXac.join('-') : '';
+    return [
+      it.phien, `"${dice}"`, it.tong || '', it.ketQuaLabel || '',
+      it.phienDuDoan, it.DU_DOAN || '', it.TI_LE || '',
+      `"${it.ensReason || ''}"`, `"${it.regimeType || ''}"`, it.trangThai || ''
+    ].join(',');
+  });
+  return headers.join(',') + '\n' + rows.join('\n');
+}
+
+// ============ API ENDPOINTS ============
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    version: 11,
+    uptime: process.uptime(),
+    timestamp: now(),
+    endpoints: Object.keys(APIS)
+  });
+});
+
+// Config info
+app.get('/api/config', (req, res) => {
+  res.json({
+    version: 11,
+    algorithms: ALL_ALGOS,
+    minConfidence: MIN_CONFIDENCE,
+    rateLimit: { windowMs: RATE_LIMIT_WINDOW_MS, max: RATE_LIMIT_MAX },
+    apiKeyRequired: !!API_KEY,
+    webhooks: {
+      telegram: !!TELEGRAM_BOT_TOKEN,
+      discord: !!DISCORD_WEBHOOK,
+      slack: !!SLACK_WEBHOOK,
+      custom: !!CUSTOM_WEBHOOK
+    }
+  });
+});
+
+// Main predict — supports ?format=json|xml|txt|csv
+app.get('/api/predict/:game', rateLimit, checkApiKey, async (req, res) => {
   const game = req.params.game;
-  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
+  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game', valid: Object.keys(APIS) });
+  const format = (req.query.format || 'json').toLowerCase();
+
   try {
     const r = await fetchWithRetry(APIS[game]);
     const list = parseHistoryResponse(r.data);
@@ -1384,7 +1067,9 @@ app.get('/api/predict/:game', async (req, res) => {
       };
     }
 
-    return res.json({
+    const response = {
+      success: true,
+      game: game.toUpperCase(),
       phien: cs,
       xucXac: itemToDice(latest),
       tong: itemToSum(latest),
@@ -1397,26 +1082,82 @@ app.get('/api/predict/:game', async (req, res) => {
       reason: pred.reason,
       regime: pred.regime,
       shouldPredict: pred.shouldPredict,
-      circuitBreaker: pred.circuitBreaker,
-      kelly: pred.shouldPredict ? kellyFraction(pred.algorithms.ENSEMBLE.conf) : 0,
-      algorithms: algoDetail
-    });
+      kelly: pred.shouldPredict ? Number(Math.max(0, Math.min(0.25, ((pred.algorithms.ENSEMBLE.conf * 1 - (1 - pred.algorithms.ENSEMBLE.conf)) / 1)).toFixed(4)) : 0,
+      algorithms: algoDetail,
+      thoiGian: now()
+    };
+
+    if (format === 'xml') {
+      res.type('application/xml').send(toXML(response, 'prediction'));
+    } else if (format === 'txt') {
+      res.type('text/plain').send(toPlainText(response));
+    } else if (format === 'csv') {
+      res.type('text/csv').send(toCSV([{ ...response, DU_DOAN: response.duDoan, TI_LE: response.tiLe, ensReason: response.reason, regimeType: response.regime.type }]));
+    } else {
+      res.json(response);
+    }
   } catch (e) {
-    return res.status(500).json({ error: e.message || 'fetch error' });
+    res.status(500).json({ error: e.message || 'fetch error' });
   }
 });
 
-app.get('/api/history/:game', (req, res) => {
+// Simple endpoint cho mobile app
+app.get('/api/simple/:game', rateLimit, checkApiKey, async (req, res) => {
+  const game = req.params.game;
+  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
+
+  // Nếu có history trong DB, trả về prediction đã lưu
+  const db = loadDatabase(game);
+  const last = db.history[db.history.length - 1];
+  if (last) {
+    return res.json({
+      game: game.toUpperCase(),
+      phien: last.phienDuDoan,
+      duDoan: last.DU_DOAN,
+      duDoanCode: last.DU_DOAN_CODE,
+      tiLe: last.TI_LE,
+      regime: last.regimeType,
+      reason: last.ensReason,
+      updated: last.thoiGian
+    });
+  }
+  res.status(202).json({ message: 'Chưa có dự đoán, đang chờ data...' });
+});
+
+// Public — không cần API key
+app.get('/api/public/predict/:game', rateLimit, async (req, res) => {
+  const game = req.params.game;
+  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
+  const db = loadDatabase(game);
+  const last = db.history[db.history.length - 1];
+  if (!last) return res.status(204).send();
+  res.json({
+    game: game.toUpperCase(),
+    phien: last.phienDuDoan,
+    duDoan: last.DU_DOAN,
+    tiLe: last.TI_LE,
+    regime: last.regimeType,
+    updated: last.thoiGian
+  });
+});
+
+app.get('/api/history/:game', rateLimit, checkApiKey, (req, res) => {
   const game = req.params.game;
   if (game === 'all') return handleHistoryAll(req, res);
   if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
+  const format = (req.query.format || 'json').toLowerCase();
   const db = loadDatabase(game);
   const limit = Math.max(1, Math.min(2000, safeInt(req.query.limit, 200)));
   const slice = db.history.slice(-limit).reverse();
-  return res.json({
-    game, count: slice.length, exportedAt: now(),
-    items: slice.map(formatHistoryItem).filter(Boolean)
-  });
+
+  if (format === 'csv') {
+    res.type('text/csv').send(toCSV(slice));
+  } else {
+    res.json({
+      game, count: slice.length, exportedAt: now(),
+      items: slice.map(formatHistoryItem).filter(Boolean)
+    });
+  }
 });
 
 function handleHistoryAll(req, res) {
@@ -1432,7 +1173,6 @@ function handleHistoryAll(req, res) {
         algosReport[name] = {
           total: s.total, wins: s.wins, losses: s.losses, skips: s.skips,
           accuracy: s.total > 0 ? Number((s.wins / s.total * 100).toFixed(2)) : 0,
-          coverage: (s.total + s.skips) > 0 ? Number((s.total / (s.total + s.skips) * 100).toFixed(2)) : 0,
           brier: s.brierCount > 0 ? Number((s.brierSum / s.brierCount).toFixed(4)) : null
         };
       }
@@ -1449,71 +1189,138 @@ function handleHistoryAll(req, res) {
       result.games[game] = { error: e.message };
     }
   }
-  return res.json(result);
+  res.json(result);
 }
 
-app.get('/api/history/all', handleHistoryAll);
+app.get('/api/history/all', rateLimit, checkApiKey, handleHistoryAll);
 
-app.get('/api/export/:game', (req, res) => {
+// ✅ RSS feed
+app.get('/rss/:game', rateLimit, (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).send('Invalid game');
   const db = loadDatabase(game);
-  let csv = 'Phiên,XúcXắc,Tổng,KếtQuả,PhiênDựĐoán,DựĐoán,TỉLệ,Reason,Regime,TrạngThái\n';
-  db.history.forEach(item => {
-    const dice = (item.xucXac || []).join('-');
-    csv += `${item.phien},"${dice}",${item.tong || ''},${item.ketQuaLabel || ''},${item.phienDuDoan},${item.DU_DOAN || ''},${item.TI_LE || ''},"${item.ensReason || ''}","${item.regimeType || ''}",${item.trangThai || ''}\n`;
-  });
+  const items = db.history.slice(-30).reverse();
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>HOANG VIP - ${game.toUpperCase()}</title>
+    <link>${baseUrl}/${game}</link>
+    <description>Dự đoán Tài Xỉu ${game.toUpperCase()}</description>
+    <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
+    ${items.map(it => `
+    <item>
+      <title>Phiên #${it.phienDuDoan}: ${it.DU_DOAN} (${it.TI_LE})</title>
+      <link>${baseUrl}/${game}</link>
+      <guid>${game}-${it.phien}</guid>
+      <pubDate>${new Date(it.thoiGian).toUTCString()}</pubDate>
+      <description><![CDATA[
+        KQ phiên trước: ${it.ketQuaLabel || '?'} (Sum ${it.tong})<br>
+        Dự đoán: <b>${it.DU_DOAN}</b> ${it.TI_LE}<br>
+        Lý do: ${it.ensReason || 'N/A'}<br>
+        Regime: ${it.regimeType || 'unknown'}
+      ]]></description>
+    </item>`).join('')}
+  </channel>
+</rss>`;
+  res.type('application/rss+xml').send(xml);
+});
+
+// ✅ Embed widget (iframe-friendly)
+app.get('/widget/:game', (req, res) => {
+  const game = req.params.game;
+  if (!DB_FILES[game]) return res.send('Invalid game');
+  const db = loadDatabase(game);
+  const last = db.history[db.history.length - 1];
+  if (!last) return res.send('<div>Chưa có data</div>');
+
+  const cls = last.DU_DOAN_CODE === 'T' ? '#22c55e' : (last.DU_DOAN_CODE === 'X' ? '#ef4444' : '#eab308');
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+  body{margin:0;font-family:Arial;background:transparent}
+  .widget{background:linear-gradient(135deg,#0f172a,#1e293b);padding:14px;border-radius:10px;color:#e6eef6;text-align:center;border:1px solid #334155}
+  .title{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:1px}
+  .pred{font-size:28px;font-weight:800;color:${cls};margin:6px 0}
+  .meta{font-size:10px;color:#64748b}
+  </style><script>setTimeout(()=>location.reload(),10000)</script></head>
+  <body>
+    <div class="widget">
+      <div class="title">🎯 ${game.toUpperCase()} — Phiên #${last.phienDuDoan}</div>
+      <div class="pred">${last.DU_DOAN} ${last.TI_LE !== 'CHỜ' ? last.TI_LE : ''}</div>
+      <div class="meta">${last.ensReason || 'N/A'} • ${last.regimeType || ''}</div>
+    </div>
+  </body></html>`;
+  res.send(html);
+});
+
+// CSV export
+app.get('/api/export/:game', rateLimit, checkApiKey, (req, res) => {
+  const game = req.params.game;
+  if (!DB_FILES[game]) return res.status(400).send('Invalid game');
+  const db = loadDatabase(game);
+  const csv = toCSV(db.history.slice().reverse());
   res.header('Content-Type', 'text/csv; charset=utf-8');
   res.attachment(`history_${game}.csv`);
   res.send('\uFEFF' + csv);
 });
 
-// ============ ADMIN ============
-app.get('/admin/metrics/:game', (req, res) => {
+// Admin — không cần key nhưng có thể bảo vệ riêng
+app.get('/admin/metrics/:game', rateLimit, (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
   const db = loadDatabase(game);
-
   const report = {};
   for (const name of Object.keys(db.algoStats)) {
     const s = db.algoStats[name];
     report[name] = {
       total: s.total, wins: s.wins, losses: s.losses, skips: s.skips,
       accuracy: s.total > 0 ? Number((s.wins / s.total * 100).toFixed(2)) : 0,
-      coverage: (s.total + s.skips) > 0 ? Number((s.total / (s.total + s.skips) * 100).toFixed(2)) : 0,
       brier: s.brierCount > 0 ? Number((s.brierSum / s.brierCount).toFixed(4)) : null
     };
   }
-
-  const ranking = Object.entries(report)
-    .filter(([_, v]) => v.total >= 5)
-    .sort((a, b) => b[1].accuracy - a[1].accuracy)
-    .map(([name, v]) => ({ name, ...v }));
-
-  return res.json({
-    game,
-    algorithms: report,
-    ranking,
-    byType: db.byType,
-    byRegime: db.byRegime,
-    weights: db.algoWeights,
-    currentRegime: db.currentRegime,
-    lastProcessedSession: db.lastProcessedSession,
-    snapshots: (db.snapshots || []).length
-  });
+  const ranking = Object.entries(report).filter(([_, v]) => v.total >= 5).sort((a, b) => b[1].accuracy - a[1].accuracy).map(([name, v]) => ({ name, ...v }));
+  res.json({ game, algorithms: report, ranking, byType: db.byType, byRegime: db.byRegime, weights: db.algoWeights, currentRegime: db.currentRegime });
 });
 
-app.get('/admin/config', (req, res) => {
-  res.json({
-    VERSION: 10,
-    RULE: 'DiceSum 3-10=Xỉu, 11-18=Tài',
-    MIN_CONFIDENCE,
-    MIN_ALGO_TOTAL,
-    CB_LOSS_STREAK,
-    CB_COOLDOWN,
-    ALGORITHMS: ALL_ALGOS
-  });
+// POST webhook — test
+app.post('/admin/test-webhook', async (req, res) => {
+  try {
+    const testEntry = {
+      phienDuDoan: 999999,
+      ketQuaLabel: 'Tài',
+      tong: 13,
+      DU_DOAN: 'Xỉu',
+      TI_LE: '68.5%',
+      ensReason: 'TEST_WEBHOOK',
+      regimeType: 'TEST'
+    };
+    await sendWebhook(testEntry, 'test');
+    res.json({ ok: true, sent: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
+
+// ============ FORMAT ============
+function formatHistoryItem(it) {
+  if (!it) return null;
+  return {
+    phien: it.phien,
+    xucXac: Array.isArray(it.xucXac) ? it.xucXac : [0, 0, 0],
+    tong: it.tong || 0,
+    ketQua: it.ketQua || null,
+    ketQuaLabel: it.ketQuaLabel || (it.ketQua ? labelFromTX(it.ketQua) : null),
+    phienDuDoan: it.phienDuDoan,
+    duDoan: it.DU_DOAN || 'CHỜ',
+    duDoanCode: it.DU_DOAN_CODE || null,
+    tiLe: it.TI_LE || 'CHỜ',
+    ensReason: it.ensReason || null,
+    regimeType: it.regimeType || null,
+    streak: it.streak || null,
+    trangThai: it.trangThai || null,
+    thoiGian: it.thoiGian || null
+  };
+}
 
 // ============ UI ============
 app.get('/:game', (req, res) => {
@@ -1522,20 +1329,11 @@ app.get('/:game', (req, res) => {
 
   const db = loadDatabase(game);
   const rows = db.history.slice(-40).reverse();
-
   const algos = {};
   for (const name of Object.keys(db.algoStats)) {
     const s = db.algoStats[name];
-    algos[name] = {
-      ...s,
-      accuracy: s.total > 0 ? (s.wins / s.total * 100) : 0,
-      brier: s.brierCount > 0 ? (s.brierSum / s.brierCount) : null
-    };
+    algos[name] = { ...s, accuracy: s.total > 0 ? (s.wins / s.total * 100) : 0, brier: s.brierCount > 0 ? (s.brierSum / s.brierCount) : null };
   }
-
-  const ranking = Object.entries(algos)
-    .filter(([_, v]) => v.total >= 5)
-    .sort((a, b) => b[1].accuracy - a[1].accuracy);
 
   const latest = db.history[db.history.length - 1];
   const latestPred = latest ? latest.DU_DOAN : 'CHỜ';
@@ -1559,236 +1357,99 @@ app.get('/:game', (req, res) => {
     </tr>`;
   }).join('');
 
-  const typeRows = Object.keys(db.byType || {}).sort().map(t => {
-    const x = db.byType[t];
-    const acc = x.total > 0 ? (x.wins / x.total * 100) : 0;
-    const cls = acc >= 60 ? 'dung' : (acc >= 50 ? 'cho' : 'sai');
-    return `<tr>
-      <td><span class="type-badge">${t}</span></td>
-      <td>${x.total}</td>
-      <td class="dung">${x.wins}</td>
-      <td class="sai">${x.total - x.wins}</td>
-      <td class="${cls}"><b>${acc.toFixed(1)}%</b></td>
-    </tr>`;
-  }).join('');
-
-  const regimeRows = Object.keys(db.byRegime || {}).map(r => {
-    const x = db.byRegime[r];
-    const acc = x.total > 0 ? (x.wins / x.total * 100) : 0;
-    const cls = acc >= 60 ? 'dung' : (acc >= 50 ? 'cho' : 'sai');
-    return `<tr>
-      <td><span class="regime-badge">${r}</span></td>
-      <td>${x.total}</td>
-      <td class="dung">${x.wins}</td>
-      <td class="sai">${x.total - x.wins}</td>
-      <td class="${cls}"><b>${acc.toFixed(1)}%</b></td>
-    </tr>`;
-  }).join('');
-
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
   const html = `<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>HOANG VIP v10 - ${game.toUpperCase()}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HOANG VIP v11 - ${game.toUpperCase()}</title>
 <style>
-  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-  body{
-    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-    background:linear-gradient(135deg,#0a0e27 0%,#0f172a 50%,#1a1f3a 100%);
-    color:#e6eef6;padding:12px;margin:0;min-height:100vh;
-  }
-  .header{
-    background:linear-gradient(135deg,#1e3a8a,#3b82f6);
-    padding:16px;border-radius:14px;margin-bottom:14px;
-    box-shadow:0 8px 24px rgba(59,130,246,0.3);
-  }
-  h1{color:#fff;font-size:17px;margin:0;font-weight:700}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27,#0f172a 50%,#1a1f3a);color:#e6eef6;padding:12px;margin:0;min-height:100vh}
+  .header{background:linear-gradient(135deg,#1e3a8a,#3b82f6);padding:16px;border-radius:14px;margin-bottom:14px;box-shadow:0 8px 24px rgba(59,130,246,0.3)}
+  h1{color:#fff;font-size:17px;margin:0}
   .subtitle{color:#bfdbfe;font-size:11px;margin-top:4px}
-
-  .hero{
-    background:linear-gradient(135deg,#7c3aed,#4f46e5);
-    padding:20px;border-radius:14px;margin-bottom:14px;
-    text-align:center;
-    box-shadow:0 8px 24px rgba(124,58,237,0.3);
-  }
+  .hero{background:linear-gradient(135deg,#7c3aed,#4f46e5);padding:20px;border-radius:14px;margin-bottom:14px;text-align:center}
   .hero .label{font-size:11px;color:#ddd6fe;text-transform:uppercase;letter-spacing:1px}
-  .hero .pred{font-size:36px;font-weight:800;margin:8px 0;text-shadow:0 4px 12px rgba(0,0,0,0.3)}
-  .hero .pred.tai{color:#86efac}
-  .hero .pred.xiu{color:#fca5a5}
-  .hero .pred.cho{color:#fde047}
+  .hero .pred{font-size:36px;font-weight:800;margin:8px 0}
+  .hero .pred.tai{color:#86efac}.hero .pred.xiu{color:#fca5a5}.hero .pred.cho{color:#fde047}
   .hero .meta{font-size:11px;color:#ddd6fe;margin-top:6px}
   .hero .regime{display:inline-block;margin-top:8px;padding:4px 10px;background:rgba(0,0,0,0.3);border-radius:20px;font-size:10px;color:#c4b5fd}
-
-  .section-title{
-    font-size:12px;color:#94a3b8;text-transform:uppercase;
-    margin:14px 0 8px;font-weight:700;letter-spacing:1px;
-  }
-
-  .table-wrap{
-    background:linear-gradient(135deg,#0f172a,#1e293b);
-    border-radius:12px;overflow:hidden;
-    border:1px solid #334155;margin-bottom:14px;
-  }
+  .section-title{font-size:12px;color:#94a3b8;text-transform:uppercase;margin:14px 0 8px;font-weight:700}
+  .table-wrap{background:linear-gradient(135deg,#0f172a,#1e293b);border-radius:12px;overflow:hidden;border:1px solid #334155;margin-bottom:14px}
   table{width:100%;border-collapse:collapse;font-size:11px}
-  th{
-    background:linear-gradient(135deg,#1e40af,#3b82f6);
-    color:#fff;padding:8px 4px;font-weight:600;
-    text-transform:uppercase;font-size:9px;
-  }
+  th{background:linear-gradient(135deg,#1e40af,#3b82f6);color:#fff;padding:8px 4px;text-transform:uppercase;font-size:9px}
   td{padding:8px 4px;text-align:center;border-bottom:1px solid #1e293b}
-  tr:hover{background:rgba(59,130,246,0.08)}
-  .tai{color:#22c55e;font-weight:700}
-  .xiu{color:#ef4444;font-weight:700}
-  .dung{color:#22c55e;font-weight:600}
-  .sai{color:#ef4444;font-weight:600}
-  .cho{color:#eab308;font-weight:600;animation:pulse 1.5s infinite}
-  .wait{color:#64748b;font-style:italic}
-  .brier{color:#a78bfa;font-family:'Courier New',monospace;font-size:10px}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
-  .dice{font-family:'Courier New',monospace;font-weight:600;color:#fbbf24}
-  .sum-badge{
-    display:inline-block;padding:2px 6px;border-radius:4px;
-    background:rgba(251,191,36,0.15);color:#fbbf24;font-weight:700;
-  }
-  .session{font-family:'Courier New',monospace;font-size:10px;color:#94a3b8}
-  .ti-le{font-size:10px;color:#a5b4fc}
-  .ens-badge{
-    display:inline-block;font-size:9px;
-    padding:2px 5px;border-radius:4px;font-weight:700;
-    background:#1e40af;color:#93c5fd;
-  }
-  .algo-badge{
-    display:inline-block;font-size:9px;
-    padding:2px 6px;border-radius:4px;font-weight:700;
-    background:#7c3aed;color:#ddd6fe;
-  }
-  .type-badge{
-    display:inline-block;font-size:9px;
-    padding:2px 6px;border-radius:4px;font-weight:600;
-    background:#1e40af;color:#93c5fd;
-  }
-  .regime-badge{
-    display:inline-block;font-size:9px;
-    padding:2px 6px;border-radius:4px;font-weight:600;
-    background:#7c2d12;color:#fdba74;
-  }
-  .copy-btn{
-    background:#10b981;color:#fff;border:none;
-    padding:4px 10px;border-radius:6px;
-    font-size:10px;font-weight:600;cursor:pointer;
-  }
-  .link-box{
-    background:linear-gradient(135deg,#064e3b,#065f46);
-    padding:12px;border-radius:12px;margin-bottom:14px;
-    border:1px solid #10b981;
-  }
+  .tai{color:#22c55e;font-weight:700}.xiu{color:#ef4444;font-weight:700}
+  .dung{color:#22c55e;font-weight:600}.sai{color:#ef4444;font-weight:600}
+  .cho{color:#eab308;font-weight:600}.wait{color:#64748b;font-style:italic}
+  .brier{color:#a78bfa;font-family:monospace;font-size:10px}
+  .algo-badge{display:inline-block;font-size:9px;padding:2px 6px;border-radius:4px;font-weight:700;background:#7c3aed;color:#ddd6fe}
+  .ens-badge{display:inline-block;font-size:9px;padding:2px 5px;border-radius:4px;font-weight:700;background:#1e40af;color:#93c5fd}
+  .regime-badge{display:inline-block;font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600;background:#7c2d12;color:#fdba74}
+  .link-box{background:linear-gradient(135deg,#064e3b,#065f46);padding:12px;border-radius:12px;margin-bottom:14px;border:1px solid #10b981}
   .link-box .title{font-size:12px;color:#6ee7b7;font-weight:600;margin-bottom:6px}
-  .link-row{
-    font-family:'Courier New',monospace;font-size:11px;color:#d1fae5;
-    background:rgba(0,0,0,0.3);padding:8px;border-radius:6px;
-    margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;gap:8px;
-  }
+  .link-row{font-family:monospace;font-size:11px;color:#d1fae5;background:rgba(0,0,0,0.3);padding:8px;border-radius:6px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;gap:8px}
   .link-row span{word-break:break-all;flex:1}
+  .copy-btn{background:#10b981;color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:10px;font-weight:600;cursor:pointer}
 </style>
 <script>
-  setTimeout(()=>location.reload(), 10000);
-  function copyText(text, btn){
-    const done = ()=>{const old=btn.textContent;btn.textContent='✓';setTimeout(()=>btn.textContent=old,1500)};
-    if(navigator.clipboard){navigator.clipboard.writeText(text).then(done).catch(done)}
-    else{
-      const ta=document.createElement('textarea');ta.value=text;
-      document.body.appendChild(ta);ta.select();document.execCommand('copy');
-      document.body.removeChild(ta);done();
-    }
-  }
+  setTimeout(()=>location.reload(),10000);
+  function copyText(text, btn){const done=()=>{const old=btn.textContent;btn.textContent='✓';setTimeout(()=>btn.textContent=old,1500)};if(navigator.clipboard){navigator.clipboard.writeText(text).then(done).catch(done)}else{const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done()}}
 </script>
 </head>
 <body>
   <div class="header">
-    <h1>🎯 HOANG VIP v10 — MEGA EVOLUTION</h1>
-    <div class="subtitle">Bàn: ${game.toUpperCase()} • 15 thuật toán + Regime Detection</div>
+    <h1>🎯 HOANG VIP v11 — UNIVERSAL API</h1>
+    <div class="subtitle">15 algos + CORS + Webhook + Telegram + RSS + XML/CSV/TXT</div>
   </div>
 
   <div class="hero">
     <div class="label">Dự đoán phiên tiếp theo</div>
-    <div class="pred ${latestCode === 'T' ? 'tai' : (latestCode === 'X' ? 'xiu' : 'cho')}">
-      ${latestPred} ${latestTiLe !== 'CHỜ' ? latestTiLe : ''}
-    </div>
+    <div class="pred ${latestCode === 'T' ? 'tai' : (latestCode === 'X' ? 'xiu' : 'cho')}">${latestPred} ${latestTiLe !== 'CHỜ' ? latestTiLe : ''}</div>
     <div class="meta">${latestReason || 'Chờ tín hiệu'} • Phiên ${latest ? latest.phienDuDoan : '—'}</div>
     <div class="regime">Regime: ${latestRegime}</div>
   </div>
 
   <div class="link-box">
-    <div class="title">🔗 Link</div>
-    <div class="link-row">
-      <span>${req.protocol}://${req.get('host')}/api/predict/${game}</span>
-      <button class="copy-btn" onclick="copyText('${req.protocol}://${req.get('host')}/api/predict/${game}', this)">Copy</button>
-    </div>
-    <div class="link-row">
-      <span>${req.protocol}://${req.get('host')}/api/history/all</span>
-      <button class="copy-btn" onclick="copyText('${req.protocol}://${req.get('host')}/api/history/all', this)">Copy</button>
-    </div>
+    <div class="title">🔗 API Endpoints cho mọi app</div>
+    <div class="link-row"><span>${baseUrl}/api/predict/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}',this)">Copy</button></div>
+    <div class="link-row"><span>${baseUrl}/api/predict/${game}?format=xml</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}?format=xml',this)">Copy</button></div>
+    <div class="link-row"><span>${baseUrl}/api/predict/${game}?format=txt</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}?format=txt',this)">Copy</button></div>
+    <div class="link-row"><span>${baseUrl}/api/simple/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/simple/${game}',this)">Copy</button></div>
+    <div class="link-row"><span>${baseUrl}/api/history/all</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/history/all',this)">Copy</button></div>
+    <div class="link-row"><span>${baseUrl}/rss/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/rss/${game}',this)">Copy</button></div>
+    <div class="link-row"><span>${baseUrl}/widget/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/widget/${game}',this)">Copy</button></div>
   </div>
 
   <div class="section-title">📊 16 Thuật toán</div>
   <div class="table-wrap">
     <table>
-      <thead>
-        <tr><th>Algo</th><th>T</th><th>W</th><th>L</th><th>Skip</th><th>Acc</th><th>Brier</th></tr>
-      </thead>
+      <thead><tr><th>Algo</th><th>T</th><th>W</th><th>L</th><th>Skip</th><th>Acc</th><th>Brier</th></tr></thead>
       <tbody>${algoRows}</tbody>
     </table>
   </div>
 
-  ${regimeRows ? `
-  <div class="section-title">🎯 Accuracy theo Regime</div>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr><th>Regime</th><th>Tổng</th><th>W</th><th>L</th><th>Acc</th></tr>
-      </thead>
-      <tbody>${regimeRows}</tbody>
-    </table>
-  </div>
-  ` : ''}
-
-  ${typeRows ? `
-  <div class="section-title">🎯 Accuracy theo loại cầu</div>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr><th>Loại</th><th>Tổng</th><th>W</th><th>L</th><th>Acc</th></tr>
-      </thead>
-      <tbody>${typeRows}</tbody>
-    </table>
-  </div>
-  ` : ''}
-
   <div class="section-title">📜 40 phiên gần nhất</div>
   <div class="table-wrap">
     <table>
-      <thead>
-        <tr>
-          <th>Phiên</th><th>XX</th><th>Tổng</th><th>KQ</th>
-          <th>Dự đoán</th><th>Tỉ lệ</th><th>Reason</th><th>Regime</th><th>TT</th>
-        </tr>
-      </thead>
+      <thead><tr><th>Phiên</th><th>XX</th><th>Tổng</th><th>KQ</th><th>Dự đoán</th><th>Tỉ lệ</th><th>Reason</th><th>Regime</th><th>TT</th></tr></thead>
       <tbody>
         ${rows.map(it => {
           const dice = (it.xucXac || []).join('-');
-          const kq = it.ketQuaLabel || labelFromTX(it.ketQua) || '';
+          const kq = it.ketQuaLabel || '';
           const kqCls = it.ketQua === 'T' ? 'tai' : (it.ketQua === 'X' ? 'xiu' : '');
           const isWait = !it.DU_DOAN_CODE;
           const ddCls = isWait ? 'wait' : (it.DU_DOAN_CODE === 'T' ? 'tai' : 'xiu');
           const ttCls = it.trangThai === 'ĐÚNG' ? 'dung' : (it.trangThai === 'SAI' ? 'sai' : (it.trangThai === 'BỎ QUA' ? 'wait' : 'cho'));
           return `<tr>
-            <td class="session">${it.phien}</td>
-            <td class="dice">${dice}</td>
-            <td><span class="sum-badge">${it.tong || ''}</span></td>
+            <td style="font-family:monospace;font-size:10px;color:#94a3b8">${it.phien}</td>
+            <td style="color:#fbbf24;font-weight:600">${dice}</td>
+            <td>${it.tong || ''}</td>
             <td class="${kqCls}">${kq}</td>
             <td class="${ddCls}">${isWait ? 'CHỜ' : it.DU_DOAN}</td>
-            <td class="ti-le">${it.TI_LE || 'CHỜ'}</td>
+            <td style="color:#a5b4fc;font-size:10px">${it.TI_LE || 'CHỜ'}</td>
             <td>${it.ensReason ? `<span class="ens-badge">${it.ensReason}</span>` : '—'}</td>
             <td><span class="regime-badge">${it.regimeType || '—'}</span></td>
             <td class="${ttCls}">${it.trangThai === 'ĐANG CHỜ' ? '...' : it.trangThai}</td>
@@ -1799,7 +1460,7 @@ app.get('/:game', (req, res) => {
   </div>
 
   <div style="text-align:center;font-size:10px;color:#475569;margin-top:14px">
-    Auto refresh 10s • HOANG VIP v10 • 15 Algorithms + Regime + Brier + Kelly
+    HOANG VIP v11 • Universal API • CORS enabled
   </div>
 </body>
 </html>`;
@@ -1809,16 +1470,14 @@ app.get('/:game', (req, res) => {
 // ============ SERVER ============
 const server = app.listen(PORT, () => {
   console.log(`========================================`);
-  console.log(`🚀 HOANG VIP v10 - MEGA EVOLUTION`);
+  console.log(`🚀 HOANG VIP v11 - UNIVERSAL API`);
   console.log(`========================================`);
   console.log(`Port: ${PORT} | Polling: ${POLL_INTERVAL_MS}ms`);
-  console.log(`✅ 15 algorithms: STREAK, CAU, MARKOV, NGRAM, BAYESIAN,`);
-  console.log(`   TREND, LSTM_SIM, ARIMA, KALMAN, RANDOM_FOREST,`);
-  console.log(`   GRADIENT_BOOST, CHAOS, FOURIER, ENTROPY, META_LEARNER`);
-  console.log(`✅ + ENSEMBLE voting`);
-  console.log(`✅ Regime Detection (BỆT/CẦU_1_1/RANDOM/HỖN_HỢP)`);
-  console.log(`✅ Brier Score + Kelly Criterion + Circuit Breaker`);
-  console.log(`✅ Snapshots + Rollback support`);
+  console.log(`✅ CORS mở - mọi app gọi được`);
+  console.log(`✅ Formats: json/xml/txt/csv`);
+  console.log(`✅ Endpoints: /api/predict, /api/simple, /api/public, /rss, /widget`);
+  console.log(`✅ API Key: ${API_KEY ? 'CÓ (' + API_KEY.slice(0, 4) + '...)' : 'KHÔNG (public)'}`);
+  console.log(`✅ Webhooks: Telegram=${!!TELEGRAM_BOT_TOKEN}, Discord=${!!DISCORD_WEBHOOK}, Slack=${!!SLACK_WEBHOOK}, Custom=${!!CUSTOM_WEBHOOK}`);
   console.log(`========================================`);
   startPolling();
 });
