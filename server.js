@@ -1,10 +1,20 @@
 /**
  * ========================================================================
- * HOANG VIP ADAPTIVE v4 - FULL FIX + UI ĐẸP + LINK RIÊNG
+ * HOANG VIP ADAPTIVE v5 - FULL FIX ALL
  * ========================================================================
- * FIX: Sum >= 11 → Tài, Sum <= 10 → Xỉu (luôn tính từ 3 xúc xắc)
- * UI: Dark theme đẹp, responsive, có link copy dự đoán
- * LINK: /api/link/:game - link dự đoán riêng
+ * ✅ FIX BUG "predict toàn Xỉu":
+ *    - Bỏ debias shift (nguyên nhân chính gây collapse)
+ *    - Blend 3 nguồn không cho 1 nguồn dominate
+ *    - Floor weight 15% mỗi signal
+ *    - Force balance khi p gần 0.5
+ *    - Check agreement 3 nguồn
+ *    - Anchor về avg signal khi lệch quá xa
+ *    - Confidence floor (không predict khi quá 50/50)
+ * ✅ FIX bug Sum=8 ghi Tài (luôn tính từ 3 xúc xắc)
+ * ✅ Deterministic 100% (không Math.random)
+ * ✅ Adam optimizer + Wilson + Hedge + Variable Markov
+ * ✅ UI đẹp mobile, có nút copy link
+ * ✅ /api/link/:game trả link dự đoán riêng
  * ========================================================================
  */
 
@@ -55,10 +65,15 @@ const PATTERN_MIN_SUPPORT = 2;
 const PATTERN_TOP_N = 40;
 const PATTERN_DECAY_HALF_LIFE = 250;
 const CALIBRATION_LR = 0.015;
-const CONFIDENCE_THRESHOLD = 0.78;
-const ENTROPY_THRESHOLD = 0.65;
+const CONFIDENCE_THRESHOLD = 0.72;
+const ENTROPY_THRESHOLD = 0.68;
 const ENSEMBLE_ETA = 0.10;
 const WILSON_Z = 1.96;
+
+// ✅ NEW: Ngưỡng confidence floor
+const MIN_CONFIDENCE = 0.03;         // Không predict nếu |p-0.5| < 3%
+const MIN_SIGNAL_WEIGHT = 0.15;      // Mỗi signal tối thiểu 15%
+const MAX_SIGNAL_WEIGHT = 0.55;      // Mỗi signal tối đa 55%
 
 // ============ HELPERS ============
 function now() { return new Date().toISOString(); }
@@ -119,41 +134,30 @@ function getCurrentTimeSlot(date = new Date()) {
   return 'Dem';
 }
 
-// ============ 🎯 FIX CHÍNH: LUÔN TÍNH TỪ 3 XÚC XẮC ============
+// ============ 🎯 FIX: LUÔN TÍNH TỪ 3 XÚC XẮC ============
 function itemToDice(item) {
   if (!item) return [0, 0, 0];
-  return [
-    safeInt(item.FirstDice, 0),
-    safeInt(item.SecondDice, 0),
-    safeInt(item.ThirdDice, 0)
-  ];
+  return [safeInt(item.FirstDice, 0), safeInt(item.SecondDice, 0), safeInt(item.ThirdDice, 0)];
 }
 
 function itemToSum(item) {
   if (!item) return 0;
   const d = itemToDice(item);
   const s = d[0] + d[1] + d[2];
-  if (s > 0) return s;
-  // fallback nếu API không có dice nhưng có DiceSum
+  if (s > 0 && s <= 18) return s;
   if (item.DiceSum !== undefined) return safeInt(item.DiceSum, 0);
   return 0;
 }
 
 /**
- * ✅ FIX: LUÔN tính Tài/Xỉu từ tổng 3 xúc xắc
- * Tài: 11-18 | Xỉu: 3-10
- * BỎ QUA BetSide vì API có thể trả sai
+ * ✅ FIX BUG: Sum >= 11 → Tài, Sum <= 10 → Xỉu
+ * KHÔNG dùng BetSide từ API (có thể sai)
  */
 function itemToResult(item) {
   if (!item) return null;
   const sum = itemToSum(item);
-  if (sum >= 3 && sum <= 18) {
-    return sum >= 11 ? 'T' : 'X';
-  }
-  // fallback cuối: dùng BetSide nếu không có dice
-  if (item.BetSide !== undefined) {
-    return safeInt(item.BetSide, 0) === 1 ? 'T' : 'X';
-  }
+  if (sum >= 3 && sum <= 18) return sum >= 11 ? 'T' : 'X';
+  if (item.BetSide !== undefined) return safeInt(item.BetSide, 0) === 1 ? 'T' : 'X';
   return null;
 }
 
@@ -165,18 +169,15 @@ function deterministicHash(str) {
 
 function deterministicInitWeights(dim, seed = 'default') {
   const w = new Array(dim);
-  for (let i = 0; i < dim; i++) {
-    w[i] = (deterministicHash(`${seed}::${i}`) - 0.5) * 0.02;
-  }
+  for (let i = 0; i < dim; i++) w[i] = (deterministicHash(`${seed}::${i}`) - 0.5) * 0.02;
   return w;
 }
 
 // ============ DB ============
 function defaultDB() {
   return {
-    version: 4,
-    createdAt: now(),
-    updatedAt: now(),
+    version: 5,
+    createdAt: now(), updatedAt: now(),
     history: [],
     stats: { total: 0, wins: 0, losses: 0, currentStreak: 0, maxWinStreak: 0, maxLossStreak: 0 },
     timeStats: {
@@ -184,15 +185,13 @@ function defaultDB() {
       Toi: { total: 0, wins: 0 }, Dem: { total: 0, wins: 0 }
     },
     lastProcessedSession: null,
-    model: { weights: null, bias: 0, iter: 0, createdAt: now(), version: 1, bestAcc: 0, seed: 'hoang_vip_v4' },
+    model: { weights: null, bias: 0, iter: 0, createdAt: now(), version: 1, bestAcc: 0, seed: 'hoang_vip_v5' },
     calibration: { a: 1.0, b: 0.0, iter: 0 },
     optimizer: { m: null, v: null, t: 0 },
     ensembleRegret: { model: 0, pattern: 0, markov: 0 },
     patterns: { lastExtractedAt: null, list: [] },
     ensembleWeights: { model: 0.34, pattern: 0.33, markov: 0.33 },
-    checkpoints: [],
-    biasCorrections: [],
-    brierHistory: [],
+    checkpoints: [], biasCorrections: [], brierHistory: [],
     _strictUnbiased: true
   };
 }
@@ -208,9 +207,7 @@ function migrateDB(db) {
   if (!db.stats || typeof db.stats !== 'object') db.stats = def.stats;
   for (const k in def.stats) if (!Number.isFinite(db.stats[k])) db.stats[k] = def.stats[k];
   if (!db.timeStats || typeof db.timeStats !== 'object') db.timeStats = def.timeStats;
-  for (const s of ['Sang', 'Chieu', 'Toi', 'Dem']) {
-    if (!db.timeStats[s]) db.timeStats[s] = { total: 0, wins: 0 };
-  }
+  for (const s of ['Sang', 'Chieu', 'Toi', 'Dem']) if (!db.timeStats[s]) db.timeStats[s] = { total: 0, wins: 0 };
   if (!db.model || typeof db.model !== 'object') db.model = def.model;
   if (!Array.isArray(db.model.weights) && db.model.weights !== null) db.model.weights = null;
   if (!Number.isFinite(db.model.bias)) db.model.bias = 0;
@@ -226,7 +223,7 @@ function migrateDB(db) {
   if (!Array.isArray(db.patterns.list)) db.patterns.list = [];
   if (!db.ensembleWeights) db.ensembleWeights = { model: 0.34, pattern: 0.33, markov: 0.33 };
   if (typeof db._strictUnbiased !== 'boolean') db._strictUnbiased = true;
-  if (!db.version) db.version = 4;
+  if (!db.version) db.version = 5;
   db.history = db.history.filter(h => h && typeof h === 'object' && h.phien !== undefined);
   return db;
 }
@@ -245,7 +242,8 @@ function saveDatabase(game, db) {
   safeAtomicWrite(BACKUP_FILES[game], db);
 }
 
-// ============ DEBIAS ============
+// ============ 🎯 FIX: BỎ DEBIAS CỨNG ============
+// Nguyên nhân chính gây bug "toàn Xỉu" - đã bỏ hoàn toàn
 function getRecentMeanPred(db, windowSize = 200) {
   const hist = (db.history || []).slice(-windowSize);
   if (!hist.length) return 0.5;
@@ -261,18 +259,22 @@ function getRecentMeanPred(db, windowSize = 200) {
 }
 
 function debiasProbability(db, p, windowSize = 200) {
-  if (!db._strictUnbiased) return clamp(p);
-  const mean = getRecentMeanPred(db, windowSize);
-  const shift = mean - 0.5;
-  if (Math.abs(shift) < 0.01) return clamp(p);
+  // ✅ FIX: KHÔNG shift logit. Chỉ pass-through
   const pc = clamp(p, 1e-6, 1 - 1e-6);
-  const logit = Math.log(pc / (1 - pc));
-  const correctedLogit = logit - shift * 2;
-  let corrected = sigmoid(correctedLogit);
-  if (Math.abs(pc - 0.5) > 0.15 && Math.abs(corrected - 0.5) < Math.abs(pc - 0.5) * 0.3) {
-    corrected = pc * 0.7 + corrected * 0.3;
+  return pc;
+}
+
+// ============ ✅ FIX: FORCE BALANCE ============
+function forceBalance(db, p) {
+  const pc = clamp(p, 1e-6, 1 - 1e-6);
+  // Nếu |p - 0.5| < 0.02 → kéo về 0.5 để không predict khi quá gần
+  if (Math.abs(pc - 0.5) < 0.02) return 0.5;
+  // Nếu |p - 0.5| < 0.05 → amplify nhẹ để có tín hiệu rõ
+  if (Math.abs(pc - 0.5) < 0.05) {
+    const sign = pc >= 0.5 ? 1 : -1;
+    return clamp(0.5 + sign * (Math.abs(pc - 0.5) * 1.3));
   }
-  return clamp(corrected);
+  return pc;
 }
 
 // ============ PATTERN MINING ============
@@ -442,9 +444,7 @@ function buildBaseFeatures(sequence) {
   const alphas = [0.3, 0.15, 0.07, 0.03, 0.015];
   for (const a of alphas) {
     let s = 0;
-    for (let i = 0; i < sequence.length; i++) {
-      s = a * (sequence[i] === 'T' ? 1 : -1) + (1 - a) * s;
-    }
+    for (let i = 0; i < sequence.length; i++) s = a * (sequence[i] === 'T' ? 1 : -1) + (1 - a) * s;
     f.push(Number.isFinite(s) ? s : 0);
   }
   const last = sequence[sequence.length - 1];
@@ -549,9 +549,7 @@ function adamUpdateModel(db, x, labelT) {
   const err = labelT - pred;
 
   const grad = new Array(x.length);
-  for (let i = 0; i < x.length; i++) {
-    grad[i] = err * (x[i] || 0) - LR_REGULARIZATION * (db.model.weights[i] || 0);
-  }
+  for (let i = 0; i < x.length; i++) grad[i] = err * (x[i] || 0) - LR_REGULARIZATION * (db.model.weights[i] || 0);
   clipGradients(grad, GRAD_CLIP);
 
   const b1 = 1 - Math.pow(ADAM_BETA1, opt.t);
@@ -595,16 +593,28 @@ function calibrationUpdate(db, logit, labelT) {
   return { pred, err };
 }
 
-// ============ ENSEMBLE ============
+// ============ 🎯 FIX: ENSEMBLE VỚI FLOOR WEIGHT ============
 function combineSignals(db, pm, pp, pk) {
-  const w = db.ensembleWeights || { model: 0.34, pattern: 0.33, markov: 0.33 };
-  return { p: clamp(w.model * pm + w.pattern * pp + w.markov * pk), weights: w };
+  let w = db.ensembleWeights || { model: 0.34, pattern: 0.33, markov: 0.33 };
+
+  // ✅ FIX: Floor 15% và cap 55% mỗi nguồn
+  w = {
+    model: Math.max(MIN_SIGNAL_WEIGHT, Math.min(MAX_SIGNAL_WEIGHT, w.model || 0.34)),
+    pattern: Math.max(MIN_SIGNAL_WEIGHT, Math.min(MAX_SIGNAL_WEIGHT, w.pattern || 0.33)),
+    markov: Math.max(MIN_SIGNAL_WEIGHT, Math.min(MAX_SIGNAL_WEIGHT, w.markov || 0.33))
+  };
+  const s = w.model + w.pattern + w.markov;
+  w.model /= s; w.pattern /= s; w.markov /= s;
+
+  const raw = w.model * pm + w.pattern * pp + w.markov * pk;
+  return { p: clamp(raw), weights: w };
 }
 
 function updateEnsembleWeights(db, losses, eta = ENSEMBLE_ETA) {
   const keys = ['model', 'pattern', 'markov'];
   const w = db.ensembleWeights || { model: 0.34, pattern: 0.33, markov: 0.33 };
   db.ensembleRegret = db.ensembleRegret || { model: 0, pattern: 0, markov: 0 };
+
   let total = 0;
   for (const k of keys) {
     const li = Math.max(0, Math.min(1, losses[k] || 0.5));
@@ -616,14 +626,17 @@ function updateEnsembleWeights(db, losses, eta = ENSEMBLE_ETA) {
   }
   if (total <= 0) { w.model = 0.34; w.pattern = 0.33; w.markov = 0.33; }
   else for (const k of keys) w[k] /= total;
-  for (const k of keys) w[k] = Math.max(0.08, w[k]);
+
+  // ✅ FIX: Floor 15%
+  for (const k of keys) w[k] = Math.max(MIN_SIGNAL_WEIGHT, w[k]);
   const s = w.model + w.pattern + w.markov;
   for (const k of keys) w[k] /= s;
+
   db.ensembleWeights = w;
   return w;
 }
 
-// ============ GATING ============
+// ============ 🎯 FIX: GATING CHẶT HƠN ============
 function adaptiveThresholds(db) {
   const recent = (db.history || []).filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI').slice(-50);
   if (recent.length < 20) return { confThresh: CONFIDENCE_THRESHOLD, entThresh: ENTROPY_THRESHOLD };
@@ -641,13 +654,21 @@ function gatingDecision(db, cp, ent, comps) {
   if ((comps.modelProb >= 0.5 ? 'T' : 'X') === final) agree++;
   if ((comps.patternProb >= 0.5 ? 'T' : 'X') === final) agree++;
   if ((comps.markovProb >= 0.5 ? 'T' : 'X') === final) agree++;
-  if (cp < confThresh) return { pass: false, reason: 'low_confidence', confThresh, entThresh, agree };
-  if (ent > entThresh) return { pass: false, reason: 'high_entropy', confThresh, entThresh, agree };
-  if (agree < 2) return { pass: false, reason: 'low_agreement', confThresh, entThresh, agree };
+
+  // ✅ FIX: Cần ít nhất 2/3 đồng ý
+  if (agree < 2) return { pass: false, reason: 'low_agreement', agree, confThresh, entThresh };
+
+  // ✅ FIX: Nếu quá gần 0.5 → không tự tin
+  if (Math.abs(cp - 0.5) < MIN_CONFIDENCE) {
+    return { pass: false, reason: 'too_close_50_50', agree, confThresh, entThresh };
+  }
+
+  if (cp < confThresh) return { pass: false, reason: 'low_confidence', agree, confThresh, entThresh };
+  if (ent > entThresh) return { pass: false, reason: 'high_entropy', agree, confThresh, entThresh };
   return { pass: true, reason: 'ok', agree, confThresh, entThresh };
 }
 
-// ============ BIAS ============
+// ============ BIAS DETECTION ============
 function detectAndCorrectBias(db, game) {
   try {
     const recent = (db.history || []).slice(-60);
@@ -660,16 +681,15 @@ function detectAndCorrectBias(db, game) {
     const total = cT + cX;
     if (total < 8) return;
     const pT = cT / total, pX = cX / total;
-    if (pT > 0.90 || pX > 0.90) {
+    if (pT > 0.92 || pX > 0.92) {
       console.warn(`[BIAS] game=${game} pT=${pT.toFixed(3)} pX=${pX.toFixed(3)} correcting`);
       db.ensembleWeights = { model: 0.34, pattern: 0.33, markov: 0.33 };
       db.ensembleRegret = { model: 0, pattern: 0, markov: 0 };
       db.optimizer = { m: null, v: null, t: 0 };
       if (db.model && Array.isArray(db.model.weights)) {
-        for (let i = 0; i < db.model.weights.length; i++) db.model.weights[i] *= 0.35;
-        if (typeof db.model.bias === 'number') db.model.bias *= 0.35;
+        for (let i = 0; i < db.model.weights.length; i++) db.model.weights[i] *= 0.5;
+        if (typeof db.model.bias === 'number') db.model.bias *= 0.5;
       }
-      db.calibration = { a: 1.0, b: 0.0, iter: 0 };
       db.biasCorrections.push({ at: now(), pT: Number(pT.toFixed(4)), pX: Number(pX.toFixed(4)) });
     }
   } catch (e) {}
@@ -712,7 +732,7 @@ async function fetchWithRetry(url, attempts = FETCH_RETRIES) {
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
     try {
-      return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVipAdaptive/4.0' } });
+      return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVipAdaptive/5.0' } });
     } catch (e) {
       lastErr = e;
       if (i < attempts - 1) await new Promise(r => setTimeout(r, 200 + i * 200));
@@ -729,7 +749,7 @@ function parseHistoryResponse(data) {
   return [];
 }
 
-// ============ PREDICT CORE ============
+// ============ 🎯 FIX: RUN PREDICTION ============
 function runPrediction(db, seq, game = 'default') {
   if (!Array.isArray(seq) || seq.length === 0) {
     return {
@@ -741,6 +761,7 @@ function runPrediction(db, seq, game = 'default') {
       mergedPatterns: [], fvMeta: { topPatterns: [] }
     };
   }
+
   const newPatterns = extractFrequentPatterns(seq);
   const merged = mergeAndDecayPatterns(db.patterns.list || [], newPatterns, seq.length);
   db.patterns.list = merged;
@@ -759,8 +780,25 @@ function runPrediction(db, seq, game = 'default') {
   const combined = combineSignals(db, pModel, pPattern, pMarkov);
   const calibrated = calibrate(db, logit);
 
-  let finalP = clamp(0.9 * calibrated + 0.1 * combined.p);
+  // ✅ FIX: Blend 4 nguồn cân bằng hơn
+  let finalP = clamp(
+    0.35 * calibrated +
+    0.25 * pModel +
+    0.20 * pPattern +
+    0.20 * pMarkov
+  );
+
+  // ✅ FIX: Bỏ debias shift
   finalP = debiasProbability(db, finalP, 200);
+
+  // ✅ FIX: Force balance
+  finalP = forceBalance(db, finalP);
+
+  // ✅ FIX: Anchor về avg nếu lệch quá xa
+  const avgSignal = (pModel + pPattern + pMarkov) / 3;
+  if (Math.abs(finalP - avgSignal) > 0.15) {
+    finalP = clamp(0.6 * finalP + 0.4 * avgSignal);
+  }
 
   const entropy = entropyFromProb(finalP);
   const comps = { modelProb: pModel, patternProb: pPattern, markovProb: pMarkov };
@@ -917,7 +955,7 @@ function formatHistoryItem(it) {
   };
 }
 
-// ============ API: PREDICT ============
+// ============ API ============
 app.get('/api/predict/:game', async (req, res) => {
   const game = req.params.game;
   if (!APIS[game]) return res.status(400).json({ error: 'Bàn chơi không hợp lệ.' });
@@ -958,7 +996,7 @@ app.get('/api/predict/:game', async (req, res) => {
   }
 });
 
-// ============ 🎯 API: LINK DỰ ĐOÁN RIÊNG ============
+// ============ API: LINK RIÊNG ============
 app.get('/api/link/:game', async (req, res) => {
   const game = req.params.game;
   if (!APIS[game]) return res.status(400).json({ error: 'Bàn chơi không hợp lệ.' });
@@ -1000,6 +1038,7 @@ app.get('/api/link/:game', async (req, res) => {
         modelProb: Number(pred.pModel.toFixed(4)),
         patternProb: Number(pred.pPattern.toFixed(4)),
         markovProb: Number(pred.pMarkov.toFixed(4)),
+        calibrated: Number(pred.calibrated.toFixed(4)),
         finalProb: Number(pred.combined.toFixed(4))
       }
     });
@@ -1131,12 +1170,22 @@ app.get('/admin/metrics/:game', (req, res) => {
   const db = loadDatabase(game);
   const tail = (db.history || []).filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI').slice(-200);
   const acc = tail.length ? (tail.filter(h => h.trangThai === 'ĐÚNG').length / tail.length) : 0;
+
+  // Count predictions Tài vs Xỉu trong 50 phiên gần nhất
+  const recent = (db.history || []).slice(-50);
+  let cntT = 0, cntX = 0;
+  for (const h of recent) {
+    if (h.DU_DOAN_CODE === 'T') cntT++;
+    else if (h.DU_DOAN_CODE === 'X') cntX++;
+  }
+
   return res.json({
     rollingCount: tail.length,
     rollingAccuracy: Number(acc.toFixed(4)),
     rollingBrier: computeBrierScore(db, 200),
     totalEvaluations: db.stats.total,
     globalAccuracy: db.stats.total ? Number((db.stats.wins / db.stats.total).toFixed(4)) : 0,
+    distribution: { tai: cntT, xiu: cntX, ratio: cntT + cntX > 0 ? `${cntT}/${cntX}` : 'N/A' },
     ensembleWeights: db.ensembleWeights,
     ensembleRegret: db.ensembleRegret,
     biasCorrections: db.biasCorrections ? db.biasCorrections.length : 0,
@@ -1146,10 +1195,16 @@ app.get('/admin/metrics/:game', (req, res) => {
 });
 
 app.get('/admin/config', (req, res) => {
-  res.json({ LR_LEARNING_RATE, LR_REGULARIZATION, MARKOV_MAX_ORDER, PATTERN_TOP_N, DETERMINISTIC: true, VERSION: 4 });
+  res.json({
+    LR_LEARNING_RATE, LR_REGULARIZATION,
+    MARKOV_MAX_ORDER, PATTERN_TOP_N,
+    CONFIDENCE_THRESHOLD, ENTROPY_THRESHOLD,
+    MIN_CONFIDENCE, MIN_SIGNAL_WEIGHT, MAX_SIGNAL_WEIGHT,
+    DETERMINISTIC: true, VERSION: 5
+  });
 });
 
-// ============ 🎨 UI ĐẸP ============
+// ============ UI ============
 app.get('/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.send('Trang không tồn tại.');
@@ -1157,13 +1212,14 @@ app.get('/:game', (req, res) => {
   const db = loadDatabase(game);
   const winRate = db.stats.total > 0 ? ((db.stats.wins / db.stats.total) * 100).toFixed(2) : '0.00';
   const rows = db.history.slice(-40).reverse();
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
 
   const html = `<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>HOANG VIP ADAPTIVE v4 - ${game.toUpperCase()}</title>
+<title>HOANG VIP v5 - ${game.toUpperCase()}</title>
 <style>
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   body{
@@ -1184,67 +1240,49 @@ app.get('/:game', (req, res) => {
     animation:shine 3s infinite linear;
   }
   @keyframes shine{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
-  h1{
-    color:#fff;font-size:17px;margin:0;font-weight:700;
-    letter-spacing:0.5px;position:relative;z-index:1;
-  }
+  h1{color:#fff;font-size:17px;margin:0;font-weight:700;letter-spacing:0.5px;position:relative;z-index:1}
   .subtitle{color:#bfdbfe;font-size:11px;margin-top:4px;position:relative;z-index:1}
 
-  .stats-grid{
-    display:grid;grid-template-columns:repeat(3,1fr);
-    gap:8px;margin-bottom:14px;
-  }
+  .stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px}
   .stat-card{
     background:linear-gradient(135deg,#1e293b,#0f172a);
     padding:10px;border-radius:10px;text-align:center;
-    border:1px solid #334155;
-    box-shadow:0 4px 12px rgba(0,0,0,0.3);
+    border:1px solid #334155;box-shadow:0 4px 12px rgba(0,0,0,0.3);
   }
   .stat-card .label{font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px}
   .stat-card .value{font-size:20px;font-weight:700;margin-top:2px}
-  .stat-card .value.green{color:#22c55e}
-  .stat-card .value.red{color:#ef4444}
-  .stat-card .value.blue{color:#38bdf8}
-  .stat-card .value.yellow{color:#eab308}
+  .value.green{color:#22c55e}.value.red{color:#ef4444}
+  .value.blue{color:#38bdf8}.value.yellow{color:#eab308}
 
   .link-box{
     background:linear-gradient(135deg,#064e3b,#065f46);
     padding:12px;border-radius:12px;margin-bottom:14px;
-    border:1px solid #10b981;
-    box-shadow:0 4px 12px rgba(16,185,129,0.2);
+    border:1px solid #10b981;box-shadow:0 4px 12px rgba(16,185,129,0.2);
   }
-  .link-box .title{
-    font-size:12px;color:#6ee7b7;font-weight:600;
-    margin-bottom:6px;display:flex;align-items:center;gap:6px;
+  .link-box .title{font-size:12px;color:#6ee7b7;font-weight:600;margin-bottom:6px}
+  .link-row{
+    font-family:'Courier New',monospace;font-size:11px;color:#d1fae5;
+    background:rgba(0,0,0,0.3);padding:8px;border-radius:6px;
+    margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;gap:8px;
   }
-  .link-box .url{
-    font-family:'Courier New',monospace;
-    font-size:11px;color:#d1fae5;
-    background:rgba(0,0,0,0.3);
-    padding:8px;border-radius:6px;
-    word-break:break-all;
-    display:flex;justify-content:space-between;align-items:center;gap:8px;
-  }
+  .link-row span{word-break:break-all;flex:1}
   .copy-btn{
     background:#10b981;color:#fff;border:none;
     padding:4px 10px;border-radius:6px;
-    font-size:10px;font-weight:600;cursor:pointer;
-    white-space:nowrap;
+    font-size:10px;font-weight:600;cursor:pointer;white-space:nowrap;
   }
   .copy-btn:active{background:#059669}
 
   .table-wrap{
     background:linear-gradient(135deg,#0f172a,#1e293b);
     border-radius:12px;overflow:hidden;
-    border:1px solid #334155;
-    box-shadow:0 8px 24px rgba(0,0,0,0.4);
+    border:1px solid #334155;box-shadow:0 8px 24px rgba(0,0,0,0.4);
   }
   table{width:100%;border-collapse:collapse;font-size:11px}
   th{
     background:linear-gradient(135deg,#1e40af,#3b82f6);
     color:#fff;padding:8px 4px;font-weight:600;
-    text-transform:uppercase;font-size:9px;
-    letter-spacing:0.3px;position:sticky;top:0;
+    text-transform:uppercase;font-size:9px;letter-spacing:0.3px;
   }
   td{padding:8px 4px;text-align:center;border-bottom:1px solid #1e293b}
   tr:last-child td{border-bottom:none}
@@ -1258,8 +1296,7 @@ app.get('/:game', (req, res) => {
   .dice{font-family:'Courier New',monospace;font-weight:600;color:#fbbf24}
   .sum-badge{
     display:inline-block;padding:2px 6px;border-radius:4px;
-    background:rgba(251,191,36,0.15);color:#fbbf24;
-    font-weight:700;font-size:11px;
+    background:rgba(251,191,36,0.15);color:#fbbf24;font-weight:700;font-size:11px;
   }
   .session{font-family:'Courier New',monospace;font-size:10px;color:#94a3b8}
   .ti-le{font-size:10px;color:#a5b4fc}
@@ -1268,76 +1305,54 @@ app.get('/:game', (req, res) => {
     background:#7c2d12;color:#fdba74;
     padding:1px 4px;border-radius:3px;margin-left:2px;
   }
-  .mau{font-size:9px;color:#64748b;max-width:80px;
-    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-  .footer{
-    text-align:center;margin-top:14px;
-    font-size:10px;color:#475569;
-  }
+  .mau{font-size:9px;color:#64748b;max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .footer{text-align:center;margin-top:14px;font-size:10px;color:#475569}
 </style>
 <script>
   setTimeout(()=>location.reload(), 12000);
-  function copyLink(text){
-    if(navigator.clipboard){
-      navigator.clipboard.writeText(text).then(()=>{
-        event.target.textContent='✓ Đã copy';
-        setTimeout(()=>event.target.textContent='Copy', 1500);
-      });
-    } else {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select(); document.execCommand('copy');
-      document.body.removeChild(ta);
-      event.target.textContent='✓ Đã copy';
-      setTimeout(()=>event.target.textContent='Copy', 1500);
+  function copyText(text, btn){
+    const done = ()=>{const old=btn.textContent;btn.textContent='✓';setTimeout(()=>btn.textContent=old,1500)};
+    if(navigator.clipboard){navigator.clipboard.writeText(text).then(done).catch(done)}
+    else{
+      const ta=document.createElement('textarea');ta.value=text;
+      document.body.appendChild(ta);ta.select();document.execCommand('copy');
+      document.body.removeChild(ta);done();
     }
   }
 </script>
 </head>
 <body>
   <div class="header">
-    <h1>🎯 HOANG VIP ADAPTIVE v4</h1>
+    <h1>🎯 HOANG VIP ADAPTIVE v5</h1>
     <div class="subtitle">Bàn: ${game.toUpperCase()} • Deterministic Model</div>
   </div>
 
   <div class="stats-grid">
-    <div class="stat-card">
-      <div class="label">Tổng</div>
-      <div class="value blue">${db.stats.total}</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Thắng</div>
-      <div class="value green">${db.stats.wins}</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Thua</div>
-      <div class="value red">${db.stats.losses}</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Tỉ lệ</div>
-      <div class="value ${parseFloat(winRate) >= 50 ? 'green' : 'yellow'}">${winRate}%</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Model v</div>
-      <div class="value blue">${db.model.version || 1}</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Best Acc</div>
-      <div class="value green">${((db.model.bestAcc || 0) * 100).toFixed(1)}%</div>
-    </div>
+    <div class="stat-card"><div class="label">Tổng</div><div class="value blue">${db.stats.total}</div></div>
+    <div class="stat-card"><div class="label">Thắng</div><div class="value green">${db.stats.wins}</div></div>
+    <div class="stat-card"><div class="label">Thua</div><div class="value red">${db.stats.losses}</div></div>
+    <div class="stat-card"><div class="label">Tỉ lệ</div><div class="value ${parseFloat(winRate) >= 50 ? 'green' : 'yellow'}">${winRate}%</div></div>
+    <div class="stat-card"><div class="label">Model v</div><div class="value blue">${db.model.version || 1}</div></div>
+    <div class="stat-card"><div class="label">Best Acc</div><div class="value green">${((db.model.bestAcc || 0) * 100).toFixed(1)}%</div></div>
   </div>
 
   <div class="link-box">
-    <div class="title">🔗 Link dự đoán riêng</div>
-    <div class="url">
-      <span id="linkUrl">/${game}</span>
-      <button class="copy-btn" onclick="copyLink('${req.protocol}://${req.get('host')}/${game}')">Copy</button>
+    <div class="title">🔗 Link dự đoán</div>
+    <div class="link-row">
+      <span>${baseUrl}/${game}</span>
+      <button class="copy-btn" onclick="copyText('${baseUrl}/${game}', this)">Copy</button>
     </div>
-    <div class="url" style="margin-top:6px">
-      <span>/api/predict/${game}</span>
-      <button class="copy-btn" onclick="copyLink('${req.protocol}://${req.get('host')}/api/predict/${game}')">Copy</button>
+    <div class="link-row">
+      <span>${baseUrl}/api/link/${game}</span>
+      <button class="copy-btn" onclick="copyText('${baseUrl}/api/link/${game}', this)">Copy</button>
+    </div>
+    <div class="link-row">
+      <span>${baseUrl}/api/predict/${game}</span>
+      <button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}', this)">Copy</button>
+    </div>
+    <div class="link-row">
+      <span>${baseUrl}/api/history/all</span>
+      <button class="copy-btn" onclick="copyText('${baseUrl}/api/history/all', this)">Copy</button>
     </div>
   </div>
 
@@ -1345,15 +1360,8 @@ app.get('/:game', (req, res) => {
     <table>
       <thead>
         <tr>
-          <th>Phiên</th>
-          <th>Xúc xắc</th>
-          <th>Tổng</th>
-          <th>KQ</th>
-          <th>Phiên DĐ</th>
-          <th>Dự đoán</th>
-          <th>Tỉ lệ</th>
-          <th>Mẫu</th>
-          <th>TT</th>
+          <th>Phiên</th><th>Xúc xắc</th><th>Tổng</th><th>KQ</th>
+          <th>Phiên DĐ</th><th>Dự đoán</th><th>Tỉ lệ</th><th>Mẫu</th><th>TT</th>
         </tr>
       </thead>
       <tbody>
@@ -1381,9 +1389,7 @@ app.get('/:game', (req, res) => {
     </table>
   </div>
 
-  <div class="footer">
-    Auto refresh 12s • HOANG VIP ADAPTIVE v4 • Deterministic
-  </div>
+  <div class="footer">Auto refresh 12s • HOANG VIP v5</div>
 </body>
 </html>`;
   res.send(html);
@@ -1392,16 +1398,14 @@ app.get('/:game', (req, res) => {
 // ============ SERVER ============
 const server = app.listen(PORT, () => {
   console.log(`========================================`);
-  console.log(`🚀 HOANG VIP ADAPTIVE v4`);
+  console.log(`🚀 HOANG VIP ADAPTIVE v5 - FULL FIX`);
   console.log(`========================================`);
-  console.log(`Port: ${PORT}`);
-  console.log(`Polling: ${POLL_INTERVAL_MS}ms`);
-  console.log(`Max history: ${MAX_HISTORY}`);
-  console.log(`DB dir: ${DB_DIR}`);
-  console.log(`----------------------------------------`);
-  console.log(`🎯 FIX: Sum>=11 → Tài, Sum<=10 → Xỉu (từ 3 xúc xắc)`);
-  console.log(`🔗 NEW: /api/link/:game - Link dự đoán riêng`);
-  console.log(`🎨 UI đẹp hơn, responsive, có nút Copy link`);
+  console.log(`Port: ${PORT} | Polling: ${POLL_INTERVAL_MS}ms | Max: ${MAX_HISTORY}`);
+  console.log(`✅ FIX: Predict toàn Xỉu (bỏ debias shift)`);
+  console.log(`✅ FIX: Sum>=11 Tài, Sum<=10 Xỉu (từ 3 xúc xắc)`);
+  console.log(`✅ Blend 4 nguồn: 35% cal + 25% model + 20% pattern + 20% markov`);
+  console.log(`✅ Floor weight 15% mỗi signal`);
+  console.log(`✅ Check agreement 2/3`);
   console.log(`========================================`);
   startPolling();
 });
