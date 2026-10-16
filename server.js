@@ -1,20 +1,17 @@
 /**
  * ========================================================================
- * HOANG VIP ADAPTIVE v5 - FULL FIX ALL
+ * HOANG VIP ADAPTIVE v6 - FULL FIX
  * ========================================================================
- * ✅ FIX BUG "predict toàn Xỉu":
- *    - Bỏ debias shift (nguyên nhân chính gây collapse)
- *    - Blend 3 nguồn không cho 1 nguồn dominate
- *    - Floor weight 15% mỗi signal
- *    - Force balance khi p gần 0.5
- *    - Check agreement 3 nguồn
- *    - Anchor về avg signal khi lệch quá xa
- *    - Confidence floor (không predict khi quá 50/50)
- * ✅ FIX bug Sum=8 ghi Tài (luôn tính từ 3 xúc xắc)
- * ✅ Deterministic 100% (không Math.random)
- * ✅ Adam optimizer + Wilson + Hedge + Variable Markov
- * ✅ UI đẹp mobile, có nút copy link
- * ✅ /api/link/:game trả link dự đoán riêng
+ * ✅ FIX 2 BUG CHÍNH:
+ *    1. BẮT BỆT: streak override 3-4-5-6-7+ phiên
+ *    2. NHẬN DIỆN CẦU: 1-1, 2-2, 3-3, 1-2-1, 2-1-2
+ * ✅ Giữ nguyên fix v5:
+ *    - Bỏ debias shift (nguyên nhân collapse)
+ *    - Blend 4 nguồn cân bằng
+ *    - Floor weight 15%
+ *    - Sum>=11 Tài, Sum<=10 Xỉu
+ *    - Deterministic 100%
+ * ✅ UI đẹp + badge BỆT/CAU
  * ========================================================================
  */
 
@@ -69,15 +66,16 @@ const CONFIDENCE_THRESHOLD = 0.72;
 const ENTROPY_THRESHOLD = 0.68;
 const ENSEMBLE_ETA = 0.10;
 const WILSON_Z = 1.96;
+const MIN_CONFIDENCE = 0.03;
+const MIN_SIGNAL_WEIGHT = 0.15;
+const MAX_SIGNAL_WEIGHT = 0.55;
 
-// ✅ NEW: Ngưỡng confidence floor
-const MIN_CONFIDENCE = 0.03;         // Không predict nếu |p-0.5| < 3%
-const MIN_SIGNAL_WEIGHT = 0.15;      // Mỗi signal tối thiểu 15%
-const MAX_SIGNAL_WEIGHT = 0.55;      // Mỗi signal tối đa 55%
+// ✅ NEW: Bệt thresholds
+const STREAK_MIN = 3;
+const STREAK_BREAK = 10;
 
 // ============ HELPERS ============
 function now() { return new Date().toISOString(); }
-function safeNum(x, def = 0) { const n = Number(x); return Number.isFinite(n) ? n : def; }
 function safeInt(x, def = 0) { const n = parseInt(x, 10); return Number.isFinite(n) ? n : def; }
 
 function labelFromTX(code) {
@@ -134,7 +132,7 @@ function getCurrentTimeSlot(date = new Date()) {
   return 'Dem';
 }
 
-// ============ 🎯 FIX: LUÔN TÍNH TỪ 3 XÚC XẮC ============
+// ============ FIX: LUÔN TÍNH TỪ 3 XÚC XẮC ============
 function itemToDice(item) {
   if (!item) return [0, 0, 0];
   return [safeInt(item.FirstDice, 0), safeInt(item.SecondDice, 0), safeInt(item.ThirdDice, 0)];
@@ -149,10 +147,6 @@ function itemToSum(item) {
   return 0;
 }
 
-/**
- * ✅ FIX BUG: Sum >= 11 → Tài, Sum <= 10 → Xỉu
- * KHÔNG dùng BetSide từ API (có thể sai)
- */
 function itemToResult(item) {
   if (!item) return null;
   const sum = itemToSum(item);
@@ -176,7 +170,7 @@ function deterministicInitWeights(dim, seed = 'default') {
 // ============ DB ============
 function defaultDB() {
   return {
-    version: 5,
+    version: 6,
     createdAt: now(), updatedAt: now(),
     history: [],
     stats: { total: 0, wins: 0, losses: 0, currentStreak: 0, maxWinStreak: 0, maxLossStreak: 0 },
@@ -185,7 +179,7 @@ function defaultDB() {
       Toi: { total: 0, wins: 0 }, Dem: { total: 0, wins: 0 }
     },
     lastProcessedSession: null,
-    model: { weights: null, bias: 0, iter: 0, createdAt: now(), version: 1, bestAcc: 0, seed: 'hoang_vip_v5' },
+    model: { weights: null, bias: 0, iter: 0, createdAt: now(), version: 1, bestAcc: 0, seed: 'hoang_vip_v6' },
     calibration: { a: 1.0, b: 0.0, iter: 0 },
     optimizer: { m: null, v: null, t: 0 },
     ensembleRegret: { model: 0, pattern: 0, markov: 0 },
@@ -223,7 +217,7 @@ function migrateDB(db) {
   if (!Array.isArray(db.patterns.list)) db.patterns.list = [];
   if (!db.ensembleWeights) db.ensembleWeights = { model: 0.34, pattern: 0.33, markov: 0.33 };
   if (typeof db._strictUnbiased !== 'boolean') db._strictUnbiased = true;
-  if (!db.version) db.version = 5;
+  if (!db.version) db.version = 6;
   db.history = db.history.filter(h => h && typeof h === 'object' && h.phien !== undefined);
   return db;
 }
@@ -242,8 +236,7 @@ function saveDatabase(game, db) {
   safeAtomicWrite(BACKUP_FILES[game], db);
 }
 
-// ============ 🎯 FIX: BỎ DEBIAS CỨNG ============
-// Nguyên nhân chính gây bug "toàn Xỉu" - đã bỏ hoàn toàn
+// ============ DEBIAS (ĐÃ BỎ SHIFT) ============
 function getRecentMeanPred(db, windowSize = 200) {
   const hist = (db.history || []).slice(-windowSize);
   if (!hist.length) return 0.5;
@@ -258,23 +251,160 @@ function getRecentMeanPred(db, windowSize = 200) {
   return cnt ? (sum / cnt) : 0.5;
 }
 
-function debiasProbability(db, p, windowSize = 200) {
-  // ✅ FIX: KHÔNG shift logit. Chỉ pass-through
-  const pc = clamp(p, 1e-6, 1 - 1e-6);
-  return pc;
+function debiasProbability(db, p) {
+  return clamp(p, 1e-6, 1 - 1e-6);
 }
 
-// ============ ✅ FIX: FORCE BALANCE ============
 function forceBalance(db, p) {
   const pc = clamp(p, 1e-6, 1 - 1e-6);
-  // Nếu |p - 0.5| < 0.02 → kéo về 0.5 để không predict khi quá gần
   if (Math.abs(pc - 0.5) < 0.02) return 0.5;
-  // Nếu |p - 0.5| < 0.05 → amplify nhẹ để có tín hiệu rõ
   if (Math.abs(pc - 0.5) < 0.05) {
     const sign = pc >= 0.5 ? 1 : -1;
     return clamp(0.5 + sign * (Math.abs(pc - 0.5) * 1.3));
   }
   return pc;
+}
+
+// ============ ✅ NEW #1: BẮT BỆT (STREAK) ============
+function detectStreak(seq) {
+  if (!seq || seq.length < 2) return { type: 'none', length: 0 };
+  const last = seq[seq.length - 1];
+  let len = 1;
+  for (let i = seq.length - 2; i >= 0; i--) {
+    if (seq[i] === last) len++; else break;
+  }
+  return { type: last, length: len };
+}
+
+function applyStreakOverride(db, finalP, seq) {
+  const streak = detectStreak(seq);
+  if (streak.length < STREAK_MIN) {
+    return { p: finalP, applied: false, streak, reason: 'none' };
+  }
+
+  const isTai = streak.type === 'T';
+
+  // Bệt 3-4: override 60%
+  if (streak.length <= 4) {
+    const target = isTai ? 0.62 : 0.38;
+    return { p: clamp(0.6 * target + 0.4 * finalP), applied: true, streak, reason: `bệt${streak.length}` };
+  }
+
+  // Bệt 5-6: override 75%
+  if (streak.length <= 6) {
+    const target = isTai ? 0.68 : 0.32;
+    return { p: clamp(0.75 * target + 0.25 * finalP), applied: true, streak, reason: `bệt${streak.length}` };
+  }
+
+  // Bệt 7-9: override 85%
+  if (streak.length <= 9) {
+    const target = isTai ? 0.72 : 0.28;
+    return { p: clamp(0.85 * target + 0.15 * finalP), applied: true, streak, reason: `bệt${streak.length}` };
+  }
+
+  // Bệt 10+: nghiêng gãy (vì bệt dài dễ gãy)
+  const breakTarget = isTai ? 0.45 : 0.55;
+  return { p: clamp(0.55 * breakTarget + 0.45 * finalP), applied: true, streak, reason: `bệt${streak.length}_gãy` };
+}
+
+// ============ ✅ NEW #2: NHẬN DIỆN CẦU ============
+function detectPattern(seq) {
+  if (!seq || seq.length < 6) return { type: 'none', confidence: 0, next: null, length: 0 };
+
+  const n = seq.length;
+
+  // === Cầu 1-1: T-X-T-X-T-X (đảo liên tục) ===
+  {
+    const recent = seq.slice(-12);
+    let match11 = 0;
+    for (let i = recent.length - 1; i >= 1; i--) {
+      if (recent[i] !== recent[i - 1]) match11++;
+      else break;
+    }
+    if (match11 >= 5) {
+      const next = recent[recent.length - 1] === 'T' ? 'X' : 'T';
+      return {
+        type: 'cau_1_1', next,
+        confidence: Math.min(0.60 + match11 * 0.04, 0.85),
+        length: match11
+      };
+    }
+  }
+
+  // === Cầu 2-2: TT-XX-TT-XX ===
+  if (n >= 8) {
+    const p8 = seq.slice(-8).join('');
+    if (p8 === 'TTXXTTXX') return { type: 'cau_2_2', next: 'T', confidence: 0.75, length: 8 };
+    if (p8 === 'XXTTXXTT') return { type: 'cau_2_2', next: 'X', confidence: 0.75, length: 8 };
+    if (p8 === 'TTXXTTXX') return { type: 'cau_2_2', next: 'T', confidence: 0.75, length: 8 };
+  }
+  if (n >= 6) {
+    const p6 = seq.slice(-6).join('');
+    if (p6 === 'TTXXTT') return { type: 'cau_2_2', next: 'X', confidence: 0.68, length: 6 };
+    if (p6 === 'XXTTXX') return { type: 'cau_2_2', next: 'T', confidence: 0.68, length: 6 };
+    if (p6 === 'TTXXTT') return { type: 'cau_2_2', next: 'X', confidence: 0.68, length: 6 };
+  }
+
+  // === Cầu 3-3: TTT-XXX-TTT ===
+  if (n >= 6) {
+    const p6 = seq.slice(-6).join('');
+    if (p6 === 'TTTXXX') return { type: 'cau_3_3', next: 'T', confidence: 0.72, length: 6 };
+    if (p6 === 'XXXTTT') return { type: 'cau_3_3', next: 'X', confidence: 0.72, length: 6 };
+  }
+  if (n >= 9) {
+    const p9 = seq.slice(-9).join('');
+    if (p9 === 'TTTXXXTTT') return { type: 'cau_3_3', next: 'X', confidence: 0.78, length: 9 };
+    if (p9 === 'XXXTTTXXX') return { type: 'cau_3_3', next: 'T', confidence: 0.78, length: 9 };
+  }
+
+  // === Cầu 1-2-1: T-XX-T-XX-T ===
+  if (n >= 5) {
+    const p5 = seq.slice(-5).join('');
+    if (p5 === 'TXXTX') return { type: 'cau_1_2_1', next: 'X', confidence: 0.62, length: 5 };
+    if (p5 === 'XTTXT') return { type: 'cau_1_2_1', next: 'T', confidence: 0.62, length: 5 };
+  }
+  if (n >= 8) {
+    const p8 = seq.slice(-8).join('');
+    if (p8 === 'TXXTXXTX') return { type: 'cau_1_2_1', next: 'T', confidence: 0.70, length: 8 };
+    if (p8 === 'XTTXTTXT') return { type: 'cau_1_2_1', next: 'X', confidence: 0.70, length: 8 };
+  }
+
+  // === Cầu 2-1-2: TT-X-TT-X ===
+  if (n >= 6) {
+    const p6 = seq.slice(-6).join('');
+    if (p6 === 'TTXTTX') return { type: 'cau_2_1_2', next: 'T', confidence: 0.65, length: 6 };
+    if (p6 === 'XXTXXT') return { type: 'cau_2_1_2', next: 'X', confidence: 0.65, length: 6 };
+  }
+
+  // === Cầu 1-3-1 ===
+  if (n >= 5) {
+    const p5 = seq.slice(-5).join('');
+    if (p5 === 'TXXXT') return { type: 'cau_1_3_1', next: 'X', confidence: 0.60, length: 5 };
+    if (p5 === 'XTTTX') return { type: 'cau_1_3_1', next: 'T', confidence: 0.60, length: 5 };
+  }
+
+  // === Cầu 4-4 ===
+  if (n >= 8) {
+    const p8 = seq.slice(-8).join('');
+    if (p8 === 'TTTTXXXX') return { type: 'cau_4_4', next: 'T', confidence: 0.70, length: 8 };
+    if (p8 === 'XXXXTTTT') return { type: 'cau_4_4', next: 'X', confidence: 0.70, length: 8 };
+  }
+
+  return { type: 'none', confidence: 0, next: null, length: 0 };
+}
+
+function applyCauDetection(db, finalP, seq) {
+  const cau = detectPattern(seq);
+  if (cau.type === 'none' || !cau.next) {
+    return { p: finalP, applied: false, cau };
+  }
+
+  const target = cau.next === 'T'
+    ? (0.5 + cau.confidence * 0.4)
+    : (0.5 - cau.confidence * 0.4);
+  const blendWeight = Math.min(cau.confidence * 0.75, 0.65);
+  const newP = clamp(blendWeight * target + (1 - blendWeight) * finalP);
+  return { p: newP, applied: true, cau, reason: cau.type };
 }
 
 // ============ PATTERN MINING ============
@@ -543,18 +673,14 @@ function adamUpdateModel(db, x, labelT) {
   if (!Array.isArray(opt.m) || opt.m.length !== x.length) opt.m = new Array(x.length).fill(0);
   if (!Array.isArray(opt.v) || opt.v.length !== x.length) opt.v = new Array(x.length).fill(0);
   opt.t = (opt.t || 0) + 1;
-
   const z = predictLogit(db, x);
   const pred = sigmoid(z);
   const err = labelT - pred;
-
   const grad = new Array(x.length);
   for (let i = 0; i < x.length; i++) grad[i] = err * (x[i] || 0) - LR_REGULARIZATION * (db.model.weights[i] || 0);
   clipGradients(grad, GRAD_CLIP);
-
   const b1 = 1 - Math.pow(ADAM_BETA1, opt.t);
   const b2 = 1 - Math.pow(ADAM_BETA2, opt.t);
-
   for (let i = 0; i < x.length; i++) {
     opt.m[i] = ADAM_BETA1 * opt.m[i] + (1 - ADAM_BETA1) * grad[i];
     opt.v[i] = ADAM_BETA2 * opt.v[i] + (1 - ADAM_BETA2) * grad[i] * grad[i];
@@ -564,7 +690,6 @@ function adamUpdateModel(db, x, labelT) {
   const biasStep = LR_LEARNING_RATE * err / Math.sqrt(opt.t + 1);
   if (Number.isFinite(biasStep)) db.model.bias += biasStep;
   db.model.iter = (db.model.iter || 0) + 1;
-
   const loss = -(labelT * Math.log(pred + 1e-12) + (1 - labelT) * Math.log(1 - pred + 1e-12));
   return { pred, err, loss: Number.isFinite(loss) ? loss : 0, lr: LR_LEARNING_RATE };
 }
@@ -593,11 +718,9 @@ function calibrationUpdate(db, logit, labelT) {
   return { pred, err };
 }
 
-// ============ 🎯 FIX: ENSEMBLE VỚI FLOOR WEIGHT ============
+// ============ ENSEMBLE ============
 function combineSignals(db, pm, pp, pk) {
   let w = db.ensembleWeights || { model: 0.34, pattern: 0.33, markov: 0.33 };
-
-  // ✅ FIX: Floor 15% và cap 55% mỗi nguồn
   w = {
     model: Math.max(MIN_SIGNAL_WEIGHT, Math.min(MAX_SIGNAL_WEIGHT, w.model || 0.34)),
     pattern: Math.max(MIN_SIGNAL_WEIGHT, Math.min(MAX_SIGNAL_WEIGHT, w.pattern || 0.33)),
@@ -605,7 +728,6 @@ function combineSignals(db, pm, pp, pk) {
   };
   const s = w.model + w.pattern + w.markov;
   w.model /= s; w.pattern /= s; w.markov /= s;
-
   const raw = w.model * pm + w.pattern * pp + w.markov * pk;
   return { p: clamp(raw), weights: w };
 }
@@ -614,7 +736,6 @@ function updateEnsembleWeights(db, losses, eta = ENSEMBLE_ETA) {
   const keys = ['model', 'pattern', 'markov'];
   const w = db.ensembleWeights || { model: 0.34, pattern: 0.33, markov: 0.33 };
   db.ensembleRegret = db.ensembleRegret || { model: 0, pattern: 0, markov: 0 };
-
   let total = 0;
   for (const k of keys) {
     const li = Math.max(0, Math.min(1, losses[k] || 0.5));
@@ -626,17 +747,14 @@ function updateEnsembleWeights(db, losses, eta = ENSEMBLE_ETA) {
   }
   if (total <= 0) { w.model = 0.34; w.pattern = 0.33; w.markov = 0.33; }
   else for (const k of keys) w[k] /= total;
-
-  // ✅ FIX: Floor 15%
   for (const k of keys) w[k] = Math.max(MIN_SIGNAL_WEIGHT, w[k]);
   const s = w.model + w.pattern + w.markov;
   for (const k of keys) w[k] /= s;
-
   db.ensembleWeights = w;
   return w;
 }
 
-// ============ 🎯 FIX: GATING CHẶT HƠN ============
+// ============ GATING ============
 function adaptiveThresholds(db) {
   const recent = (db.history || []).filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI').slice(-50);
   if (recent.length < 20) return { confThresh: CONFIDENCE_THRESHOLD, entThresh: ENTROPY_THRESHOLD };
@@ -654,21 +772,14 @@ function gatingDecision(db, cp, ent, comps) {
   if ((comps.modelProb >= 0.5 ? 'T' : 'X') === final) agree++;
   if ((comps.patternProb >= 0.5 ? 'T' : 'X') === final) agree++;
   if ((comps.markovProb >= 0.5 ? 'T' : 'X') === final) agree++;
-
-  // ✅ FIX: Cần ít nhất 2/3 đồng ý
   if (agree < 2) return { pass: false, reason: 'low_agreement', agree, confThresh, entThresh };
-
-  // ✅ FIX: Nếu quá gần 0.5 → không tự tin
-  if (Math.abs(cp - 0.5) < MIN_CONFIDENCE) {
-    return { pass: false, reason: 'too_close_50_50', agree, confThresh, entThresh };
-  }
-
+  if (Math.abs(cp - 0.5) < MIN_CONFIDENCE) return { pass: false, reason: 'too_close_50_50', agree, confThresh, entThresh };
   if (cp < confThresh) return { pass: false, reason: 'low_confidence', agree, confThresh, entThresh };
   if (ent > entThresh) return { pass: false, reason: 'high_entropy', agree, confThresh, entThresh };
   return { pass: true, reason: 'ok', agree, confThresh, entThresh };
 }
 
-// ============ BIAS DETECTION ============
+// ============ BIAS ============
 function detectAndCorrectBias(db, game) {
   try {
     const recent = (db.history || []).slice(-60);
@@ -732,7 +843,7 @@ async function fetchWithRetry(url, attempts = FETCH_RETRIES) {
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
     try {
-      return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVipAdaptive/5.0' } });
+      return await axios.get(url, { timeout: API_TIMEOUT_MS, headers: { 'User-Agent': 'HoangVipAdaptive/6.0' } });
     } catch (e) {
       lastErr = e;
       if (i < attempts - 1) await new Promise(r => setTimeout(r, 200 + i * 200));
@@ -749,7 +860,7 @@ function parseHistoryResponse(data) {
   return [];
 }
 
-// ============ 🎯 FIX: RUN PREDICTION ============
+// ============ ✅ FULL FIX v6: RUN PREDICTION ============
 function runPrediction(db, seq, game = 'default') {
   if (!Array.isArray(seq) || seq.length === 0) {
     return {
@@ -758,7 +869,9 @@ function runPrediction(db, seq, game = 'default') {
       gate: { pass: false, reason: 'no_data' },
       comps: { modelProb: 0.5, patternProb: 0.5, markovProb: 0.5 },
       predCode: 'T', predLabel: 'Tài', tiLe: '50.0% (LOW)',
-      mergedPatterns: [], fvMeta: { topPatterns: [] }
+      mergedPatterns: [], fvMeta: { topPatterns: [] },
+      streak: { type: 'none', length: 0 }, streakApplied: false,
+      cau: { type: 'none', confidence: 0, next: null }, cauApplied: false
     };
   }
 
@@ -780,7 +893,7 @@ function runPrediction(db, seq, game = 'default') {
   const combined = combineSignals(db, pModel, pPattern, pMarkov);
   const calibrated = calibrate(db, logit);
 
-  // ✅ FIX: Blend 4 nguồn cân bằng hơn
+  // ===== BASE BLEND =====
   let finalP = clamp(
     0.35 * calibrated +
     0.25 * pModel +
@@ -788,29 +901,60 @@ function runPrediction(db, seq, game = 'default') {
     0.20 * pMarkov
   );
 
-  // ✅ FIX: Bỏ debias shift
-  finalP = debiasProbability(db, finalP, 200);
+  finalP = debiasProbability(db, finalP);
 
-  // ✅ FIX: Force balance
+  // ===== ✅ NEW: STREAK OVERRIDE =====
+  const streakResult = applyStreakOverride(db, finalP, seq);
+  if (streakResult.applied) finalP = streakResult.p;
+
+  // ===== ✅ NEW: CẦU DETECTION =====
+  const cauResult = applyCauDetection(db, finalP, seq);
+  if (cauResult.applied) finalP = cauResult.p;
+
+  // ===== FORCE BALANCE =====
   finalP = forceBalance(db, finalP);
 
-  // ✅ FIX: Anchor về avg nếu lệch quá xa
+  // ===== ANCHOR =====
   const avgSignal = (pModel + pPattern + pMarkov) / 3;
-  if (Math.abs(finalP - avgSignal) > 0.15) {
-    finalP = clamp(0.6 * finalP + 0.4 * avgSignal);
+  if (!streakResult.applied && !cauResult.applied) {
+    if (Math.abs(finalP - avgSignal) > 0.15) {
+      finalP = clamp(0.6 * finalP + 0.4 * avgSignal);
+    }
   }
 
   const entropy = entropyFromProb(finalP);
   const comps = { modelProb: pModel, patternProb: pPattern, markovProb: pMarkov };
-  const gate = gatingDecision(db, finalP, entropy, comps);
+
+  // ===== GATING + BYPASS =====
+  let gate = gatingDecision(db, finalP, entropy, comps);
+
+  // Bypass gating nếu bệt >= 5
+  if (streakResult.applied && streakResult.streak.length >= 5 && !streakResult.reason.includes('gãy')) {
+    gate = { pass: true, reason: `streak_${streakResult.streak.length}`, agree: 3, confThresh: 0, entThresh: 0 };
+  }
+  // Bypass gating nếu cầu confidence >= 0.68
+  else if (cauResult.applied && cauResult.cau.confidence >= 0.68) {
+    gate = { pass: true, reason: `cau_${cauResult.cau.type}`, agree: 3, confThresh: 0, entThresh: 0 };
+  }
+
   const predCode = finalP >= 0.5 ? 'T' : 'X';
   const predLabel = labelFromTX(predCode);
-  const tiLe = (Math.max(finalP, 1 - finalP) * 100).toFixed(1) + '%' + (gate.pass ? '' : ' (LOW)');
+
+  // Build tỉ lệ label
+  let tiLeLabel = (Math.max(finalP, 1 - finalP) * 100).toFixed(1) + '%';
+  if (streakResult.applied) tiLeLabel += ` [BỆT${streakResult.streak.length}]`;
+  else if (cauResult.applied) tiLeLabel += ` [${cauResult.cau.type.toUpperCase()}]`;
+  else if (!gate.pass) tiLeLabel += ' (LOW)';
 
   return {
     featureVector: x, logit, calibrated, combined: finalP,
     pModel, pPattern, pMarkov, entropy, gate, comps,
-    predCode, predLabel, tiLe, mergedPatterns: merged, fvMeta: fvInfo.meta
+    predCode, predLabel, tiLe: tiLeLabel,
+    mergedPatterns: merged, fvMeta: fvInfo.meta,
+    streak: streakResult.streak,
+    streakApplied: streakResult.applied,
+    cau: cauResult.cau,
+    cauApplied: cauResult.applied
   };
 }
 
@@ -899,6 +1043,8 @@ async function processGameTick(game) {
       mauCau: (pred.fvMeta && pred.fvMeta.topPatterns) ? pred.fvMeta.topPatterns.map(p => p.pattern).slice(0, 6).join('; ') : 'Auto',
       trangThai: 'ĐANG CHỜ',
       thoiGian: now(),
+      streak: pred.streak,
+      cau: pred.cau,
       meta: {
         featureVector: pred.featureVector, logit: pred.logit,
         calibratedProb: Number(pred.calibrated.toFixed(4)),
@@ -907,7 +1053,8 @@ async function processGameTick(game) {
         patternProb: Number(pred.pPattern.toFixed(4)),
         markovProb: Number(pred.pMarkov.toFixed(4)),
         entropy: Number(pred.entropy.toFixed(6)),
-        components: pred.comps, gate: pred.gate, createdAt: now()
+        components: pred.comps, gate: pred.gate, createdAt: now(),
+        streak: pred.streak, cau: pred.cau
       }
     };
 
@@ -919,7 +1066,8 @@ async function processGameTick(game) {
     maybeCheckpoint(db, game);
     saveDatabase(game, db);
 
-    console.log(`[TICK] ${game} #${currentSession} dice=[${newEntry.xucXac.join(',')}] sum=${newEntry.tong} kq=${newEntry.ketQuaLabel} → predict=${pred.predLabel} (${pred.tiLe})`);
+    const extra = pred.streakApplied ? ` [BỆT${pred.streak.length}]` : (pred.cauApplied ? ` [${pred.cau.type}]` : '');
+    console.log(`[TICK] ${game} #${currentSession} dice=[${newEntry.xucXac.join(',')}] sum=${newEntry.tong} kq=${newEntry.ketQuaLabel} → ${pred.predLabel} (${pred.tiLe})${extra}`);
   } catch (e) {
     console.error(`[TICK ERR] ${game}`, e && e.message ? e.message : e);
   }
@@ -951,7 +1099,9 @@ function formatHistoryItem(it) {
     tiLe: it.TI_LE || null,
     mauCau: it.mauCau || null,
     trangThai: it.trangThai || null,
-    thoiGian: it.thoiGian || (it.meta && it.meta.createdAt) || null
+    thoiGian: it.thoiGian || (it.meta && it.meta.createdAt) || null,
+    streak: it.streak || null,
+    cau: it.cau || null
   };
 }
 
@@ -980,6 +1130,10 @@ app.get('/api/predict/:game', async (req, res) => {
       duDoan: pred.predLabel,
       duDoanCode: pred.predCode,
       tiLe: pred.tiLe,
+      streak: pred.streak,
+      streakApplied: pred.streakApplied,
+      cau: pred.cau,
+      cauApplied: pred.cauApplied,
       chiTiet: {
         finalProb: Number(pred.combined.toFixed(4)),
         calibrated: Number(pred.calibrated.toFixed(4)),
@@ -1023,6 +1177,8 @@ app.get('/api/link/:game', async (req, res) => {
       tiLe: pred.tiLe,
       doTinCay: pred.gate.pass ? 'CAO' : 'THẤP',
       lyDo: pred.gate.reason,
+      streak: pred.streak,
+      cau: pred.cau,
       thoiGian: now(),
       links: {
         ui: `${baseUrl}/${game}`,
@@ -1127,11 +1283,12 @@ app.get('/api/export/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).send('Bàn chơi không hợp lệ.');
   const db = loadDatabase(game);
-  let csv = 'Phiên,XúcXắc,Tổng,KếtQuả,PhiênDựĐoán,DựĐoán,TỉLệ,MẫuCầu,TrạngThái,ThờiGian\n';
+  let csv = 'Phiên,XúcXắc,Tổng,KếtQuả,PhiênDựĐoán,DựĐoán,TỉLệ,MẫuCầu,Bệt,TrạngThái,ThờiGian\n';
   db.history.forEach(item => {
     const dice = (item.xucXac || []).join('-');
     const mc = (item.mauCau || '').replace(/"/g, '\'');
-    csv += `${item.phien},"${dice}",${item.tong || ''},${item.ketQuaLabel || ''},${item.phienDuDoan},${item.DU_DOAN || ''},${item.TI_LE || ''},"${mc}",${item.trangThai || ''},${item.thoiGian || ''}\n`;
+    const streak = item.streak && item.streak.length > 0 ? `${item.streak.type}${item.streak.length}` : '';
+    csv += `${item.phien},"${dice}",${item.tong || ''},${item.ketQuaLabel || ''},${item.phienDuDoan},${item.DU_DOAN || ''},${item.TI_LE || ''},"${mc}",${streak},${item.trangThai || ''},${item.thoiGian || ''}\n`;
   });
   res.header('Content-Type', 'text/csv; charset=utf-8');
   res.attachment(`lich_su_${game}.csv`);
@@ -1171,12 +1328,13 @@ app.get('/admin/metrics/:game', (req, res) => {
   const tail = (db.history || []).filter(h => h.trangThai === 'ĐÚNG' || h.trangThai === 'SAI').slice(-200);
   const acc = tail.length ? (tail.filter(h => h.trangThai === 'ĐÚNG').length / tail.length) : 0;
 
-  // Count predictions Tài vs Xỉu trong 50 phiên gần nhất
   const recent = (db.history || []).slice(-50);
-  let cntT = 0, cntX = 0;
+  let cntT = 0, cntX = 0, cntStreak = 0, cntCau = 0;
   for (const h of recent) {
     if (h.DU_DOAN_CODE === 'T') cntT++;
     else if (h.DU_DOAN_CODE === 'X') cntX++;
+    if (h.TI_LE && h.TI_LE.includes('BỆT')) cntStreak++;
+    if (h.TI_LE && h.TI_LE.includes('CAU_')) cntCau++;
   }
 
   return res.json({
@@ -1186,6 +1344,7 @@ app.get('/admin/metrics/:game', (req, res) => {
     totalEvaluations: db.stats.total,
     globalAccuracy: db.stats.total ? Number((db.stats.wins / db.stats.total).toFixed(4)) : 0,
     distribution: { tai: cntT, xiu: cntX, ratio: cntT + cntX > 0 ? `${cntT}/${cntX}` : 'N/A' },
+    recentDetections: { streakCount: cntStreak, cauCount: cntCau },
     ensembleWeights: db.ensembleWeights,
     ensembleRegret: db.ensembleRegret,
     biasCorrections: db.biasCorrections ? db.biasCorrections.length : 0,
@@ -1200,7 +1359,8 @@ app.get('/admin/config', (req, res) => {
     MARKOV_MAX_ORDER, PATTERN_TOP_N,
     CONFIDENCE_THRESHOLD, ENTROPY_THRESHOLD,
     MIN_CONFIDENCE, MIN_SIGNAL_WEIGHT, MAX_SIGNAL_WEIGHT,
-    DETERMINISTIC: true, VERSION: 5
+    STREAK_MIN, STREAK_BREAK,
+    DETERMINISTIC: true, VERSION: 6
   });
 });
 
@@ -1219,7 +1379,7 @@ app.get('/:game', (req, res) => {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>HOANG VIP v5 - ${game.toUpperCase()}</title>
+<title>HOANG VIP v6 - ${game.toUpperCase()}</title>
 <style>
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   body{
@@ -1240,7 +1400,7 @@ app.get('/:game', (req, res) => {
     animation:shine 3s infinite linear;
   }
   @keyframes shine{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
-  h1{color:#fff;font-size:17px;margin:0;font-weight:700;letter-spacing:0.5px;position:relative;z-index:1}
+  h1{color:#fff;font-size:17px;margin:0;font-weight:700;position:relative;z-index:1}
   .subtitle{color:#bfdbfe;font-size:11px;margin-top:4px;position:relative;z-index:1}
 
   .stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px}
@@ -1305,6 +1465,18 @@ app.get('/:game', (req, res) => {
     background:#7c2d12;color:#fdba74;
     padding:1px 4px;border-radius:3px;margin-left:2px;
   }
+  .streak-badge{
+    display:inline-block;font-size:8px;
+    background:#7c2d12;color:#fdba74;
+    padding:1px 4px;border-radius:3px;margin-left:2px;
+    font-weight:700;
+  }
+  .cau-badge{
+    display:inline-block;font-size:8px;
+    background:#1e40af;color:#93c5fd;
+    padding:1px 4px;border-radius:3px;margin-left:2px;
+    font-weight:700;
+  }
   .mau{font-size:9px;color:#64748b;max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .footer{text-align:center;margin-top:14px;font-size:10px;color:#475569}
 </style>
@@ -1323,8 +1495,8 @@ app.get('/:game', (req, res) => {
 </head>
 <body>
   <div class="header">
-    <h1>🎯 HOANG VIP ADAPTIVE v5</h1>
-    <div class="subtitle">Bàn: ${game.toUpperCase()} • Deterministic Model</div>
+    <h1>🎯 HOANG VIP ADAPTIVE v6</h1>
+    <div class="subtitle">Bàn: ${game.toUpperCase()} • Bắt bệt + Nhận diện cầu</div>
   </div>
 
   <div class="stats-grid">
@@ -1337,7 +1509,7 @@ app.get('/:game', (req, res) => {
   </div>
 
   <div class="link-box">
-    <div class="title">🔗 Link dự đoán</div>
+    <div class="title">🔗 Link</div>
     <div class="link-row">
       <span>${baseUrl}/${game}</span>
       <button class="copy-btn" onclick="copyText('${baseUrl}/${game}', this)">Copy</button>
@@ -1345,10 +1517,6 @@ app.get('/:game', (req, res) => {
     <div class="link-row">
       <span>${baseUrl}/api/link/${game}</span>
       <button class="copy-btn" onclick="copyText('${baseUrl}/api/link/${game}', this)">Copy</button>
-    </div>
-    <div class="link-row">
-      <span>${baseUrl}/api/predict/${game}</span>
-      <button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}', this)">Copy</button>
     </div>
     <div class="link-row">
       <span>${baseUrl}/api/history/all</span>
@@ -1360,7 +1528,7 @@ app.get('/:game', (req, res) => {
     <table>
       <thead>
         <tr>
-          <th>Phiên</th><th>Xúc xắc</th><th>Tổng</th><th>KQ</th>
+          <th>Phiên</th><th>XX</th><th>Tổng</th><th>KQ</th>
           <th>Phiên DĐ</th><th>Dự đoán</th><th>Tỉ lệ</th><th>Mẫu</th><th>TT</th>
         </tr>
       </thead>
@@ -1371,8 +1539,11 @@ app.get('/:game', (req, res) => {
           const kqCls = it.ketQua === 'T' ? 'tai' : (it.ketQua === 'X' ? 'xiu' : '');
           const ddCls = it.DU_DOAN_CODE === 'T' ? 'tai' : 'xiu';
           const ttCls = it.trangThai === 'ĐÚNG' ? 'dung' : (it.trangThai === 'SAI' ? 'sai' : 'cho');
-          const tiLe = (it.TI_LE || '').replace(' (LOW)', '');
-          const isLow = (it.TI_LE || '').includes('LOW');
+          const tiLeRaw = it.TI_LE || '';
+          const tiLeNum = tiLeRaw.replace(/\s*\[.*?\]|\s*\(LOW\)/g, '');
+          const streakMatch = tiLeRaw.match(/\[BỆT(\d+)\]/);
+          const cauMatch = tiLeRaw.match(/\[(CAU_\d+_\d+)\]/);
+          const isLow = tiLeRaw.includes('LOW');
           return `<tr>
             <td class="session">${it.phien}</td>
             <td class="dice">${dice}</td>
@@ -1380,7 +1551,12 @@ app.get('/:game', (req, res) => {
             <td class="${kqCls}">${kq}</td>
             <td class="session">${it.phienDuDoan}</td>
             <td class="${ddCls}">${it.DU_DOAN || ''}</td>
-            <td class="ti-le">${tiLe}${isLow ? '<span class="low-badge">LOW</span>' : ''}</td>
+            <td class="ti-le">
+              ${tiLeNum}
+              ${streakMatch ? `<span class="streak-badge">BỆT${streakMatch[1]}</span>` : ''}
+              ${cauMatch ? `<span class="cau-badge">${cauMatch[1]}</span>` : ''}
+              ${isLow && !streakMatch && !cauMatch ? '<span class="low-badge">LOW</span>' : ''}
+            </td>
             <td class="mau">${it.mauCau || ''}</td>
             <td class="${ttCls}">${it.trangThai === 'ĐANG CHỜ' ? '...' : it.trangThai}</td>
           </tr>`;
@@ -1389,7 +1565,7 @@ app.get('/:game', (req, res) => {
     </table>
   </div>
 
-  <div class="footer">Auto refresh 12s • HOANG VIP v5</div>
+  <div class="footer">Auto refresh 12s • HOANG VIP v6 • Bắt bệt + Cầu</div>
 </body>
 </html>`;
   res.send(html);
@@ -1398,14 +1574,13 @@ app.get('/:game', (req, res) => {
 // ============ SERVER ============
 const server = app.listen(PORT, () => {
   console.log(`========================================`);
-  console.log(`🚀 HOANG VIP ADAPTIVE v5 - FULL FIX`);
+  console.log(`🚀 HOANG VIP ADAPTIVE v6 - BẮT BỆT + CẦU`);
   console.log(`========================================`);
-  console.log(`Port: ${PORT} | Polling: ${POLL_INTERVAL_MS}ms | Max: ${MAX_HISTORY}`);
-  console.log(`✅ FIX: Predict toàn Xỉu (bỏ debias shift)`);
-  console.log(`✅ FIX: Sum>=11 Tài, Sum<=10 Xỉu (từ 3 xúc xắc)`);
-  console.log(`✅ Blend 4 nguồn: 35% cal + 25% model + 20% pattern + 20% markov`);
-  console.log(`✅ Floor weight 15% mỗi signal`);
-  console.log(`✅ Check agreement 2/3`);
+  console.log(`Port: ${PORT} | Polling: ${POLL_INTERVAL_MS}ms`);
+  console.log(`✅ BẮT BỆT: 3-4 (60%) | 5-6 (75%) | 7-9 (85%) | 10+ (gãy)`);
+  console.log(`✅ NHẬN CẦU: 1-1 | 2-2 | 3-3 | 1-2-1 | 2-1-2 | 1-3-1 | 4-4`);
+  console.log(`✅ Bypass gating khi bệt>=5 hoặc cầu>=0.68`);
+  console.log(`✅ UI có badge BỆT/CAU`);
   console.log(`========================================`);
   startPolling();
 });
