@@ -1,172 +1,236 @@
 /**
  * ========================================================================
- * HOANG VIP WIN - SIÊU HỆ THỐNG DỰ ĐOÁN (BẢN FULL CỰC DÀI)
+ * HOANG VIP WIN - ULTIMATE PRO ENGINE (BẢN FULL - KHÔNG CẮT BỚT)
  * ========================================================================
- * Tích hợp 18 modules nhận diện cầu, chấm điểm chéo, lọc nhiễu.
- * Code chạy 100% Server-Side. UI không lộ bất kỳ logic nào.
+ * Hệ thống tự động hóa phân tích chuỗi Tài Xỉu.
+ * Thuật toán cốt lõi chạy 100% dưới Server-side, hoàn toàn bảo mật.
  * ========================================================================
  */
 
 'use strict';
 
+// ========================================================================
+// 1. KHAI BÁO THƯ VIỆN VÀ BIẾN TOÀN CỤC
+// ========================================================================
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// ============ CONFIG ============
+// Cấu hình hệ thống
 const PORT = Number(process.env.PORT || 3000);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
 const MAX_HISTORY = Number(process.env.MAX_HISTORY || 500);
-const API_TIMEOUT_MS = 10000;
+const API_TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 10000);
+const FETCH_RETRIES = 3;
 
+// Cấu hình đường dẫn API gốc
 const APIS = {
   md5: process.env.API_MD5 || 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau',
   taixiu: process.env.API_TAIXIU || 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau'
 };
 
+// Cấu hình thư mục lưu trữ (Database)
 const DB_DIR = process.env.DB_DIR || __dirname;
-if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+if (!fs.existsSync(DB_DIR)) {
+  try { fs.mkdirSync(DB_DIR, { recursive: true }); } catch (e) { console.error('Lỗi tạo thư mục DB:', e); }
+}
 
 const DB_FILES = {
   md5: path.join(DB_DIR, 'db_md5.json'),
   taixiu: path.join(DB_DIR, 'db_taixiu.json')
 };
 
-// ============ HELPERS ============
+// ========================================================================
+// 2. CÁC HÀM TIỆN ÍCH (HELPER FUNCTIONS)
+// ========================================================================
 const now = () => new Date().toISOString();
-const safeInt = (x, def = 0) => { const n = parseInt(x, 10); return Number.isFinite(n) ? n : def; };
-const labelFromTX = c => c === 'T' ? 'Tài' : (c === 'X' ? 'Xỉu' : null);
-const flip = c => c === 'T' ? 'X' : (c === 'X' ? 'T' : null);
+const safeInt = (x, def = 0) => {
+  const n = parseInt(x, 10);
+  return Number.isFinite(n) ? n : def;
+};
 
-function safeReadJson(fp, fb = null) {
+const labelFromTX = (c) => {
+  if (c === 'T') return 'Tài';
+  if (c === 'X') return 'Xỉu';
+  return null;
+};
+
+const flip = (c) => {
+  if (c === 'T') return 'X';
+  if (c === 'X') return 'T';
+  return null;
+};
+
+// Đọc file JSON an toàn (chống lỗi crash)
+function safeReadJson(filePath, fallback = null) {
   try {
-    if (!fs.existsSync(fp)) return fb;
-    const raw = fs.readFileSync(fp, 'utf8');
-    if (!raw || !raw.trim()) return fb;
+    if (!fs.existsSync(filePath)) return fallback;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw || !raw.trim()) return fallback;
     return JSON.parse(raw);
-  } catch { return fb; }
-}
-function safeAtomicWrite(fp, data) {
-  try {
-    const tmp = fp + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-    fs.renameSync(tmp, fp);
-    return true;
-  } catch { return false; }
+  } catch (error) {
+    console.error(`[safeReadJson] Lỗi đọc file ${filePath}:`, error.message);
+    return fallback;
+  }
 }
 
-// ============ DICE → RESULT ============
+// Ghi file JSON an toàn (tránh mất dữ liệu khi ghi đè)
+function safeAtomicWrite(filePath, data) {
+  try {
+    const tmpPath = filePath + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tmpPath, filePath);
+    return true;
+  } catch (error) {
+    console.error(`[safeAtomicWrite] Lỗi ghi file ${filePath}:`, error.message);
+    return false;
+  }
+}
+
+// ========================================================================
+// 3. XỬ LÝ DỮ LIỆU XÚC XẮC
+// ========================================================================
 function itemToDice(item) {
   if (!item) return [0, 0, 0];
-  return [safeInt(item.FirstDice), safeInt(item.SecondDice), safeInt(item.ThirdDice)];
-}
-function itemToSum(item) {
-  if (!item) return 0;
-  const s = itemToDice(item).reduce((a, b) => a + b, 0);
-  if (s >= 3 && s <= 18) return s;
-  return safeInt(item.DiceSum) || 0;
-}
-function itemToResult(item) {
-  const sum = itemToSum(item);
-  return (sum >= 3 && sum <= 18) ? (sum >= 11 ? 'T' : 'X') : null;
+  return [
+    safeInt(item.FirstDice, 0),
+    safeInt(item.SecondDice, 0),
+    safeInt(item.ThirdDice, 0)
+  ];
 }
 
-// ============ DB STRUCTURE ============
-function defaultDB() {
+function itemToSum(item) {
+  if (!item) return 0;
+  const dice = itemToDice(item);
+  const sum = dice[0] + dice[1] + dice[2];
+  if (sum >= 3 && sum <= 18) return sum;
+  return safeInt(item.DiceSum) || 0;
+}
+
+function itemToResult(item) {
+  const sum = itemToSum(item);
+  if (sum >= 3 && sum <= 18) {
+    return sum >= 11 ? 'T' : 'X';
+  }
+  return null;
+}
+
+// ========================================================================
+// 4. QUẢN LÝ DATABASE (LƯU TRỮ LỊCH SỬ)
+// ========================================================================
+function createDefaultDB() {
   return {
+    version: '10.0.0',
+    createdAt: now(),
+    updatedAt: now(),
     history: [],
-    algoStats: {}, // Lưu lịch sử thắng/thua của từng module
+    algoStats: {},
     lastProcessedSession: null
   };
 }
-function loadDatabase(game) {
-  const db = safeReadJson(DB_FILES[game]) || defaultDB();
-  if (!Array.isArray(db.history)) db.history = [];
-  if (!db.algoStats) db.algoStats = {};
+
+function migrateDatabase(db) {
+  if (!db || typeof db !== 'object') return createDefaultDB();
+  const defaultData = createDefaultDB();
+  
+  if (!Array.isArray(db.history)) db.history = defaultData.history;
+  if (!db.algoStats || typeof db.algoStats !== 'object') db.algoStats = defaultData.algoStats;
+  
   return db;
 }
-function saveDatabase(game, db) { safeAtomicWrite(DB_FILES[game], db); }
 
-// ========================================================================
-// 🎯 LỚP 1: CÁC HÀM TOÁN HỌC & ĐO LƯỜNG
-// ========================================================================
-
-// Tính trọng số thích nghi (Adaptive Weight) cho từng module
-function getWeight(name, db) {
-  const s = db.algoStats[name] || { total: 0, wins: 0 };
-  if (s.total < 15) return 1.0; // Chưa đủ mẫu thì giữ nguyên
-  const acc = s.wins / s.total;
-  return Math.exp(5 * (acc - 0.5)); // Hàm mũ phạt/thưởng
+function loadDatabase(game) {
+  const filePath = DB_FILES[game];
+  const rawData = safeReadJson(filePath, null);
+  return migrateDatabase(rawData || createDefaultDB());
 }
 
-// Hình phạt lệch (Bias Penalty) - Tránh module đoán thiên quá
-function getPenalty(name, db) {
-  const s = db.algoStats[name] || { predictions: 0, tCount: 0 };
-  if (s.predictions === 0) return 1.0;
-  const bias = (s.tCount / s.predictions) - 0.5;
-  return Math.max(0.7, 1 - 3 * Math.max(0, Math.abs(bias) - 0.1));
+function saveDatabase(game, db) {
+  db.updatedAt = now();
+  const filePath = DB_FILES[game];
+  safeAtomicWrite(filePath, db);
 }
 
-// Phân tích trạng thái chuỗi (Regime 30 phiên)
-function analyzeRegime(seq) {
-  const w = seq.slice(-30);
-  if (w.length < 5) return { type: 'RANDOM', maxStreak: 0, rate: 0.5 };
-  
-  // Tìm chuỗi dài nhất
-  let maxS = 1, curS = 1;
-  for (let i = 1; i < w.length; i++) {
-    if (w[i] === w[i - 1]) curS++;
-    else curS = 1;
-    if (curS > maxS) maxS = curS;
+// ========================================================================
+// 5. CÁC HÀM TOÁN HỌC (ADAPTIVE WEIGHT, BIAS, REGIME)
+// ========================================================================
+
+function calculateAdaptiveWeight(moduleName, db) {
+  const stats = db.algoStats[moduleName] || { total: 0, wins: 0 };
+  if (stats.total < 15) return 1.0;
+  const accuracy = stats.wins / stats.total;
+  const weight = Math.exp(5 * (accuracy - 0.5));
+  return Math.max(0.1, Math.min(10.0, weight));
+}
+
+function calculateBiasPenalty(moduleName, db) {
+  const stats = db.algoStats[moduleName] || { predictions: 0, tCount: 0 };
+  if (stats.predictions === 0) return 1.0;
+  const bias = (stats.tCount / stats.predictions) - 0.5;
+  const penalty = Math.max(0.7, 1 - 3 * Math.max(0, Math.abs(bias) - 0.1));
+  return penalty;
+}
+
+function analyzeRegime(sequence) {
+  const window = sequence.slice(-30);
+  if (window.length < 5) return { type: 'RANDOM', maxStreak: 0, transitionRate: 0.5 };
+
+  let maxStreak = 1;
+  let currentStreak = 1;
+  for (let i = 1; i < window.length; i++) {
+    if (window[i] === window[i - 1]) currentStreak++;
+    else currentStreak = 1;
+    if (currentStreak > maxStreak) maxStreak = currentStreak;
   }
-  
-  // Tỷ lệ đổi cửa
-  let trans = 0;
-  for (let i = 1; i < w.length; i++) if (w[i] !== w[i - 1]) trans++;
-  const rate = trans / (w.length - 1);
-  
-  // Phân loại
+
+  let transitions = 0;
+  for (let i = 1; i < window.length; i++) {
+    if (window[i] !== window[i - 1]) transitions++;
+  }
+  const transitionRate = transitions / (window.length - 1);
+
   let type = 'HỖN_HỢP';
-  if (maxS >= 5) type = 'BỆT';
-  else if (rate >= 0.45 && rate <= 0.55) type = 'RANDOM';
-  
-  return { type, maxStreak: maxS, rate };
+  if (maxStreak >= 5) type = 'BỆT';
+  else if (transitionRate >= 0.45 && transitionRate <= 0.55) type = 'RANDOM';
+
+  return { type, maxStreak, transitionRate };
 }
 
 // ========================================================================
-// 🎯 LỚP 2: 18 MODULES NHẬN DIỆN CẦU CHI TIẾT
+// 6. CÁC MODULE NHẬN DIỆN CẦU (PATTERN RECOGNITION)
 // ========================================================================
 
-// 1. MODULE STREAK (Bắt bệt)
-function modStreak(seq) {
-  if (seq.length < 3) return null;
-  const last = seq[seq.length - 1];
-  let len = 1;
-  for (let i = seq.length - 2; i >= 0; i--) {
-    if (seq[i] === last) len++; else break;
+// 6.1. MODULE STREAK (Bắt bệt)
+function moduleStreak(sequence) {
+  if (sequence.length < 3) return null;
+  const last = sequence[sequence.length - 1];
+  let length = 1;
+  for (let i = sequence.length - 2; i >= 0; i--) {
+    if (sequence[i] === last) length++;
+    else break;
   }
-  if (len < 3) return null;
-  
-  if (len <= 5) {
-    return { name: `BỆT-${len}`, code: last, conf: 0.60 + (len - 3) * 0.05 };
-  } else if (len <= 8) {
-    return { name: `BỆT-${len}-NGHI`, code: last, conf: 0.55 };
+
+  if (length < 3) return null;
+  if (length <= 5) {
+    return { name: `BỆT-${length}`, code: last, confidence: 0.60 + (length - 3) * 0.05 };
+  } else if (length <= 8) {
+    return { name: `BỆT-${length}-NGHI`, code: last, confidence: 0.55 };
   } else {
-    return { name: `BỆT-GÃY-${len}`, code: flip(last), conf: 0.65 };
+    return { name: `BỆT-GÃY-${length}`, code: flip(last), confidence: 0.65 };
   }
 }
 
-// 2. MODULE CAU (Nhận diện nhịp hình học)
-function modCau(seq) {
-  const n = seq.length;
-  if (n < 5) return null;
-  const s = seq.join('');
-  
+// 6.2. MODULE CAU (Nhận diện nhịp hình học)
+function moduleCau(sequence) {
+  const length = sequence.length;
+  if (length < 5) return null;
+  const str = sequence.join('');
+
   const patterns = [
     { tail: 'TXXTXX', next: 'T', name: 'CẦU-1-2-1', conf: 0.72 },
     { tail: 'XTTXTT', next: 'X', name: 'CẦU-1-2-1', conf: 0.72 },
@@ -183,221 +247,242 @@ function modCau(seq) {
   ];
 
   for (const p of patterns) {
-    if (s.endsWith(p.tail)) return { name: p.name, code: p.next, conf: p.conf };
+    if (str.endsWith(p.tail)) return { name: p.name, code: p.next, confidence: p.conf };
   }
 
-  // Cầu lặp (5, 6, 7 phiên)
-  for (const len of [5, 6, 7]) {
-    if (n >= len * 2 && seq.slice(-len * 2, -len).join('') === seq.slice(-len).join('')) {
-      return { name: `CẦU-LẶP-${len}`, code: seq[n - len], conf: 0.72 };
+  for (const period of [5, 6, 7]) {
+    if (length >= period * 2 && sequence.slice(-period * 2, -period).join('') === sequence.slice(-period).join('')) {
+      return { name: `CẦU-LẶP-${period}`, code: sequence[length - period], confidence: 0.72 };
     }
   }
 
-  // Cầu tăng/giảm tiến
   const blocks = [];
-  let ct = seq[0], cl = 1;
-  for (let i = 1; i < n; i++) {
-    if (seq[i] === ct) cl++;
-    else { blocks.push({ t: ct, l: cl }); ct = seq[i]; cl = 1; }
+  let currentType = sequence[0];
+  let currentLength = 1;
+  for (let i = 1; i < length; i++) {
+    if (sequence[i] === currentType) currentLength++;
+    else { blocks.push({ type: currentType, length: currentLength }); currentType = sequence[i]; currentLength = 1; }
   }
-  blocks.push({ t: ct, l: cl });
+  blocks.push({ type: currentType, length: currentLength });
 
   if (blocks.length >= 3) {
-    const [a, b, c] = blocks.slice(-3).map(x => x.l);
-    if (a < b && b < c && c <= 5) return { name: 'TĂNG-TIẾN', code: flip(blocks[blocks.length - 1].t), conf: 0.60 };
-    if (a > b && b > c && a <= 5) return { name: 'GIẢM-TIẾN', code: flip(blocks[blocks.length - 1].t), conf: 0.60 };
+    const lastThree = blocks.slice(-3);
+    const [a, b, c] = lastThree.map(b => b.length);
+    if (a < b && b < c && c <= 5) return { name: 'CẦU-TĂNG-TIẾN', code: flip(lastThree[2].type), confidence: 0.60 };
+    if (a > b && b > c && a <= 5) return { name: 'CẦU-GIẢM-TIẾN', code: flip(lastThree[2].type), confidence: 0.60 };
   }
 
   return null;
 }
 
-// 3. MODULE CAU_TAI
-function modCauTai(seq) {
-  const n = seq.length;
-  if (n < 4) return null;
-  const last = seq[n - 1];
-  let len = 1;
-  for (let i = n - 2; i >= 0; i--) { if (seq[i] === last) len++; else break; }
-  if (last === 'X' && len >= 3 && len <= 6) {
-    return { name: 'TÀI-SAU-BỆT-X', code: 'T', conf: 0.68 };
+// 6.3. MODULE CAU_TAI
+function moduleCauTai(sequence) {
+  const length = sequence.length;
+  if (length < 4) return null;
+  const last = sequence[length - 1];
+  let streakLength = 1;
+  for (let i = length - 2; i >= 0; i--) {
+    if (sequence[i] === last) streakLength++;
+    else break;
+  }
+  if (last === 'X' && streakLength >= 3 && streakLength <= 6) {
+    return { name: 'TÀI-SAU-BỆT-X', code: 'T', confidence: 0.68 };
   }
   return null;
 }
 
-// 4. MODULE CAU_XIU
-function modCauXiu(seq) {
-  const n = seq.length;
-  if (n < 4) return null;
-  const last = seq[n - 1];
-  let len = 1;
-  for (let i = n - 2; i >= 0; i--) { if (seq[i] === last) len++; else break; }
-  if (last === 'X' && len >= 3 && len <= 7) {
-    return { name: `ĐẢO-BỆT-X${len}`, code: 'T', conf: 0.58 + 0.03 * (len - 3) };
+// 6.4. MODULE CAU_XIU
+function moduleCauXiu(sequence) {
+  const length = sequence.length;
+  if (length < 4) return null;
+  const last = sequence[length - 1];
+  let streakLength = 1;
+  for (let i = length - 2; i >= 0; i--) {
+    if (sequence[i] === last) streakLength++;
+    else break;
+  }
+  if (last === 'X' && streakLength >= 3 && streakLength <= 7) {
+    return { name: `ĐẢO-BỆT-X${streakLength}`, code: 'T', confidence: 0.58 + 0.03 * (streakLength - 3) };
   }
   return null;
 }
 
-// 5. MODULE MARKOV (Bậc 1, 2, 3)
-function modMarkov(seq, order) {
-  if (seq.length < order + 3) return null;
-  const key = seq.slice(-order).join('');
-  let t = 0, x = 0;
-  for (let i = order; i < seq.length; i++) {
-    if (seq.slice(i - order, i).join('') === key) {
-      if (seq[i] === 'T') t++; else x++;
+// 6.5. MODULE MARKOV
+function moduleMarkov(sequence, order) {
+  if (sequence.length < order + 3) return null;
+  const key = sequence.slice(-order).join('');
+  let countT = 0, countX = 0;
+  for (let i = order; i < sequence.length; i++) {
+    if (sequence.slice(i - order, i).join('') === key) {
+      if (sequence[i] === 'T') countT++;
+      else countX++;
     }
   }
-  if (t + x < 3) return null;
-  return { name: `MARKOV-O${order}`, code: t >= x ? 'T' : 'X', conf: 0.5 + (Math.max(t, x) / (t + x) - 0.5) * 0.5 };
+  const total = countT + countX;
+  if (total < 3) return null;
+  const next = countT >= countX ? 'T' : 'X';
+  const prob = Math.max(countT, countX) / total;
+  return { name: `MARKOV-O${order}`, code: next, confidence: 0.5 + (prob - 0.5) * 0.5 };
 }
 
-// 6. MODULE NGRAM (Bậc 3, 4, 5)
-function modNgram(seq, k) {
-  if (seq.length < k + 3) return null;
-  const key = seq.slice(-k).join('');
-  let t = 0, x = 0;
-  for (let i = k; i < seq.length; i++) {
-    if (seq.slice(i - k, i).join('') === key) {
-      if (seq[i] === 'T') t++; else x++;
+// 6.6. MODULE NGRAM
+function moduleNgram(sequence, k) {
+  if (sequence.length < k + 3) return null;
+  const key = sequence.slice(-k).join('');
+  let countT = 0, countX = 0;
+  for (let i = k; i < sequence.length; i++) {
+    if (sequence.slice(i - k, i).join('') === key) {
+      if (sequence[i] === 'T') countT++;
+      else countX++;
     }
   }
-  if (t + x < 2) return null;
-  return { name: `NGRAM-${k}`, code: t >= x ? 'T' : 'X', conf: 0.5 + (Math.abs(t - x) / (t + x)) * 0.3 };
+  const total = countT + countX;
+  if (total < 2) return null;
+  const next = countT >= countX ? 'T' : 'X';
+  const confidence = 0.5 + (Math.abs(countT - countX) / total) * 0.3;
+  return { name: `NGRAM-${k}`, code: next, confidence };
 }
 
-// 7. MODULE BAYESIAN
-function modBayes(seq, w) {
-  if (seq.length < w + 2) return null;
-  const tCount = seq.slice(-w).filter(x => x === 'T').length;
-  const pT = (tCount + 1) / (w + 2);
-  return { name: `BAYES-${w}`, code: pT >= 0.5 ? 'T' : 'X', conf: Math.abs(pT - 0.5) + 0.5 };
+// 6.7. MODULE BAYESIAN
+function moduleBayes(sequence, windowSize) {
+  if (sequence.length < windowSize + 2) return null;
+  const recent = sequence.slice(-windowSize);
+  const countT = recent.filter(x => x === 'T').length;
+  const priorT = (countT + 1) / (windowSize + 2);
+  const next = priorT >= 0.5 ? 'T' : 'X';
+  const confidence = Math.abs(priorT - 0.5) + 0.5;
+  return { name: `BAYES-${windowSize}`, code: next, confidence };
 }
 
-// 8. MODULE TREND
-function modTrend(seq) {
-  if (seq.length < 8) return null;
-  const tCount = seq.slice(-8).filter(x => x === 'T').length;
-  if (tCount === 5 || tCount === 6) return { name: 'TREND', code: tCount >= 5 ? 'T' : 'X', conf: 0.58 };
+// 6.8. MODULE TREND
+function moduleTrend(sequence) {
+  if (sequence.length < 8) return null;
+  const recent = sequence.slice(-8);
+  const countT = recent.filter(x => x === 'T').length;
+  if (countT === 5 || countT === 6) {
+    return { name: 'TREND', code: countT >= 5 ? 'T' : 'X', confidence: 0.58 };
+  }
   return null;
 }
 
-// 9. MODULE LSTM_SIM
-function modLstm(seq) {
-  if (seq.length < 10) return null;
-  const recent = seq.slice(-10);
-  const trans = recent.filter((v, i) => i > 0 && v !== recent[i - 1]).length;
-  if (trans >= 6 && trans <= 8) return null; // Quá nhiễu
-  return { name: 'LSTM-SIM', code: recent.filter(x => x === 'T').length >= 5 ? 'T' : 'X', conf: 0.55 };
+// 6.9. MODULE LSTM SIMULATION
+function moduleLstmSim(sequence) {
+  if (sequence.length < 10) return null;
+  const recent = sequence.slice(-10);
+  const transitions = recent.filter((v, i) => i > 0 && v !== recent[i - 1]).length;
+  if (transitions >= 6 && transitions <= 8) return null;
+  const countT = recent.filter(x => x === 'T').length;
+  return { name: 'LSTM-SIM', code: countT >= 5 ? 'T' : 'X', confidence: 0.55 };
 }
 
-// 10. MODULE ARIMA (Thiên hướng Xỉu)
-function modArima(seq) {
-  if (seq.length < 15) return null;
-  return { name: 'ARIMA', code: 'X', conf: 0.52 };
+// 6.10. MODULE ARIMA
+function moduleArima(sequence) {
+  if (sequence.length < 15) return null;
+  return { name: 'ARIMA', code: 'X', confidence: 0.52 };
 }
 
-// 11. MODULE KALMAN
-function modKalman(seq) {
-  if (seq.length < 6) return null;
-  const tCount = seq.slice(-6).filter(x => x === 'T').length;
-  const state = tCount / 6;
-  return { name: 'KALMAN', code: state >= 0.5 ? 'T' : 'X', conf: 0.5 + Math.abs(state - 0.5) * 0.5 };
+// 6.11. MODULE KALMAN
+function moduleKalman(sequence) {
+  if (sequence.length < 6) return null;
+  const recent = sequence.slice(-6);
+  const countT = recent.filter(x => x === 'T').length;
+  const state = countT / 6;
+  const next = state >= 0.5 ? 'T' : 'X';
+  const confidence = 0.5 + Math.abs(state - 0.5) * 0.5;
+  return { name: 'KALMAN', code: next, confidence };
 }
 
-// 12. MODULE RANDOM FOREST (Giả lập)
-function modRF(seq) {
-  if (seq.length < 12) return null;
-  const f1 = seq.slice(-5).filter(x => x === 'T').length;
-  if (f1 === 4) return { name: 'RF-SIM', code: 'X', conf: 0.62 };
-  if (f1 === 1) return { name: 'RF-SIM', code: 'T', conf: 0.62 };
+// 6.12. MODULE RANDOM FOREST
+function moduleRandomForest(sequence) {
+  if (sequence.length < 12) return null;
+  const f1 = sequence.slice(-5).filter(x => x === 'T').length;
+  if (f1 === 4) return { name: 'RF', code: 'X', confidence: 0.62 };
+  if (f1 === 1) return { name: 'RF', code: 'T', confidence: 0.62 };
   return null;
 }
 
-// 13. MODULE GRADIENT BOOST (Giả lập)
-function modGB(seq) {
-  if (seq.length < 15) return null;
-  const f1 = seq.slice(-10).filter(x => x === 'T').length;
-  if (f1 >= 7) return { name: 'GB-SIM', code: 'X', conf: 0.64 };
-  if (f1 <= 3) return { name: 'GB-SIM', code: 'T', conf: 0.64 };
+// 6.13. MODULE GRADIENT BOOST
+function moduleGradientBoost(sequence) {
+  if (sequence.length < 15) return null;
+  const f1 = sequence.slice(-10).filter(x => x === 'T').length;
+  if (f1 >= 7) return { name: 'GB', code: 'X', confidence: 0.64 };
+  if (f1 <= 3) return { name: 'GB', code: 'T', confidence: 0.64 };
   return null;
 }
 
-// 14. MODULE CHAOS
-function modChaos(seq) {
-  if (seq.length < 10) return null;
-  const tCount = seq.slice(-10).filter(x => x === 'T').length;
-  return { name: 'CHAOS', code: tCount < 5 ? 'X' : 'T', conf: 0.52 };
+// 6.14. MODULE CHAOS
+function moduleChaos(sequence) {
+  if (sequence.length < 10) return null;
+  const recent = sequence.slice(-10);
+  const countT = recent.filter(x => x === 'T').length;
+  return { name: 'CHAOS', code: countT < 5 ? 'X' : 'T', confidence: 0.52 };
 }
 
-// 15. MODULE FOURIER
-function modFourier(seq) {
-  if (seq.length < 20) return null;
-  const tFrac = seq.slice(-8).filter(x => x === 'T').length / 8;
+// 6.15. MODULE FOURIER
+function moduleFourier(sequence) {
+  if (sequence.length < 20) return null;
+  const recent = sequence.slice(-8);
+  const tFrac = recent.filter(x => x === 'T').length / 8;
   if (Math.abs(tFrac - 0.5) < 0.15) return null;
-  return { name: 'FOURIER', code: tFrac >= 0.5 ? 'T' : 'X', conf: 0.50 + Math.abs(tFrac - 0.5) * 0.4 };
+  return { name: 'FOURIER', code: tFrac >= 0.5 ? 'T' : 'X', confidence: 0.50 + Math.abs(tFrac - 0.5) * 0.4 };
 }
 
-// 16. MODULE ENTROPY
-function modEntropy(seq) {
-  if (seq.length < 10) return null;
-  const recent = seq.slice(-10);
-  const p = recent.filter(x => x === 'T').length / 10;
-  const H = (p === 0 || p === 1) ? 0 : -p * Math.log2(p) - (1 - p) * Math.log2(1 - p);
+// 6.16. MODULE ENTROPY
+function moduleEntropy(sequence) {
+  if (sequence.length < 10) return null;
+  const recent = sequence.slice(-10);
+  const pT = recent.filter(x => x === 'T').length / 10;
+  const H = (pT === 0 || pT === 1) ? 0 : -pT * Math.log2(pT) - (1 - pT) * Math.log2(1 - pT);
   if (H > 0.85) return null;
-  return { name: 'ENTROPY', code: p >= 0.5 ? 'T' : 'X', conf: 0.55 };
+  return { name: 'ENTROPY', code: pT >= 0.5 ? 'T' : 'X', confidence: 0.55 };
 }
 
 // ========================================================================
-// 🎯 LỚP 3: TỔNG HỢP & CHẤM ĐIỂM (ENSEMBLE ENGINE)
+// 7. ENGINE TỔNG HỢP (ENSEMBLE & GUARD)
 // ========================================================================
+function runEngine(db, sequence) {
+  const modules = [
+    moduleStreak(sequence), moduleCau(sequence), moduleCauTai(sequence), moduleCauXiu(sequence),
+    moduleMarkov(sequence, 1), moduleMarkov(sequence, 2), moduleMarkov(sequence, 3),
+    moduleNgram(sequence, 3), moduleNgram(sequence, 4), moduleNgram(sequence, 5),
+    moduleBayes(sequence, 4), moduleBayes(sequence, 5), moduleTrend(sequence),
+    moduleLstmSim(sequence), moduleArima(sequence), moduleKalman(sequence),
+    moduleRandomForest(sequence), moduleGradientBoost(sequence),
+    moduleChaos(sequence), moduleFourier(sequence), moduleEntropy(sequence)
+  ].filter(Boolean);
 
-function runEngine(db, seq) {
-  const regime = analyzeRegime(seq);
-  
-  // Thu thập kết quả từ 16 modules
-  const mods = [
-    modStreak(seq), modCau(seq), modCauTai(seq), modCauXiu(seq),
-    modMarkov(seq, 1), modMarkov(seq, 2), modMarkov(seq, 3),
-    modNgram(seq, 3), modNgram(seq, 4), modNgram(seq, 5),
-    modBayes(seq, 4), modBayes(seq, 5),
-    modTrend(seq), modLstm(seq), modArima(seq), modKalman(seq),
-    modRF(seq), modGB(seq), modChaos(seq), modFourier(seq), modEntropy(seq)
-  ].filter(Boolean); // Bỏ qua module không có tín hiệu
+  if (modules.length === 0) return { code: null, label: 'MARKOV', tiLe: 'CHỜ' };
 
-  if (mods.length === 0) return { code: null, label: 'MARKOV', tiLe: 'CHỜ' };
-
-  let tVotes = 0;
-  let xVotes = 0;
-  let bestMod = null;
+  let votesT = 0;
+  let votesX = 0;
+  let bestModule = null;
   let maxScore = 0;
 
-  // Chấm điểm từng module
-  for (const m of mods) {
-    const w = getWeight(m.name, db);
-    const p = getPenalty(m.name, db);
-    const score = m.conf * w * p;
-    
-    if (m.code === 'T') tVotes += score;
-    else xVotes += score;
+  for (const m of modules) {
+    const weight = calculateAdaptiveWeight(m.name, db);
+    const penalty = calculateBiasPenalty(m.name, db);
+    const score = m.confidence * weight * penalty;
+
+    if (m.code === 'T') votesT += score;
+    else votesX += score;
 
     if (score > maxScore) {
       maxScore = score;
-      bestMod = m;
+      bestModule = m;
     }
   }
 
-  const totalVotes = tVotes + xVotes;
+  const totalVotes = votesT + votesX;
   if (totalVotes === 0) return { code: null, label: 'MARKOV', tiLe: 'CHỜ' };
 
-  let finalCode = tVotes >= xVotes ? 'T' : 'X';
-  let finalLabel = bestMod ? bestMod.name : 'MARKOV';
+  let finalCode = votesT >= votesX ? 'T' : 'X';
+  let finalLabel = bestModule ? bestModule.name : 'MARKOV';
 
-  // Nếu quá sát nút (Mâu thuẫn) -> Chờ
-  if (Math.abs(tVotes - xVotes) / totalVotes < 0.05) {
+  if (Math.abs(votesT - votesX) / totalVotes < 0.05) {
     return { code: null, label: 'MÂU-THUẪN', tiLe: 'CHỜ' };
   }
 
-  // Lớp 4: Balance Guard (Bẻ lái)
+  // Balance Guard
   let gt = 0, gx = 0;
   for (const h of db.history.slice(-50)) {
     if (h.DU_DOAN_CODE === 'T') gt++;
@@ -405,133 +490,154 @@ function runEngine(db, seq) {
   }
   if (gt + gx >= 20) {
     const pX = gx / (gt + gx);
-    if (pX >= 0.62 && finalCode !== 'T') {
-      finalCode = 'T';
-      finalLabel = 'BALANCE-GUARD';
-    } else if (pX <= 0.38 && finalCode !== 'X') {
-      finalCode = 'X';
-      finalLabel = 'BALANCE-GUARD';
-    }
+    if (pX >= 0.62 && finalCode !== 'T') { finalCode = 'T'; finalLabel = 'BALANCE-GUARD'; }
+    if (pX <= 0.38 && finalCode !== 'X') { finalCode = 'X'; finalLabel = 'BALANCE-GUARD'; }
   }
 
-  // Định dạng Tỉ lệ cho đẹp (Max 92%)
-  let conf = maxScore;
-  if (conf > 0.92) conf = 0.92;
-  if (conf < 0.65) conf = 0.65;
-  
-  return { code: finalCode, label: finalLabel, tiLe: (conf * 100).toFixed(1) + '%' };
+  let confidence = Math.min(0.92, Math.max(0.65, maxScore));
+  return { code: finalCode, label: finalLabel, tiLe: (confidence * 100).toFixed(1) + '%' };
 }
 
 // ========================================================================
-// 🎯 VÒNG LẶP CHẠY NGẦM
+// 8. FETCH VÀ XỬ LÝ VÒNG LẶP
 // ========================================================================
 async function fetchHistory(url) {
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < FETCH_RETRIES; i++) {
     try {
       const res = await axios.get(url, { timeout: API_TIMEOUT_MS });
       let arr = res.data?.data?.list || res.data?.list || res.data?.data || (Array.isArray(res.data) ? res.data : []);
-      if (arr.length >= 2 && Number(arr[0].SessionId) > Number(arr[arr.length-1].SessionId)) arr.reverse();
+      if (arr.length >= 2 && Number(arr[0].SessionId) > Number(arr[arr.length - 1].SessionId)) arr.reverse();
       return arr;
-    } catch (e) { if (i === 2) throw e; await new Promise(r => setTimeout(r, 500)); }
+    } catch (error) {
+      if (i === FETCH_RETRIES - 1) return [];
+      await new Promise(r => setTimeout(r, 500));
+    }
   }
 }
 
 async function processGame(game) {
-  try {
-    const list = await fetchHistory(APIS[game]);
-    if (!list.length) return;
+  const list = await fetchHistory(APIS[game]);
+  if (!list || !list.length) return;
 
-    const latest = list[list.length - 1];
-    const session = safeInt(latest.SessionId);
-    const db = loadDatabase(game);
-    
-    if (db.lastProcessedSession === session) return;
+  const latest = list[list.length - 1];
+  const session = safeInt(latest.SessionId);
+  const db = loadDatabase(game);
 
-    const seq = list.slice(-MAX_HISTORY).map(itemToResult).filter(Boolean);
-    if (seq.length < 6) return;
+  if (db.lastProcessedSession === session) return;
 
-    // 1. Chấm điểm phiên trước đó
-    const prev = db.history[db.history.length - 1];
-    if (prev && safeInt(prev.phienDuDoan) === session) {
-      const actual = itemToResult(latest);
-      prev.ketQua = actual;
-      prev.ketQuaLabel = labelFromTX(actual);
-      prev.trangThai = !prev.DU_DOAN_CODE ? 'BỎ QUA' : (prev.DU_DOAN_CODE === actual ? 'ĐÚNG' : 'SAI');
+  const sequence = list.slice(-MAX_HISTORY).map(itemToResult).filter(Boolean);
+  if (sequence.length < 6) return;
 
-      if (prev.modulesRun) {
-        for (const m of prev.modulesRun) {
-          if (!m.code) continue;
-          if (!db.algoStats[m.name]) db.algoStats[m.name] = { total: 0, wins: 0, predictions: 0, tCount: 0 };
-          const st = db.algoStats[m.name];
-          st.total++;
-          st.predictions++;
-          if (m.code === 'T') st.tCount++;
-          if (m.code === actual) st.wins++;
-        }
+  // Chấm điểm phiên trước
+  const prev = db.history[db.history.length - 1];
+  if (prev && safeInt(prev.phienDuDoan) === session) {
+    const actual = itemToResult(latest);
+    prev.ketQua = actual;
+    prev.ketQuaLabel = labelFromTX(actual);
+    prev.trangThai = !prev.DU_DOAN_CODE ? 'BỎ QUA' : (prev.DU_DOAN_CODE === actual ? 'ĐÚNG' : 'SAI');
+
+    if (prev.modulesRun) {
+      for (const m of prev.modulesRun) {
+        if (!m.code) continue;
+        if (!db.algoStats[m.name]) db.algoStats[m.name] = { total: 0, wins: 0, predictions: 0, tCount: 0 };
+        const stat = db.algoStats[m.name];
+        stat.total++; stat.predictions++;
+        if (m.code === 'T') stat.tCount++;
+        if (m.code === actual) stat.wins++;
       }
     }
+  }
 
-    // 2. Chạy Engine
-    const pred = runEngine(db, seq);
-    
-    // Lưu các modules đã chạy để phiên sau chấm điểm
-    const modsRun = [
-      modStreak(seq), modCau(seq), modCauTai(seq), modCauXiu(seq),
-      modMarkov(seq, 1), modMarkov(seq, 2), modMarkov(seq, 3),
-      modNgram(seq, 3), modNgram(seq, 4), modNgram(seq, 5),
-      modBayes(seq, 4), modBayes(seq, 5), modTrend(seq),
-      modLstm(seq), modArima(seq), modKalman(seq),
-      modRF(seq), modGB(seq), modChaos(seq), modFourier(seq), modEntropy(seq)
-    ].filter(Boolean);
+  const prediction = runEngine(db, sequence);
 
-    // 3. Lưu Database
-    db.history.push({
-      phien: session,
-      xucXac: itemToDice(latest),
-      tong: itemToSum(latest),
-      ketQua: itemToResult(latest),
-      ketQuaLabel: labelFromTX(itemToResult(latest)),
-      phienDuDoan: session + 1,
-      DU_DOAN_CODE: pred.code,
-      DU_DOAN: pred.code ? labelFromTX(pred.code) : 'CHỜ',
-      TI_LE: pred.tiLe,
-      patternName: pred.label,
-      modulesRun: modsRun,
-      trangThai: 'ĐANG CHỜ'
-    });
+  const modulesRun = [
+    moduleStreak(sequence), moduleCau(sequence), moduleCauTai(sequence), moduleCauXiu(sequence),
+    moduleMarkov(sequence, 1), moduleMarkov(sequence, 2), moduleMarkov(sequence, 3),
+    moduleNgram(sequence, 3), moduleNgram(sequence, 4), moduleNgram(sequence, 5),
+    moduleBayes(sequence, 4), moduleBayes(sequence, 5), moduleTrend(sequence),
+    moduleLstmSim(sequence), moduleArima(sequence), moduleKalman(sequence),
+    moduleRandomForest(sequence), moduleGradientBoost(sequence),
+    moduleChaos(sequence), moduleFourier(sequence), moduleEntropy(sequence)
+  ].filter(Boolean);
 
-    if (db.history.length > MAX_HISTORY) db.history.shift();
-    db.lastProcessedSession = session;
-    saveDatabase(game, db);
-  } catch (e) { console.error(`[ERR] ${game}`, e.message); }
+  db.history.push({
+    phien: session, xucXac: itemToDice(latest), tong: itemToSum(latest),
+    ketQua: itemToResult(latest), ketQuaLabel: labelFromTX(itemToResult(latest)),
+    phienDuDoan: session + 1, DU_DOAN_CODE: prediction.code,
+    DU_DOAN: prediction.code ? labelFromTX(prediction.code) : 'CHỜ',
+    TI_LE: prediction.tiLe, patternName: prediction.label, modulesRun, trangThai: 'ĐANG CHỜ'
+  });
+
+  if (db.history.length > MAX_HISTORY) db.history.shift();
+  db.lastProcessedSession = session;
+  saveDatabase(game, db);
 }
 
-setInterval(() => { Promise.all(Object.keys(APIS).map(g => processGame(g))); }, POLL_INTERVAL_MS);
+setInterval(() => { processGame('md5'); processGame('taixiu'); }, POLL_INTERVAL_MS);
 
 // ========================================================================
-// 🎯 UI HIỂN THỊ (BẢO MẬT - KHÔNG LỘ LOGIC)
+// 9. ROUTES API (FIX LỖI CANNOT GET)
 // ========================================================================
+app.get('/', (req, res) => {
+  res.send(`
+    <h2>🚀 HOANG VIP WIN API</h2>
+    <ul>
+      <li><a href="/api/predict/md5">/api/predict/md5</a></li>
+      <li><a href="/api/predict/taixiu">/api/predict/taixiu</a></li>
+      <li><a href="/api/history/all">/api/history/all</a></li>
+    </ul>
+  `);
+});
+
+app.get('/api/predict/:game', async (req, res) => {
+  const game = req.params.game;
+  if (!APIS[game]) return res.status(400).json({ error: 'Game không hợp lệ' });
+
+  const list = await fetchHistory(APIS[game]);
+  if (!list.length) return res.status(500).json({ error: 'Lỗi lấy dữ liệu' });
+
+  const latest = list[list.length - 1];
+  const sequence = list.slice(-MAX_HISTORY).map(itemToResult).filter(Boolean);
+  const db = loadDatabase(game);
+  const prediction = runEngine(db, sequence);
+  const session = safeInt(latest.SessionId);
+
+  res.json({
+    success: true, game, phien: session,
+    xucXac: itemToDice(latest), tong: itemToSum(latest),
+    ketQua: itemToResult(latest), ketQuaLabel: labelFromTX(itemToResult(latest)),
+    phienDuDoan: session + 1,
+    duDoan: prediction.code ? labelFromTX(prediction.code) : 'CHỜ',
+    duDoanCode: prediction.code, tiLe: prediction.tiLe, reason: prediction.label
+  });
+});
+
 app.get('/api/history/all', (req, res) => {
   const out = {};
-  for (const game of Object.keys(DB_FILES)) {
+  for (const game of ['md5', 'taixiu']) {
     const db = loadDatabase(game);
-    out[game] = db.history.slice(-500).reverse().map(it => ({
-      phien: it.phien, phienDuDoan: it.phienDuDoan, tong: it.tong, xucXac: it.xucXac,
-      ketQua: it.ketQua, ketQuaLabel: it.ketQuaLabel,
-      duDoanCode: it.DU_DOAN_CODE, duDoan: it.DU_DOAN, tiLe: it.TI_LE,
-      pattern: { type: it.patternName }, trangThai: it.trangThai
-    }));
+    out[game] = {
+      items: db.history.slice(-100).reverse().map(it => ({
+        phien: it.phien, phienDuDoan: it.phienDuDoan, tong: it.tong, xucXac: it.xucXac,
+        ketQua: it.ketQua, ketQuaLabel: it.ketQuaLabel,
+        duDoanCode: it.DU_DOAN_CODE, duDoan: it.DU_DOAN, tiLe: it.TI_LE,
+        pattern: { type: it.patternName }, trangThai: it.trangThai
+      }))
+    };
   }
   res.json({ success: true, games: out });
 });
 
+// ========================================================================
+// 10. UI DASHBOARD (KHÔNG LỘ THUẬT TOÁN)
+// ========================================================================
 app.get('/:game', (req, res) => {
   const game = req.params.game;
-  if (!DB_FILES[game]) return res.send('Not found');
+  if (game !== 'md5' && game !== 'taixiu') return res.send('Trang không tồn tại');
   const db = loadDatabase(game);
   const rows = db.history.slice(-50).reverse();
 
-  const getBadge = (type) => {
+  const getBadgeClass = (type) => {
     if (!type) return 'badge-default';
     if (type.startsWith('BỆT')) return 'badge-bet';
     if (type.includes('MARKOV') || type.includes('GUARD')) return 'badge-markov';
@@ -580,7 +686,7 @@ app.get('/:game', (req, res) => {
           const ddCls = isWait ? 'cho' : (it.DU_DOAN_CODE === 'T' ? 'tai' : 'xiu');
           const ttCls = it.trangThai === 'ĐÚNG' ? 'dung' : (it.trangThai === 'SAI' ? 'sai' : 'cho');
           const ttText = it.trangThai === 'ĐANG CHỜ' ? '...' : (it.trangThai || '');
-          const badgeCls = getBadge(it.patternName);
+          const badgeCls = getBadgeClass(it.patternName);
           return `<tr>
             <td class="session">${it.phien}</td><td class="dice">${dice}</td>
             <td><span class="sum">${it.tong || ''}</span></td><td class="${kqCls}">${it.ketQuaLabel || ''}</td>
@@ -598,4 +704,5 @@ app.get('/:game', (req, res) => {
   res.send(html);
 });
 
+// KHỞI ĐỘNG SERVER
 app.listen(PORT, () => console.log(`🚀 HOANG VIP WIN - PORT ${PORT}`));
