@@ -1,15 +1,14 @@
 {
-  "name": "hoang-vip-ai",
-  "version": "11.0.0",
+  "name": "hoang-vip-secure",
+  "version": "15.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "install": "node-gyp rebuild"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "axios": "^1.6.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "axios": "^1.6.0",
+    "node-gyp": "^10.0.0"
   }
 }
