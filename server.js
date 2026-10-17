@@ -1,13 +1,14 @@
 /**
- * server.js — FULL FIX (algorithm upgraded, drop-in)
+ * server.js — FULL FIX (deterministic algorithm upgraded, preserves /md5 & /taixiu)
  *
- * - Keeps all original routes, polling, persistence and UI from your app.
- * - Replaces only the internal engine with a deterministic, non-random "CUEJC-VIP" algorithm.
- * - Single-file: drop into your project, npm i express axios, then node server.js (or deploy).
+ * - Replaces only the internal algorithm (deterministic, many pattern detectors).
+ * - Preserves routes: /md5, /taixiu, /api/*, admin endpoints.
+ * - Single-file: save as server.js, run with Node.js (>=18).
  *
- * Notes:
- * - Preserves routes: /api/predict/:game, /api/simple/:game, /api/history/*, admin endpoints, UI, etc.
- * - If your original server had a different filename, ensure this replaces it and is run.
+ * Install:
+ *   npm install express axios
+ * Run:
+ *   node server.js
  */
 
 'use strict';
@@ -18,21 +19,22 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Basic CORS & JSON
+// Simple CORS for convenience
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
-app.use(express.json());
 
-/* ===================== Configuration ===================== */
+/* ================= CONFIG ================= */
 const PORT = Number(process.env.PORT || 3000);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
-const MAX_HISTORY = Number(process.env.MAX_HISTORY || 600);
+const MAX_HISTORY = Number(process.env.MAX_HISTORY || 800);
 const API_TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 8000);
 
 const API_MD5 = process.env.API_MD5 || 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau';
@@ -41,23 +43,29 @@ const API_TX = process.env.API_TX || 'https://taixiu.maksh3979madfw.com/api/luck
 const DB_DIR = process.env.DB_DIR || __dirname;
 if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 
-const DB_FILES = { md5: path.join(DB_DIR, 'db_md5.json'), taixiu: path.join(DB_DIR, 'db_taixiu.json') };
-const BACKUP_FILES = { md5: path.join(DB_DIR, 'backup_db_md5.json'), taixiu: path.join(DB_DIR, 'backup_db_taixiu.json') };
+const DB_FILES = {
+  md5: path.join(DB_DIR, 'db_md5.json'),
+  taixiu: path.join(DB_DIR, 'db_taixiu.json')
+};
+const BACKUP_FILES = {
+  md5: path.join(DB_DIR, 'db_md5.bak.json'),
+  taixiu: path.join(DB_DIR, 'db_taixiu.bak.json')
+};
 
-/* ===================== Utilities ===================== */
+/* ================= HELPERS ================= */
 function now() { return new Date().toISOString(); }
 function safeReadJson(file, fallback = null) {
   try { if (!fs.existsSync(file)) return fallback; return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return fallback; }
 }
 function safeWriteJson(file, obj) {
-  try { const tmp = file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8'); fs.renameSync(tmp, file); } catch (e) { console.error('Write error', file, e && e.message); }
+  try { const tmp = file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8'); fs.renameSync(tmp, file); } catch (e) { console.error('write error', file, e && e.message); }
 }
 function clamp(x, lo = 1e-6, hi = 1 - 1e-6) { return Math.min(Math.max(x, lo), hi); }
 function safeInt(x, def = NaN) { const n = Number(x); return Number.isFinite(n) ? n : def; }
 function labelFromCode(c) { if (c === 'T') return 'Tài'; if (c === 'X') return 'Xỉu'; return null; }
 function flip(c) { if (c === 'T') return 'X'; if (c === 'X') return 'T'; return null; }
 
-/* ===================== Persistence ===================== */
+/* ================= PERSISTENCE ================= */
 function defaultDB() {
   return {
     history: [],
@@ -65,18 +73,26 @@ function defaultDB() {
     stats: { total: 0, wins: 0, losses: 0 },
     meta: { events: [], ewma: 0.5 },
     patterns: { list: [], _map: {} },
-    settings: { antiBias: { maxConsecutivePredictions: 4, failureWindow: 6, failureThreshold: 3, flipOnFail: true, softenOnFail: false } }
+    settings: {
+      antiBias: {
+        maxConsecutivePredictions: 4,
+        failureWindow: 6,
+        failureThreshold: 3,
+        flipOnFail: true,
+        softenOnFail: false
+      }
+    }
   };
 }
 function loadDatabase(game) {
-  const file = DB_FILES[game];
-  const bak = BACKUP_FILES[game];
-  const base = safeReadJson(file);
+  const f = DB_FILES[game];
+  const b = BACKUP_FILES[game];
+  const base = safeReadJson(f);
   if (base) return base;
-  const restore = safeReadJson(bak);
+  const restore = safeReadJson(b);
   if (restore) return restore;
   const d = defaultDB();
-  safeWriteJson(file, d);
+  safeWriteJson(f, d);
   return d;
 }
 function saveDatabase(game, db) {
@@ -84,12 +100,11 @@ function saveDatabase(game, db) {
   safeWriteJson(BACKUP_FILES[game], db);
 }
 
-/* ===================== Upstream parsing ===================== */
+/* ================= UPSTREAM PARSE ================= */
 function normalizeUpstream(raw) {
   if (!raw) return [];
   if (Array.isArray(raw)) return raw.map(normalizeItem).filter(Boolean);
   if (typeof raw === 'object') return [normalizeItem(raw)].filter(Boolean);
-  // string fallback
   try {
     const parsed = JSON.parse(String(raw));
     if (Array.isArray(parsed)) return parsed.map(normalizeItem).filter(Boolean);
@@ -131,7 +146,7 @@ function itemResult(it) {
   return s >= 11 ? 'T' : 'X';
 }
 
-/* ===================== Thin helpers for engine compatibility ===================== */
+/* ================= SMALL HELPERS FOR ALGORITHM ================= */
 function rle(seq) {
   if (!seq || seq.length === 0) return [];
   const out = []; let cur = seq[0], len = 1;
@@ -145,17 +160,8 @@ function tailString(seq, n) { return lastN(seq, n).join(''); }
 function countInWindow(seq, n, ch) { return lastN(seq, n).filter(x => x === ch).length; }
 function ewma(prev, value, alpha = 0.18) { return alpha * value + (1 - alpha) * prev; }
 
-/* ===================== Algorithm Module (integrated) ===================== */
-/*
- * This section is the upgraded deterministic algorithm module.
- * It exports a single function predict(list, db) which returns:
- * { code, strength, tiLe, detail, regime, votes }
- *
- * We will call predict(list, db) inside processGame (replacing runEngine).
- */
-
+/* ================= DETERMINISTIC ALGORITHM MODULE ================= */
 const ALG = (function buildAlg() {
-  // Config local to alg
   const CONFIG = {
     EWMA_ALPHA: 0.18,
     PATTERN_MIN_SUPPORT: 2,
@@ -164,10 +170,10 @@ const ALG = (function buildAlg() {
     ANTI_BIAS: { maxConsecutivePredictions: 4, failureWindow: 6, failureThreshold: 3, flipOnFail: true, softenOnFail: false }
   };
 
-  // Detectors: array of functions(seq, sums, db) -> {name, code, strength, info} | null
   const DETECTORS = [];
 
-  DETECTORS.push(function detector_persist(seq) {
+  // Persist run detector
+  DETECTORS.push((seq) => {
     const r = rle(seq); if (!r.length) return null;
     const last = r[r.length - 1];
     if (last.len >= 3 && last.len <= 6) return { name: 'PERSIST_3_6', code: last.ch, strength: 0.68, info: { len: last.len } };
@@ -176,7 +182,8 @@ const ALG = (function buildAlg() {
     return null;
   });
 
-  DETECTORS.push(function detector_anti_persist(seq) {
+  // Anti-persist (flip)
+  DETECTORS.push((seq) => {
     const r = rle(seq); if (!r.length) return null;
     const last = r[r.length - 1];
     if (last.len >= 8 && last.len <= 12) return { name: 'ANTI_PERSIST_8_12', code: flip(last.ch), strength: 0.70, info: { len: last.len } };
@@ -184,36 +191,35 @@ const ALG = (function buildAlg() {
     return null;
   });
 
-  DETECTORS.push(function detector_alternate(seq) {
-    const n = Math.min(12, seq.length);
-    if (n < 6) return null;
-    const tail = lastN(seq, n);
-    let alt = true;
-    for (let i = 2; i < tail.length; i++) { if (tail[i] === tail[i - 2]) { alt = false; break; } }
+  // Alternation
+  DETECTORS.push((seq) => {
+    const n = Math.min(12, seq.length); if (n < 6) return null;
+    const tail = lastN(seq, n); let alt = true;
+    for (let i = 2; i < tail.length; i++) if (tail[i] === tail[i - 2]) { alt = false; break; }
     if (alt) return { name: 'ALTERNATE', code: flip(seq[seq.length - 1]), strength: 0.72, info: { n } };
     return null;
   });
 
-  DETECTORS.push(function detector_repeat_block(seq) {
+  // Repeat block
+  DETECTORS.push((seq) => {
     if (seq.length < 8) return null;
     for (let block = 2; block <= 5; block++) {
-      const tail = seq.slice(-block * 2);
-      if (tail.length < block * 2) continue;
+      const tail = seq.slice(-block * 2); if (tail.length < block * 2) continue;
       const a = tail.slice(0, block).join(''), b = tail.slice(block).join('');
       if (a === b) return { name: `REPEAT_${block}`, code: a[0], strength: 0.70, info: { block } };
     }
     return null;
   });
 
-  DETECTORS.push(function detector_ngram(seq) {
+  // N-gram
+  DETECTORS.push((seq) => {
     const maxN = Math.min(4, seq.length - 1);
     for (let n = maxN; n >= 1; n--) {
       const ctx = seq.slice(-n).join('');
       let t = 0, x = 0;
       for (let i = 0; i + n < seq.length; i++) {
         if (seq.slice(i, i + n).join('') === ctx) {
-          const nx = seq[i + n];
-          if (nx === 'T') t++; else x++;
+          const nx = seq[i + n]; if (nx === 'T') t++; else x++;
         }
       }
       const tot = t + x;
@@ -227,7 +233,8 @@ const ALG = (function buildAlg() {
     return null;
   });
 
-  DETECTORS.push(function detector_anti_ratio(seq) {
+  // Anti-ratio
+  DETECTORS.push((seq) => {
     const n = Math.min(20, seq.length);
     if (n < 8) return null;
     const tcount = countInWindow(seq, n, 'T');
@@ -237,7 +244,8 @@ const ALG = (function buildAlg() {
     return null;
   });
 
-  DETECTORS.push(function detector_motif(seq) {
+  // Motif
+  DETECTORS.push((seq) => {
     if (seq.length < 8) return null;
     const tail8 = tailString(seq, 8);
     if (tail8 === 'TTTXTTTX') return { name: 'TTTX_REPEAT', code: 'T', strength: 0.78 };
@@ -245,15 +253,15 @@ const ALG = (function buildAlg() {
     return null;
   });
 
-  DETECTORS.push(function detector_suffix(seq) {
+  // Suffix frequency
+  DETECTORS.push((seq) => {
     const kmax = Math.min(7, seq.length - 1);
     for (let k = kmax; k >= 1; k--) {
       const ctx = seq.slice(-k).join('');
       let t = 0, x = 0;
       for (let i = 0; i + k < seq.length; i++) {
         if (seq.slice(i, i + k).join('') === ctx) {
-          const nx = seq[i + k];
-          if (nx === 'T') t++; else x++;
+          const nx = seq[i + k]; if (nx === 'T') t++; else x++;
         }
       }
       if (t + x >= CONFIG.PATTERN_MIN_SUPPORT) {
@@ -265,7 +273,6 @@ const ALG = (function buildAlg() {
     return null;
   });
 
-  // markov builders inside alg
   function buildMarkov(list, maxOrder = CONFIG.MARKOV_ORDER) {
     const seq = list.map(itemResult).filter(Boolean);
     const models = {};
@@ -296,26 +303,25 @@ const ALG = (function buildAlg() {
 
   function combineDeterministic(votes, markovRes, ewmaProb, heurCode) {
     const weights = CONFIG.COMBINER_WEIGHTS;
-    let scoreT = 0, scoreX = 0;
-    const detail = [];
+    let scoreT = 0, scoreX = 0, detail = [];
     for (const v of votes) {
       const w = weights.pattern * (v.strength || 0.6);
       if (v.code === 'T') scoreT += w; else scoreX += w;
-      detail.push({ source: v.name, code: v.code, weight: w });
+      detail.push({ source: v.name, code: v.code, weight: +w.toFixed(3) });
     }
     if (markovRes && markovRes.code) {
       const w = weights.markov * (Math.abs(markovRes.pT - 0.5) * 2 || 0.5);
       if (markovRes.code === 'T') scoreT += w; else scoreX += w;
-      detail.push({ source: `MARKOV@${markovRes.order}`, code: markovRes.code, weight: w });
+      detail.push({ source: `MARKOV@${markovRes.order}`, code: markovRes.code, weight: +w.toFixed(3) });
     }
     const ewmaCode = ewmaProb >= 0.5 ? 'T' : 'X';
     const wE = weights.ewma * Math.abs(ewmaProb - 0.5) * 2;
     if (ewmaCode === 'T') scoreT += wE; else scoreX += wE;
-    detail.push({ source: 'EWMA', code: ewmaCode, weight: wE });
+    detail.push({ source: 'EWMA', code: ewmaCode, weight: +wE.toFixed(3) });
     if (heurCode) {
       const wH = weights.heuristics * 0.6;
       if (heurCode === 'T') scoreT += wH; else scoreX += wH;
-      detail.push({ source: 'HEUR', code: heurCode, weight: wH });
+      detail.push({ source: 'HEUR', code: heurCode, weight: +wH.toFixed(3) });
     }
     const pT = scoreT / Math.max(1, (scoreT + scoreX));
     const code = pT >= 0.5 ? 'T' : 'X';
@@ -362,23 +368,17 @@ const ALG = (function buildAlg() {
     return result;
   }
 
-  // exported predict function
   function predict(list, db) {
     const seq = list.map(itemResult).filter(Boolean);
-    const sums = list.map(it => safeInt(it.DiceSum, NaN)).filter(x => Number.isFinite(x));
     if (seq.length < 6) return { code: null, strength: 0, tiLe: 'CHỜ', detail: [], regime: 'COLD', votes: [] };
-
     db.meta = db.meta || {}; db.meta.ewma = db.meta.ewma === undefined ? 0.5 : db.meta.ewma;
     db.meta.ewma = ewma(db.meta.ewma, seq[seq.length - 1] === 'T' ? 1 : 0, CONFIG.EWMA_ALPHA);
-
     const votes = [];
-    for (const d of DETECTORS) {
-      try { const r = d(seq, sums, db); if (r && r.code) votes.push(r); } catch (e) {}
+    for (const det of DETECTORS) {
+      try { const r = det(seq); if (r && r.code) votes.push(r); } catch (e) {}
     }
-
     const markovModels = buildMarkov(list, CONFIG.MARKOV_ORDER);
     const markovRes = markovPredict(markovModels, seq);
-
     const heur = (() => {
       const window = Math.min(20, seq.length);
       const tcount = countInWindow(seq, window, 'T');
@@ -387,11 +387,9 @@ const ALG = (function buildAlg() {
       if (ratio <= 0.18) return 'T';
       return null;
     })();
-
     let comb = combineDeterministic(votes, markovRes, db.meta.ewma, heur);
     comb = antiBiasAndTrend(comb, seq, db);
-
-    const regime = (function() {
+    const regime = (function () {
       try {
         if (seq.length < 6) return 'COLD';
         const r = rle(seq); const last = r[r.length - 1];
@@ -405,7 +403,6 @@ const ALG = (function buildAlg() {
         return 'CHAOS';
       } catch (e) { return 'COLD'; }
     })();
-
     const out = {
       code: comb.code,
       strength: comb.strength,
@@ -414,44 +411,38 @@ const ALG = (function buildAlg() {
       regime,
       votes
     };
-
     try {
-      db.meta = db.meta || {};
-      db.meta.events = db.meta.events || [];
+      db.meta = db.meta || {}; db.meta.events = db.meta.events || [];
       db.meta.events.push({ at: now(), type: 'predict', code: out.code, tiLe: out.tiLe, regime });
-      if (db.meta.events.length > 300) db.meta.events.shift();
+      if (db.meta.events.length > 400) db.meta.events.shift();
     } catch (e) {}
-
     return out;
   }
 
   return { predict };
 })();
 
-/* ===================== Fetch with retry ===================== */
-const axiosInstance = axios.create({ timeout: API_TIMEOUT_MS });
+/* ================= FETCH WITH RETRY ================= */
+const axiosInst = axios.create({ timeout: API_TIMEOUT_MS });
 async function fetchWithRetry(url, attempts = 2) {
   for (let i = 0; i < attempts; i++) {
-    try { const r = await axiosInstance.get(url); return r; } catch (e) { if (i === attempts - 1) throw e; await new Promise(r => setTimeout(r, 200 + i * 150)); }
+    try { return await axiosInst.get(url); } catch (e) { if (i === attempts - 1) throw e; await new Promise(r => setTimeout(r, 200 + i * 200)); }
   }
 }
 
-/* ===================== Processing loop (uses ALG.predict) ===================== */
+/* ================= PROCESSING (uses ALG.predict) ================= */
 async function processGameTick(game) {
   try {
     const api = (game === 'md5') ? API_MD5 : API_TX;
     const resp = await fetchWithRetry(api, 2);
-    const rawList = Array.isArray(resp.data) ? resp.data : (resp.data && (resp.data.data || resp.data.list) ? (resp.data.data || resp.data.list) : []);
-    const list = normalizeUpstream(rawList);
+    const raw = Array.isArray(resp.data) ? resp.data : (resp.data && (resp.data.data || resp.data.list) ? (resp.data.data || resp.data.list) : resp.data);
+    const list = normalizeUpstream(raw);
     if (!list || !list.length) return;
-
-    // ensure chronological
+    // ensure ascending by SessionId
     list.sort((a, b) => (Number(a.SessionId || 0) - Number(b.SessionId || 0)));
-
     const latest = list[list.length - 1];
     const session = safeInt(latest.SessionId, null);
     if (!session) return;
-
     const db = loadDatabase(game);
     if (db.lastProcessedSession === session) return;
 
@@ -464,10 +455,8 @@ async function processGameTick(game) {
       lastRecorded.trangThai = !lastRecorded.DU_DOAN_CODE ? 'BỎ QUA' : (lastRecorded.DU_DOAN_CODE === actual ? 'ĐÚNG' : 'SAI');
       db.stats.total = (db.stats.total || 0) + 1;
       if (lastRecorded.trangThai === 'ĐÚNG') db.stats.wins = (db.stats.wins || 0) + 1; else db.stats.losses = (db.stats.losses || 0) + 1;
-      // update pattern map
       if (lastRecorded.patternName) {
-        db.patterns = db.patterns || {};
-        db.patterns._map = db.patterns._map || {};
+        db.patterns = db.patterns || {}; db.patterns._map = db.patterns._map || {};
         db.patterns._map[lastRecorded.patternName] = db.patterns._map[lastRecorded.patternName] || { correct: 0, total: 0 };
         db.patterns._map[lastRecorded.patternName].total++;
         if (lastRecorded.trangThai === 'ĐÚNG') db.patterns._map[lastRecorded.patternName].correct++;
@@ -475,10 +464,9 @@ async function processGameTick(game) {
       saveDatabase(game, db);
     }
 
-    // run upgraded algorithm
+    // call upgraded algorithm
     const algOut = ALG.predict(list, db);
 
-    // create deterministic entry
     const entry = {
       phien: session,
       xucXac: [safeInt(latest.FirstDice, 0), safeInt(latest.SecondDice, 0), safeInt(latest.ThirdDice, 0)],
@@ -498,65 +486,91 @@ async function processGameTick(game) {
     db.history.push(entry);
     if (db.history.length > MAX_HISTORY) db.history.splice(0, db.history.length - MAX_HISTORY);
     db.lastProcessedSession = session;
-    db.meta.events = db.meta.events || [];
-    db.meta.events.push({ at: now(), type: 'predict', session, code: algOut.code, tiLe: algOut.tiLe });
-    if (db.meta.events.length > 300) db.meta.events.shift();
-
+    db.meta.events = db.meta.events || []; db.meta.events.push({ at: now(), type: 'predict', session, code: algOut.code, tiLe: algOut.tiLe });
+    if (db.meta.events.length > 400) db.meta.events.shift();
     saveDatabase(game, db);
-    console.log(`[${game}] processed session ${session} => pred=${algOut.code} ${algOut.tiLe}`);
+
+    console.log(`[${game}] session ${session} -> pred=${algOut.code} ${algOut.tiLe}`);
   } catch (err) {
     console.error('processGameTick error', err && err.message ? err.message : err);
   }
 }
 
-/* Start polling with jitter */
+/* ================= POLLING ================= */
 function startPolling() {
-  async function tick() {
+  async function loop() {
     try {
       await Promise.all(['md5', 'taixiu'].map(g => processGameTick(g)));
-    } catch (e) { /* logged in processGameTick */ }
-    setTimeout(tick, POLL_INTERVAL_MS + Math.floor(Math.random() * 1000));
+    } catch (_) {}
+    setTimeout(loop, POLL_INTERVAL_MS + Math.floor(Math.random() * 1000));
   }
-  tick();
+  loop();
 }
 
-/* ===================== Routes (preserve original UX) ===================== */
-app.get('/', (req, res) => {
-  res.send(`<div style="font-family:system-ui,Arial;padding:14px">
-    <h2>HOANG VIP - Upgraded Algorithm</h2>
-    <ul>
-      <li><a href="/api/predict/md5">/api/predict/md5</a></li>
-      <li><a href="/api/predict/taixiu">/api/predict/taixiu</a></li>
-      <li><a href="/api/simple/md5">/api/simple/md5</a></li>
-      <li><a href="/api/history/md5?limit=50">/api/history/md5</a></li>
-    </ul></div>`);
+/* ================= ROUTES (preserve /md5 and /taixiu) ================= */
+
+// Keep /md5 and /taixiu as quick access to JSON prediction (calls processGameTick then returns simple JSON)
+app.get('/md5', async (req, res) => {
+  try { await processGameTick('md5'); } catch (_) {}
+  const db = loadDatabase('md5');
+  const latest = db.history.length ? db.history[db.history.length - 1] : null;
+  if (!latest) return res.status(204).send();
+  return res.json({
+    phien: latest.phien,
+    tong: latest.tong,
+    ketQua: latest.ketQua,
+    phienDuDoan: latest.phienDuDoan,
+    duDoan: latest.DU_DOAN,
+    tiLe: latest.TI_LE
+  });
+});
+app.get('/taixiu', async (req, res) => {
+  try { await processGameTick('taixiu'); } catch (_) {}
+  const db = loadDatabase('taixiu');
+  const latest = db.history.length ? db.history[db.history.length - 1] : null;
+  if (!latest) return res.status(204).send();
+  return res.json({
+    phien: latest.phien,
+    tong: latest.tong,
+    ketQua: latest.ketQua,
+    phienDuDoan: latest.phienDuDoan,
+    duDoan: latest.DU_DOAN,
+    tiLe: latest.TI_LE
+  });
 });
 
-// analyze arbitrary seq
+// Root / UI pointer
+app.get('/', (req, res) => {
+  res.send(`<div style="font-family:system-ui,Arial;padding:16px">
+    <h3>HOANG VIP - Deterministic Algorithm (Upgraded)</h3>
+    <ul>
+      <li><a href="/md5">/md5</a></li>
+      <li><a href="/taixiu">/taixiu</a></li>
+      <li><a href="/api/predict/md5">/api/predict/md5</a></li>
+      <li><a href="/api/history/md5?limit=50">/api/history/md5</a></li>
+    </ul>
+  </div>`);
+});
+
+// analyze arbitrary sequence
 app.get('/api/analyze', (req, res) => {
   const seqStr = String(req.query.seq || '').toUpperCase().replace(/[^TX]/g, '');
-  if (seqStr.length < 4) return res.status(400).json({ success: false, error: 'seq >= 4 ký tự' });
+  if (seqStr.length < 4) return res.status(400).json({ success: false, error: 'seq >= 4 required' });
   const seq = seqStr.split('');
-  const dummyList = seq.map((c, i) => ({ SessionId: i + 1, DiceSum: (c === 'T' ? 11 : 6), FirstDice: 1, SecondDice: 1, ThirdDice: (c === 'T' ? 9 : 4) }));
+  const dummy = seq.map((c, i) => ({ SessionId: i + 1, DiceSum: c === 'T' ? 11 : 6, FirstDice: 1, SecondDice: 1, ThirdDice: c === 'T' ? 9 : 4 }));
   const db = loadDatabase('md5');
-  const out = ALG.predict(dummyList, db);
+  const out = ALG.predict(dummy, db);
   res.json({ success: true, seq: seqStr, prediction: out });
 });
 
-// predict on demand
+// on-demand predict
 app.get('/api/predict/:game', async (req, res) => {
   const game = req.params.game;
-  if (game !== 'md5' && game !== 'taixiu') return res.status(400).json({ success: false, error: 'Game không hợp lệ' });
-  try {
-    await processGameTick(game);
-    const db = loadDatabase(game);
-    const latest = db.history.length ? db.history[db.history.length - 1] : null;
-    if (!latest) return res.status(204).json({ success: false, error: 'No history' });
-    return res.json({ success: true, game, entry: latest });
-  } catch (e) { return res.status(500).json({ success: false, error: e && e.message }); }
+  if (!['md5', 'taixiu'].includes(game)) return res.status(400).json({ success: false, error: 'Invalid game' });
+  try { await processGameTick(game); const db = loadDatabase(game); const latest = db.history.length ? db.history[db.history.length - 1] : null; if (!latest) return res.status(204).json({ success: false, error: 'No history' }); return res.json({ success: true, game, entry: latest }); } catch (e) { return res.status(500).json({ success: false, error: e && e.message }); }
 });
 
-// simple API
+// simple JSON API
 app.get('/api/simple/:game', async (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
@@ -564,8 +578,7 @@ app.get('/api/simple/:game', async (req, res) => {
   let latest = db.history.length ? db.history[db.history.length - 1] : null;
   if (!latest) {
     try { await processGameTick(game); } catch (_) {}
-    const db2 = loadDatabase(game);
-    latest = db2.history.length ? db2.history[db2.history.length - 1] : null;
+    const db2 = loadDatabase(game); latest = db2.history.length ? db2.history[db2.history.length - 1] : null;
     if (!latest) return res.status(204).send();
   }
   res.json({
@@ -578,16 +591,16 @@ app.get('/api/simple/:game', async (req, res) => {
   });
 });
 
-// history
+// history export
 app.get('/api/history/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
   const db = loadDatabase(game);
-  const limit = Math.max(1, Math.min(1000, Number(req.query.limit) || 200));
+  const limit = Math.max(1, Math.min(2000, Number(req.query.limit) || 200));
   res.json({ success: true, game, count: db.history.length, items: db.history.slice(-limit).reverse() });
 });
 
-// force tick
+// admin: force tick
 app.post('/admin/force-tick/:game', async (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ success: false, error: 'Invalid game' });
@@ -597,14 +610,14 @@ app.post('/admin/force-tick/:game', async (req, res) => {
 // admin stats
 app.get('/admin/stats/:game', (req, res) => {
   const game = req.params.game;
+  if (!DB_FILES[game]) return res.status(400).json({ success: false, error: 'Invalid game' });
   const db = loadDatabase(game);
-  const m = db.meta || {};
   const total = db.stats.total || 0;
   const wr = total ? ((db.stats.wins || 0) / total * 100).toFixed(2) + '%' : 'N/A';
-  res.json({ success: true, stats: db.stats, meta: m, winRate: wr });
+  res.json({ success: true, stats: db.stats, meta: db.meta || {}, winRate: wr });
 });
 
-// admin: set anti-bias
+// admin: configure anti-bias
 app.post('/admin/bias/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).json({ success: false, error: 'Invalid game' });
@@ -612,8 +625,8 @@ app.post('/admin/bias/:game', (req, res) => {
   const db = loadDatabase(game);
   db.settings = db.settings || {};
   db.settings.antiBias = db.settings.antiBias || {};
-  for (const k of ['maxConsecutivePredictions', 'failureWindow', 'failureThreshold', 'flipOnFail', 'softenOnFail']) {
-    if (body[k] !== undefined) db.settings.antiBias[k] = body[k];
+  for (const key of ['maxConsecutivePredictions', 'failureWindow', 'failureThreshold', 'flipOnFail', 'softenOnFail']) {
+    if (body[key] !== undefined) db.settings.antiBias[key] = body[key];
   }
   saveDatabase(game, db);
   res.json({ success: true, settings: db.settings.antiBias });
@@ -638,8 +651,8 @@ app.get('/admin/losing-chains/:game', (req, res) => {
   res.json({ success: true, chains });
 });
 
-/* ===================== Start server ===================== */
+/* ================= START ================= */
 app.listen(PORT, () => {
-  console.log(`Server upgraded and running on port ${PORT} — deterministic algorithm active`);
+  console.log(`Server running on port ${PORT} — deterministic algorithm active`);
   startPolling();
 });
