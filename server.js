@@ -1,113 +1,12 @@
-'use strict';
-const express = require('express');
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
-
-// 🔥 TỰ ĐỘNG DÒ TÌM FILE C++ (.node)
-let nativeCore;
-try {
-  nativeCore = require('./build/Release/predict.node');
-  console.log("✅ Đã load C++ core từ build/Release/");
-} catch (e) {
-  try {
-    nativeCore = require('./predict.node');
-    console.log("✅ Đã load C++ core từ thư mục gốc");
-  } catch (err) {
-    console.error("❌ LỖI: Không tìm thấy file C++ (predict.node).");
-    process.exit(1);
-  }
-}
-
-const app = express();
-app.use(express.json());
-
-// Cấu hình CORS tự viết (Không cần thư viện ngoài, không bao giờ lỗi)
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
-const PORT = process.env.PORT || 3000;
-const DB_DIR = '/tmp/hoang_vip_data';
-if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
-const DB_FILE = path.join(DB_DIR, 'db.json');
-
-const APIS = {
-  md5: 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau',
-  taixiu: 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoi rCau'
-};
-
-// Quản lý dữ liệu lịch sử
-function loadDB() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } 
-  catch (e) { return { history: [] }; }
-}
-function saveDB(data) {
-  try { fs.writeFileSync(DB_FILE, JSON.stringify(data)); } catch (e) {}
-}
-
-app.get('/api/predict/:game', async (req, res) => {
-  const game = req.params.game;
-  if (!APIS[game]) return res.status(400).json({ error: 'Bàn chơi không hợp lệ' });
-
-  try {
-    const r = await axios.get(APIS[game]);
-    let list = Array.isArray(r.data) ?.data : r.data.data;
-    if (!list || !list.length) return res.status(204).send();
-
-    // Đảm bảo dữ liệu xếp theo thứ tự cũ -> mới
-    if (Number(list[0].SessionId) > Number(list[list.length - 1].SessionId)) list.reverse();
-
-    const latest = list[list.length - 1];
-    const dice = [Number(latest.FirstDice)||0, Number(latest.SecondDice)||0, Number(latest.ThirdDice)||0];
-    const sum = dice.reduce((a, b) => a + b, 0);
-
-    // Chuyển lịch sử thành chuỗi T/X (Ví dụ: "TTXXTTX")
-    const seqStr = list.map(item => {
-      const s = (Number(item.FirstDice)||0) + (Number(item.SecondDice)||0) + (Number(item.ThirdDice)||0);
-      return s >= 11 ? 'T' : 'X';
-    }).join('');
-
-    // 🔥 GỌI C++ CORE XỬ LÝ TÍNH TOÁN
-    const prediction = nativeCore.predict(seqStr);
-    
-    const result = {
-      success: true,
-      game: game.toUpperCase(),
-      phien: Number(latest.SessionId),
-      xucXac: dice,
-      tong: sum,
-      ketQua: sum >= 11 ? 'Tài' : 'Xỉu',
-      duDoan: prediction.code === 'T' ? 'Tài' : (prediction.code === 'X' ? 'Xỉu' : 'CHỜ'),
-      tiLe: prediction.confidence > 0 ? (prediction.confidence * 100).toFixed(1) + '%' : '0%',
-      thoiGian: new Date().toISOString()
-    };
-
-    // Lưu lịch sử
-    const db = loadDB();
-    db.history.push({
-      phien: result.phien,
-      duDoan: prediction.code,
-      tiLe: result.tiLe,
-      thoiGian: result.thoiGian
-    });
-    if (db.history.length > 200) db.history.shift();
-    saveDB(db);
-
-    res.json(result);
-  } catch (e) {
-    console.error("Lỗi Predict:", e.message);
-    res.status(500).json({ error: 'Lỗi server' });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`========================================`);
-  console.log(`🚀 HOANG VIP v16 (C++ Core) Running`);
-  console.log(`Cổng: ${PORT}`);
-  console.log(`========================================`);
-});
+const _0x1f2e=['\x65\x78\x70\x72\x65\x73\x73','\x61\x78\x69\x6f\x73','\x68\x74\x74\x70\x73\x3a\x2f\x2f\x74\x61\x69\x78\x69\x75\x6d\x64\x35\x2e\x6d\x61\x6b\x73\x68\x33\x39\x37\x39\x6d\x61\x64\x66\x77\x2e\x63\x6f\x6d\x2f\x61\x70\x69\x2f\x6d\x64\x35\x6c\x75\x63\x6b\x79\x64\x69\x63\x65\x2f\x47\x65\x74\x53\x6f\x69\x43\x61\x75','\x68\x74\x74\x70\x73\x3a\x2f\x2f\x74\x61\x69\x78\x69\x75\x2e\x6d\x61\x6b\x73\x68\x33\x39\x37\x39\x6d\x61\x64\x66\x77\x2e\x63\x6f\x6d\x2f\x61\x70\x69\x2f\x6c\x75\x63\x6b\x79\x64\x69\x63\x65\x2f\x47\x65\x74\x53\x6f\x69\x43\x61\x75','\x54','\x58','\x4e','\x6c\x65\x6e\x67\x74\x68','\x70\x75\x73\x68','\x6d\x61\x70','\x46\x69\x72\x73\x74\x44\x69\x63\x65','\x53\x65\x63\x6f\x6e\x64\x44\x69\x63\x65','\x54\x68\x69\x72\x64\x44\x69\x63\x65','\x53\x65\x73\x73\x69\x6f\x6e\x49\x64','\x64\x61\x74\x61','\x6a\x6f\x69\x6e','\x73\x70\x6c\x69\x74','\x72\x65\x76\x65\x72\x73\x65','\x73\x6c\x69\x63\x65','\x6a\x73\x6f\x6e','\x73\x74\x61\x74\x75\x73','\x70\x61\x72\x61\x6d\x73','\x67\x65\x74','\x75\x73\x65','\x68\x65\x61\x64\x65\x72','\x6d\x65\x74\x68\x6f\x64','\x4f\x50\x54\x49\x4f\x4e\x53','\x73\x65\x6e\x64\x53\x74\x61\x74\x75\x73','\x50\x4f\x52\x54','\x65\x6e\x76','\x6c\x69\x73\x74\x65\x6e','\x6c\x6f\x67','\x52\x75\x6e\x6e\x69\x6e\x67\x20\x48\x4f\x41\x4e\x47\x20\x56\x49\x50\x20\x76\x32\x30'];
+const _0x2b3c=function(_0x3c4d){return _0x1f2e[_0x3c4d-0x0];};
+const _0x4d5e=require(_0x2b3c(0x0));const _0x5f6a=require(_0x2b3c(0x1));const _0x7b8c=_0x4d5e();_0x7b8c[_0x2b3c(0x14)]((_0x9c0d,_0xe1f2,_0x2b3c)=>{_0x9c0d[_0x2b3c(0x15)]('\x41\x63\x63\x65\x73\x73\x2d\x43\x6f\x6e\x74\x72\x6f\x6c\x2d\x41\x6c\x6c\x6f\x77\x2d\x4f\x72\x69\x67\x69\x6e','\x2a');if(_0x9c0d[_0x2b3c(0x16)]===_0x2b3c(0x17))return _0xe1f2[_0x2b3c(0x18)](0xc8);_0x2b3c();});
+const _0x6f7a={'\x6d\x64\x35':_0x2b3c(0x2),'\x74\x61\x69\x78\x69\x75':_0x2b3c(0x3)};
+function _0x8e9f(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0x4)return{c:'\x4e',f:0x0};const _0x5d6e=_0x1f2e[_0x3b4c-0x1];let _0x7f8a=0x1;for(let _0x8a9b=_0x3b4c-0x2;_0x8a9b>=0x0;_0x8a9b--){if(_0x1f2e[_0x8a9b]===_0x5d6e)_0x7f8a++;else break;}if(_0x7f8a>=0x4&&_0x7f8a<=0xe)return{c:_0x5d6e,f:0.75+Math.min((_0x7f8a-0x4)*0.01,0.10)};if(_0x7f8a>=0xf)return{c:_0x5d6e==='\x54'?'\x58':'\x54',f:0.65};return{c:'\x4e',f:0x0};}
+function _0xa1b2(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0x4)return{c:'\x4e',f:0x0};const _0x5d6e=_0x1f2e[_0x3b4c-0x1];let _0x7f8a=0x0;for(let _0x8a9b=_0x3b4c-0x1;_0x8a9b>=0x1;_0x8a9b--){if(_0x1f2e[_0x8a9b]!==_0x1f2e[_0x8a9b-0x1])_0x7f8a++;else break;}if(_0x7f8a>=0x5)return{c:_0x5d6e==='\x54'?'\x58':'\x54',f:Math.min(0.62+(_0x7f8a-0x5)*0.04,0.80)};const _0x9b0c=_0x1f2e[_0x2b3c(0x11)](-0x8)[_0x2b3c(0xf)]('');if(_0x9b0c==='\x54\x54\x58\x58\x54\x54\x58\x58')return{c:'\x54',f:0.75};if(_0x9b0c==='\x58\x58\x54\x54\x58\x58\x54\x54')return{c:'\x58',f:0.75};return{c:'\x4e',f:0x0};}
+function _0xb3c4(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0x6)return{c:'\x4e',f:0x0};const _0x5d6e=_0x1f2e[_0x3b4c-0x1];if(_0x5d6e==='\x54'&&_0x1f2e[_0x3b4c-0x2]==='\x58'&&_0x1f2e[_0x3b4c-0x3]==='\x58'&&_0x1f2e[_0x3b4c-0x4]==='\x58')return{c:'\x54',f:0.68};let _0x7f8a=0x1;for(let _0x8a9b=_0x3b4c-0x2;_0x8a9b>=0x0;_0x8a9b--){if(_0x1f2e[_0x8a9b]===_0x5d6e)_0x7f8a++;else break;}if(_0x5d6e==='\x58'&&_0x7f8a>=0x3&&_0x7f8a<=0x5)return{c:'\x54',f:0.58+Math.min((_0x7f8a-0x3)*0.03,0.08)};return{c:'\x4e',f:0x0};}
+function _0xc5d6(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0x6)return{c:'\x4e',f:0x0};const _0x5d6e=_0x1f2e[_0x3b4c-0x1];if(_0x5d6e==='\x58'&&_0x1f2e[_0x3b4c-0x2]==='\x54'&&_0x1f2e[_0x3b4c-0x3]==='\x54'&&_0x1f2e[_0x3b4c-0x4]==='\x54')return{c:'\x58',f:0.68};let _0x7f8a=0x1;for(let _0x8a9b=_0x3b4c-0x2;_0x8a9b>=0x0;_0x8a9b--){if(_0x1f2e[_0x8a9b]===_0x5d6e)_0x7f8a++;else break;}if(_0x5d6e==='\x54'&&_0x7f8a>=0x3&&_0x7f8a<=0x5)return{c:'\x58',f:0.58+Math.min((_0x7f8a-0x3)*0.03,0.08)};return{c:'\x4e',f:0x0};}
+function _0xd6e7(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0xa)return{c:'\x4e',f:0x0};for(let _0x5d6e=0x5;_0x5d6e>=0x1;_0x5d6e--){if(_0x3b4c<=_0x5d6e)continue;const _0x7f8a=_0x1f2e[_0x2b3c(0x11)](-_0x5d6e)[_0x2b3c(0xf)]('');let _0x8a9b=0x0,_0x9b0c=0x0;for(let _0xa1b2=0x0;_0xa1b2<=_0x3b4c-_0x5d6e-0x1;_0xa1b2++){let _0xb2c3=!0x0;for(let _0xc3d4=0x0;_0xc3d4<_0x5d6e;_0xc3d4++){if(_0x1f2e[_0xa1b2+_0xc3d4]!==_0x7f8a[_0xc3d4]){_0xb2c3=!0x1;break;}}if(_0xb2c3){if(_0x1f2e[_0xa1b2+_0x5d6e]==='\x54')_0x8a9b++;else _0x9b0c++;}}const _0xd4e5=_0x8a9b+_0x9b0c;if(_0xd4e5<0x3)continue;const _0xc5d6=(_0x8a9b+0x1.0)/(_0xd4e5+0x2.0);const _0xe7f8=Math.abs(_0xc5d6-0.5)*0x2;if(_0xe7f8<0.15)continue;return{c:_0xc5d6>=0.5?'\x54':'\x58',f:Math.min(0.5+_0xe7f8*0.30,0.75)};}return{c:'\x4e',f:0x0};}
+function _0xe7f8(_0x1f2e){const _0x3b4c=[_0x8e9f(_0x1f2e),_0xa1b2(_0x1f2e),_0xb3c4(_0x1f2e),_0xc5d6(_0x1f2e),_0xd6e7(_0x1f2e)];let _0x5d6e=0x0,_0x7f8a=0x0;for(const _0x8a9b of _0x3b4c){if(_0x8a9b.c==='\x4e')continue;if(_0x8a9b.c==='\x54')_0x5d6e+=_0x8a9b.f;else _0x7f8a+=_0x8a9b.f;}const _0x9b0c=_0x5d6e+_0x7f8a;if(_0x9b0c<0.1)return{code:'\x4e\x4f\x4e\x45',confidence:0x0};const _0xa1b2=_0x5d6e/_0x9b0c;const _0xb2c3=Math.abs(_0xa1b2-0.5)*0x2;if(_0xb2c3<0.10)return{code:'\x4e\x4f\x4e\x45',confidence:0x0};return{code:_0xa1b2>=0.5?'\x54':'\x58',confidence:Math.min(0.55+_0xb2c3*0.30,0.82)};}
+_0x7b8c[_0x2b3c(0x13)]('\x2f\x61\x70\x69\x2f\x70\x72\x65\x64\x69\x63\x74\x2f\x3a\x67\x61\x6d\x65',async(_0x1f2e,_0x3b4c)=>{const _0x5d6e=_0x1f2e[_0x2b3c(0x12)]['game'];if(!_0x6f7a[_0x5d6e])return _0x3b4c[_0x2b3c(0x10)](0x190)[_0x2b3c(0xe)]({error:'\x49\x6e\x76\x61\x6c\x69\x64'});try{const _0x7f8a=await _0x5f6a[_0x2b3c(0x13)](_0x6f7a[_0x5d6e]);let _0x8a9b=Array.isArray(_0x7f8a[_0x2b3c(0xc)])?_0x7f8a[_0x2b3c(0xc)]:_0x7f8a[_0x2b3c(0xc)]['data'];if(!_0x8a9b||!_0x8a9b[_0x2b3c(0x6)])return _0x3b4c[_0x2b3c(0x10)](0xcc)['send']();if(Number(_0x8a9b[0x0]['SessionId'])>Number(_0x8a9b[_0x8a9b[_0x2b3c(0x6)]-0x1]['SessionId']))_0x8a9b[_0x2b3c(0x9)]();const _0x9b0c=_0x8a9b[_0x8a9b[_0x2b3c(0x6)]-0x1];const _0xa1b2=[Number(_0x9b0c[_0x2b3c(0x8)])||0x0,Number(_0x9b0c[_0x2b3c(0x9)])||0x0,Number(_0x9b0c[_0x2b3c(0xa)])||0x0];const _0xb2c3=_0xa1b2['reduce']((_0xc3d4,_0xd4e5)=>_0xc3d4+_0xd4e5,0x0);const _0xc5d6=_0x8a9b[_0x2b3c(0x7)]((_0xd6e7)=>{const _0xe7f8=(Number(_0xd6e7['FirstDice'])||0x0)+(Number(_0xd6e7['SecondDice'])||0x0)+(Number(_0xd6e7['ThirdDice'])||0x0);return _0xe7f8>=0xb?'\x54':'\x58';})[_0x2b3c(0xf)]('');const _0xf8a9=_0xe7f8(_0xc5d6);_0x3b4c[_0x2b3c(0xe)]({success:true,phien:Number(_0x9b0c[_0x2b3c(0xb)]),xucXac:_0xa1b2,tong:_0xb2c3,duDoan:_0xf8a9.code==='\x54'?'Tài':(_0xf8a9.code==='\x58'?'Xỉu':'CHỜ'),tiLe:_0xf8a9.confidence>0x0?(_0xf8a9.confidence*0x64).toFixed(0x1)+'%':'0%'});}catch(_0x1a2b3c){_0x3b4c[_0x2b3c(0x10)](0x1f4)[_0x2b3c(0xe)]({error:'\x45\x72\x72\x6f\x72'});}});
+_0x7b8c[_0x2b3c(0x1a)](process[_0x2b3c(0x19)][_0x2b3c(0x18)]||0xbb8,()=>console[_0x2b3c(0x1b)](_0x2b3c(0x1c)));
