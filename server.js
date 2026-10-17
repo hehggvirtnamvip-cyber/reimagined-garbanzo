@@ -1,8 +1,9 @@
 'use strict';
 
 // language: JavaScript (Node.js >= 18), file: server.js
-// *24 detectors + composite grammar parser + regime detection + adaptive ensemble*
-// *patterns target: bệt dài (5-10), block-3/4, composite 2-block, palindrome, mixed*
+// *regime-switch engine: 6 regime detectors (PERSIST / ANTI-PERSIST / ALTERNATE / BLOCK / CHAOS / TREND)
+// *bayesian-weighted ensemble with online learning per regime
+// *target: chuỗi thực ảnh (đảo liên tục) + bệt dài + block + composite*
 
 const express = require('express');
 const axios = require('axios');
@@ -35,7 +36,17 @@ const safeInt = (x, def = 0) => { const n = parseInt(x, 10); return Number.isFin
 function readDB(g) {
     const p = path.join(DB_DIR, `db_${g}.json`);
     try { if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) {}
-    return { history: [], lastProcessedSession: null, patternStats: {}, meta: { totalPred: 0, totalWin: 0, recent50: [] } };
+    return {
+        history: [],
+        lastProcessedSession: null,
+        // Bayesian priors: regime -> { correct, total }
+        regimeStats: {},
+        // Pattern-level tracking
+        patternStats: {},
+        // Sliding window memory of last 200 predictions
+        mem: [],
+        meta: { totalPred: 0, totalWin: 0, recent50: [] }
+    };
 }
 function saveDB(g, db) {
     const p = path.join(DB_DIR, `db_${g}.json`);
@@ -53,7 +64,7 @@ function getResult(item) {
 }
 
 // ============================================================
-// RUN-LENGTH HELPERS
+// RUN-LENGTH + STATISTICAL HELPERS
 // ============================================================
 function rle(seq) {
     const out = []; let cur = seq[0], len = 1;
@@ -65,520 +76,337 @@ function rle(seq) {
     return out;
 }
 
-function blockSizes(seq) { return rle(seq).map(b => b.len); }
+// entropy của chuỗi nhị phân
+function binaryEntropy(arr) {
+    if (!arr.length) return 0;
+    const p = arr.filter(x => x === 'T').length / arr.length;
+    if (p === 0 || p === 1) return 0;
+    return -(p * Math.log2(p) + (1 - p) * Math.log2(1 - p));
+}
+
+// run lengths distribution — mean/std của block
+function blockStats(seq) {
+    const r = rle(seq);
+    if (r.length < 2) return { mean: 1, std: 0, max: 1, count: r.length };
+    const lens = r.map(b => b.len);
+    const mean = lens.reduce((a, b) => a + b, 0) / lens.length;
+    const variance = lens.reduce((a, b) => a + (b - mean) ** 2, 0) / lens.length;
+    return { mean, std: Math.sqrt(variance), max: Math.max(...lens), count: lens.length };
+}
 
 // ============================================================
-// DETECTORS — 24 patterns
-// Each returns { name, code, weight, tier } or null
-// tier: 1=strong, 2=medium, 3=weak
+// REGIME DETECTION — 6 regimes
+// Mỗi regime quyết định CÁCH predict, không phải predict cái gì
 // ============================================================
+function detectRegime(seq) {
+    if (!seq || seq.length < 8) return { name: 'COLD', confidence: 0.5 };
+    const n = seq.length;
+    const win = seq.slice(-Math.min(30, n));
+    const bs = blockStats(win);
+    const ent = binaryEntropy(win);
+    const r = rle(win);
 
-const detectors = {
+    // 1. PERSIST — bệt dài đang chạy
+    const last = win[win.length - 1];
+    let streak = 1;
+    for (let i = win.length - 2; i >= 0; i--) { if (win[i] === last) streak++; else break; }
+    if (streak >= 4) {
+        return { name: 'PERSIST', confidence: Math.min(0.95, 0.6 + (streak - 3) * 0.08), streak, last };
+    }
 
-    // ---------- TIER 1: STRONG STRUCTURAL ----------
+    // 2. ANTI-PERSIST — đảo liên tục sau 1-3 phiên (như ảnh)
+    //    Metric: mean block length thấp + entropy trung bình
+    if (bs.mean <= 2.2 && r.length >= 6) {
+        // check ratio of 1-length blocks
+        const shortBlocks = r.filter(b => b.len === 1).length;
+        const ratio = shortBlocks / r.length;
+        if (ratio >= 0.45) {
+            return { name: 'ANTI-PERSIST', confidence: Math.min(0.90, 0.5 + ratio * 0.5), meanBlk: bs.mean, shortRatio: ratio };
+        }
+    }
 
-    // 1. Bệt — streak đang chạy
-    bet(seq) {
-        const n = seq.length; if (n < 3) return null;
-        const last = seq[n - 1];
-        let len = 1;
-        for (let i = n - 2; i >= 0; i--) { if (seq[i] === last) len++; else break; }
-        if (len < 3) return null;
-        // Bệt 3-4: theo, 5-6: theo mạnh, 7-8: theo nhưng cảnh báo, 9+: gãy sớm
-        if (len <= 4) return { name: `BỆT-${len}-THEO`, code: last, weight: 1.1 + (len - 3) * 0.20, tier: 1 };
-        if (len <= 6) return { name: `BỆT-${len}-MẠNH`, code: last, weight: 1.6 + (len - 5) * 0.15, tier: 1 };
-        if (len <= 8) return { name: `BỆT-${len}-RỦI`, code: last, weight: 1.2, tier: 2 };
-        return { name: `BỆT-GÃY-${len}`, code: flip(last), weight: 1.7, tier: 1 };
-    },
+    // 3. ALTERNATE — 1-1 thuần (T X T X T X)
+    let altRun = 0;
+    for (let i = win.length - 1; i >= 1; i--) { if (win[i] !== win[i - 1]) altRun++; else break; }
+    if (altRun >= 4) {
+        return { name: 'ALTERNATE', confidence: Math.min(0.92, 0.5 + altRun * 0.06), altRun };
+    }
 
-    // 2. Bệt dài 9+ → gãy (mean reversion mạnh)
-    longStreak(seq) {
-        const n = seq.length; if (n < 9) return null;
-        const last = seq[n - 1];
-        let len = 1;
-        for (let i = n - 2; i >= 0; i--) { if (seq[i] === last) len++; else break; }
-        if (len < 9) return null;
-        return { name: `LONG-STREAK-${len}`, code: flip(last), weight: 1.9, tier: 1 };
-    },
+    // 4. BLOCK — block đều đặn (3-3, 4-4, 2-2)
+    if (r.length >= 3) {
+        const last3 = r.slice(-3).map(b => b.len);
+        if (last3[0] === last3[1] && last3[1] === last3[2]) {
+            return { name: 'BLOCK', confidence: 0.80, blockSize: last3[0], color: r[r.length - 1].ch };
+        }
+    }
 
-    // 3. Block-3 pattern (TTT XXX TTT XXX)
-    block3(seq) {
-        const n = seq.length; if (n < 6) return null;
+    // 5. TREND — phân phối lệch mạnh về 1 phía
+    const tRatio = win.filter(x => x === 'T').length / win.length;
+    if (tRatio >= 0.65 || tRatio <= 0.35) {
+        return { name: 'TREND', confidence: 0.65, tRatio };
+    }
+
+    // 6. CHAOS — không có pattern rõ
+    return { name: 'CHAOS', confidence: 0.40, entropy: ent, meanBlk: bs.mean };
+}
+
+// ============================================================
+// PREDICTOR PER REGIME
+// Mỗi regime có chiến thuật dự đoán riêng
+// ============================================================
+function predictByRegime(regime, seq) {
+    const n = seq.length;
+    const last = seq[n - 1];
+
+    switch (regime.name) {
+        case 'PERSIST': {
+            // Bệt đang chạy: theo nếu <= 6, gãy nếu 7-9, chắc gãy nếu >= 10
+            const s = regime.streak;
+            if (s <= 6) return { code: last, weight: 1.5 + (s - 4) * 0.1, name: `PERSIST-THEO-${s}` };
+            if (s <= 9) return { code: last, weight: 1.0, name: `PERSIST-RỦI-${s}` };
+            return { code: flip(last), weight: 1.7, name: `PERSIST-GÃY-${s}` };
+        }
+        case 'ANTI-PERSIST': {
+            // Đảo liên tục: 50% đảo tiếp, nhưng block 2-3 xen kẽ
+            // Dùng transition matrix window cuối để xác định
+            const win = seq.slice(-15);
+            let tt = 0, tx = 0, xt = 0, xx = 0;
+            for (let i = 1; i < win.length; i++) {
+                const a = win[i - 1], b = win[i];
+                if (a === 'T' && b === 'T') tt++;
+                else if (a === 'T' && b === 'X') tx++;
+                else if (a === 'X' && b === 'T') xt++;
+                else xx++;
+            }
+            // P(next | last)
+            let pSame, pFlip;
+            if (last === 'T') { pSame = tt / (tt + tx || 1); pFlip = 1 - pSame; }
+            else { pSame = xx / (xx + xt || 1); pFlip = 1 - pSame; }
+            // Anti-persist → ưu tiên đảo nếu recent cho thấy flip rate cao
+            const code = pFlip > pSame ? flip(last) : last;
+            return { code, weight: 1.2 + Math.abs(pFlip - pSame) * 0.8, name: `ANTIPERSIST-${code === last ? 'THEO' : 'ĐẢO'}` };
+        }
+        case 'ALTERNATE': {
+            // 1-1 đảo → flip
+            return { code: flip(last), weight: 1.4, name: `ALT-${regime.altRun}` };
+        }
+        case 'BLOCK': {
+            // Block đều: nếu vừa hết block → flip; đang giữa block → theo
+            const r = rle(seq);
+            const lastBlk = r[r.length - 1];
+            if (lastBlk.len < regime.blockSize) {
+                // đang giữa block → theo
+                return { code: last, weight: 1.3, name: `BLOCK-THEO-${regime.blockSize}` };
+            }
+            // vừa hết block → flip
+            return { code: flip(last), weight: 1.4, name: `BLOCK-FLIP-${regime.blockSize}` };
+        }
+        case 'TREND': {
+            // Trend: theo trend
+            const code = regime.tRatio >= 0.65 ? 'T' : 'X';
+            return { code, weight: 1.0, name: `TREND-${code}` };
+        }
+        case 'CHAOS':
+        default: {
+            // Không có pattern → dùng markov bậc 3-4 làm fallback
+            for (const order of [3, 4]) {
+                if (seq.length < order + 5) continue;
+                const key = seq.slice(-order).join('');
+                let t = 0, x = 0;
+                for (let i = order; i < seq.length; i++) {
+                    if (seq.slice(i - order, i).join('') === key) {
+                        if (seq[i] === 'T') t++; else x++;
+                    }
+                }
+                if (t + x >= 3) {
+                    const code = t > x ? 'T' : 'X';
+                    const conf = Math.max(t, x) / (t + x);
+                    return { code, weight: 0.7 + conf * 0.5, name: `CHAOS-MARKOV-${order}` };
+                }
+            }
+            // cuối cùng: anti-ratio
+            const tRatio = seq.slice(-15).filter(x => x === 'T').length / Math.min(15, seq.length);
+            const code = tRatio > 0.5 ? 'X' : 'T';
+            return { code, weight: 0.6, name: `CHAOS-ANTI-RATIO` };
+        }
+    }
+}
+
+// ============================================================
+// STRUCTURAL DETECTORS — vẫn dùng để boost khi regime không đủ
+// (giữ các pattern mạnh từ v3)
+// ============================================================
+function structuralDetectors(seq, sums) {
+    const votes = [];
+    const n = seq.length;
+
+    // Block-3-repeat
+    if (n >= 8) {
         const r = rle(seq);
-        if (r.length < 2) return null;
-        const last = r[r.length - 1];
-        const prev = r[r.length - 2];
-        if (last.len !== 3 || prev.len !== 3) return null;
-        // TTT XXX → next = T (repeating block-3)
         if (r.length >= 4) {
-            const p2 = r[r.length - 3], p3 = r[r.length - 4];
-            if (p2.len === 3 && p3.len === 3) {
-                // full 3-3-3-3 detected, next should flip last
-                return { name: 'BLOCK-3-REPEAT', code: flip(last.ch), weight: 1.5, tier: 1 };
+            const last4 = r.slice(-4);
+            if (last4.every(b => b.len === 3)) {
+                votes.push({ name: `BLK3-CYCLE`, code: flip(last4[3].ch), weight: 1.5 });
             }
         }
-        return { name: 'BLOCK-3', code: flip(last.ch), weight: 1.2, tier: 2 };
-    },
+    }
 
-    // 4. Block-4 pattern
-    block4(seq) {
-        const n = seq.length; if (n < 8) return null;
+    // Composite grammar
+    if (n >= 8) {
         const r = rle(seq);
-        if (r.length < 2) return null;
-        const last = r[r.length - 1];
-        const prev = r[r.length - 2];
-        if (last.len !== 4 || prev.len !== 4) return null;
-        if (r.length >= 4) {
-            const p2 = r[r.length - 3], p3 = r[r.length - 4];
-            if (p2.len === 4 && p3.len === 4) {
-                return { name: 'BLOCK-4-REPEAT', code: flip(last.ch), weight: 1.55, tier: 1 };
-            }
-        }
-        return { name: 'BLOCK-4', code: flip(last.ch), weight: 1.15, tier: 2 };
-    },
-
-    // 5. Block-2 (2-2 repeating)
-    block2(seq) {
-        const n = seq.length; if (n < 8) return null;
-        const r = rle(seq);
-        if (r.length < 4) return null;
-        const last4 = r.slice(-4);
-        if (last4.every(b => b.len === 2)) {
-            // 2-2-2-2 → next continues pattern
-            return { name: 'BLOCK-2-REPEAT', code: flip(last4[3].ch), weight: 1.35, tier: 1 };
-        }
-        return null;
-    },
-
-    // ---------- TIER 1: COMPOSITE GRAMMAR ----------
-
-    // 6. Composite: detect repeated block-group, predict next block
-    // Handles cầu như "TTTXTTTX" (block TTT-X repeated) or "TTTXXTTTXX" 
-    compositeGrammar(seq) {
-        const n = seq.length; if (n < 8) return null;
-        const r = rle(seq);
-        if (r.length < 4) return null;
-
-        // Thử grammar độ dài k block (k = 2, 3, 4): block-groups lặp lại
-        for (const k of [2, 3, 4]) {
+        for (const k of [2, 3]) {
             if (r.length < k * 2) continue;
             const grpA = r.slice(-k * 2, -k);
             const grpB = r.slice(-k);
-            // cùng chữ + cùng độ dài
             let match = true;
             for (let i = 0; i < k; i++) {
                 if (grpA[i].ch !== grpB[i].ch || grpA[i].len !== grpB[i].len) { match = false; break; }
             }
-            if (!match) continue;
-            // Lặp được → predict block kế = grpA[0]? Không. Nếu chu kỳ 2*k block thì block kế = grpA[0]
-            // nhưng thực tế nếu vừa hết grpB (=grpA), cycle tiếp = grpA[0]
-            const nextCh = grpA[0].ch;
-            return { name: `COMPOSITE-${k}`, code: nextCh, weight: 1.4 + k * 0.05, tier: 1 };
-        }
-
-        // Thử grammar "abab" (2 block repeating) — 4 block cuối có dạng A B A B
-        if (r.length >= 4) {
-            const [a, b, c, d] = r.slice(-4);
-            if (a.ch === c.ch && a.len === c.len && b.ch === d.ch && b.len === d.len) {
-                // next = a
-                return { name: 'ABAB', code: a.ch, weight: 1.35, tier: 1 };
+            if (match) {
+                votes.push({ name: `COMPOSITE-${k}`, code: grpA[0].ch, weight: 1.4 + k * 0.1 });
+                break;
             }
         }
-        return null;
-    },
+    }
 
-    // 7. Palindrome block — đối xứng block size
-    palindromeBlock(seq) {
-        const n = seq.length; if (n < 8) return null;
-        const sizes = blockSizes(seq);
-        if (sizes.length < 4) return null;
-        const last4 = sizes.slice(-4);
-        const [a, b, c, d] = last4;
-        // 1-3-3-1, 2-3-3-2, 1-2-2-1, 3-1-1-3, ...
-        if (a === d && b === c && a !== b) {
-            return { name: `PALIN-BLK-${a}-${b}`, code: flip(seq[n - 1]), weight: 1.25, tier: 2 };
-        }
-        return null;
-    },
+    // TTTX-repeat
+    const s = seq.join('');
+    if (s.endsWith('TTTXTTTX') || s.endsWith('TTTXTTTXTTT')) votes.push({ name: 'TTTX-REPEAT', code: 'T', weight: 1.55 });
+    if (s.endsWith('XXXTXXXT') || s.endsWith('XXXTXXXTXXX')) votes.push({ name: 'XXXT-REPEAT', code: 'X', weight: 1.55 });
 
-    // 8. Mixed TTTXTTTX — pattern TTT-X-TTT-X (1-3-1-3 alternating)
-    tttxRepeating(seq) {
-        const n = seq.length; if (n < 8) return null;
-        const s = seq.join('');
-        // TTT-X-TTT-X = 8 chars, hoặc X-TTT-X-TTT
-        const pats = [
-            ['TTTXTTTX', 'T'], ['XXXTXXXT', 'X'],
-            ['XTTTXTTT', 'X'], ['TXXXTXXX', 'T']
-        ];
-        for (const [tail, code] of pats) {
-            if (s.endsWith(tail)) return { name: 'TTTX-REPEAT', code, weight: 1.55, tier: 1 };
-        }
-        return null;
-    },
-
-    // 9. TTTTXTTTXTT — 4T-X-3T-X-2T descending
-    descendingBlocks(seq) {
-        const n = seq.length; if (n < 10) return null;
-        const sizes = blockSizes(seq);
-        if (sizes.length < 4) return null;
-        const last4 = sizes.slice(-4);
-        // 4-3-3-2: nếu giảm dần, predict block nhỏ hơn
-        const [a, b, c, d] = last4;
-        if (a >= b && b >= c && c >= d && a > d + 1) {
-            return { name: `DESC-BLK-${a}${b}${c}${d}`, code: flip(seq[n - 1]), weight: 1.15, tier: 2 };
-        }
-        if (a <= b && b <= c && c <= d && d > a + 1) {
-            return { name: `ASC-BLK-${a}${b}${c}${d}`, code: flip(seq[n - 1]), weight: 1.15, tier: 2 };
-        }
-        return null;
-    },
-
-    // ---------- TIER 2: STANDARD PATTERNS ----------
-
-    // 10. Alternate 1-1
-    alt11(seq) {
-        const n = seq.length; if (n < 6) return null;
-        let alt = 0;
-        for (let i = n - 1; i >= 1; i--) { if (seq[i] !== seq[i - 1]) alt++; else break; }
-        if (alt < 5) return null;
-        return { name: `ALT-1-1-${alt}`, code: flip(seq[n - 1]), weight: 1.1 + Math.min(alt, 12) * 0.04, tier: 2 };
-    },
-
-    // 11. Alternate 1-2-1
-    pat121(seq) {
-        const s = seq.join('');
-        const pats = [
-            ['TXXTXX', 'T'], ['XTTXTT', 'X'],
-            ['TXTTXT', 'X'], ['XTXXTX', 'T'],
-            ['TXXTXXTXX', 'T'], ['XTTXTTXTT', 'X']
-        ];
-        for (const [tail, code] of pats) {
-            if (s.endsWith(tail)) return { name: 'CẦU-1-2-1', code, weight: 1.35, tier: 2 };
-        }
-        return null;
-    },
-
-    // 12. Alternate 2-2
-    pat22(seq) {
-        const s = seq.join('');
-        const pats = [
-            ['TTXXTT', 'X'], ['XXTTXX', 'T'],
-            ['TTXXTTXX', 'T'], ['XXTTXXTT', 'X']
-        ];
-        for (const [tail, code] of pats) {
-            if (s.endsWith(tail)) return { name: 'CẦU-2-2', code, weight: 1.3, tier: 2 };
-        }
-        return null;
-    },
-
-    // 13. Alternate 1-3-1
-    pat131(seq) {
-        const s = seq.join('');
-        const pats = [
-            ['TXXXT', 'X'], ['XTTTX', 'T'],
-            ['TXXXTXXXT', 'X'], ['XTTTXTTTX', 'T']
-        ];
-        for (const [tail, code] of pats) {
-            if (s.endsWith(tail)) return { name: 'CẦU-1-3-1', code, weight: 1.25, tier: 2 };
-        }
-        return null;
-    },
-
-    // 14. Cycle exact
-    cycle(seq) {
-        const n = seq.length;
-        for (const l of [4, 5, 6, 7, 8, 9, 10]) {
-            if (n < l * 2) continue;
-            if (seq.slice(-l * 2, -l).join('') === seq.slice(-l).join('')) {
-                return { name: `CYCLE-${l}`, code: seq[n - l], weight: 1.15 + l * 0.02, tier: 2 };
-            }
-        }
-        return null;
-    },
-
-    // ---------- TIER 3: WEAK / FALLBACK ----------
-
-    // 15. Markov bậc 2-5 ensemble
-    markov(seq) {
-        if (seq.length < 12) return null;
-        let best = null;
-        for (const order of [2, 3, 4, 5]) {
-            if (seq.length < order + 5) continue;
-            const key = seq.slice(-order).join('');
-            let t = 0, x = 0;
-            for (let i = order; i < seq.length; i++) {
-                if (seq.slice(i - order, i).join('') === key) {
-                    if (seq[i] === 'T') t++; else x++;
-                }
-            }
-            const tot = t + x;
-            if (tot < 3) continue;
-            const conf = Math.max(t, x) / tot;
-            const code = t > x ? 'T' : 'X';
-            const w = conf * (order / 5) * 1.15;
-            if (!best || w > best.weight) best = { name: `MARKOV-${order}`, code, weight: w, tier: 3, sample: tot };
-        }
-        return best;
-    },
-
-    // 16. Sum trend
-    sumTrend(seq, sums) {
-        if (!sums || sums.length < 6) return null;
+    // Sum cluster
+    if (sums && sums.length >= 6) {
         const last6 = sums.slice(-6);
         const avg = last6.reduce((a, b) => a + b, 0) / 6;
-        const recent3 = last6.slice(-3).reduce((a, b) => a + b, 0) / 3;
-        if (recent3 - avg > 3.5) return { name: 'SUM-CAO', code: 'T', weight: 1.0, tier: 3 };
-        if (avg - recent3 > 3.5) return { name: 'SUM-THẤP', code: 'X', weight: 1.0, tier: 3 };
-        return null;
-    },
-
-    // 17. Boundary sum (10/11 near threshold)
-    boundary(seq, sums) {
-        if (!sums || sums.length < 3) return null;
-        const last3 = sums.slice(-3);
-        const near = last3.filter(s => s === 10 || s === 11).length;
-        if (near >= 2) {
-            const lastSum = last3[last3.length - 1];
-            return { name: `NEAR-BOUND-${lastSum}`, code: lastSum === 10 ? 'X' : 'T', weight: 0.95, tier: 3 };
-        }
-        return null;
-    },
-
-    // 18. Sum parity
-    sumParity(sums) {
-        if (!sums || sums.length < 6) return null;
-        const last6 = sums.slice(-6);
-        const even = last6.filter(s => s % 2 === 0).length;
-        if (even >= 5) return { name: 'SUM-EVEN', code: 'X', weight: 0.85, tier: 3 };
-        if (even <= 1) return { name: 'SUM-ODD', code: 'T', weight: 0.85, tier: 3 };
-        return null;
-    },
-
-    // 19. Sum cluster (sum hay nổ quanh 10-11)
-    sumCluster(sums) {
-        if (!sums || sums.length < 8) return null;
-        const recent = sums.slice(-8);
-        const avg = recent.reduce((a, b) => a + b, 0) / 8;
-        if (avg >= 13) return { name: 'SUM-HIGH-CLUSTER', code: 'X', weight: 0.9, tier: 3 };
-        if (avg <= 7) return { name: 'SUM-LOW-CLUSTER', code: 'T', weight: 0.9, tier: 3 };
-        return null;
-    },
-
-    // 20. Anti-ratio — fallback
-    antiRatio(seq) {
-        if (seq.length < 10) return null;
-        const last10 = seq.slice(-10);
-        const t = last10.filter(x => x === 'T').length;
-        if (t >= 8) return { name: 'ANTI-T', code: 'X', weight: 0.75, tier: 3 };
-        if (t <= 2) return { name: 'ANTI-X', code: 'T', weight: 0.75, tier: 3 };
-        return null;
-    },
-
-    // 21. Reversal after long run
-    reversal(seq) {
-        const n = seq.length; if (n < 6) return null;
-        const r = rle(seq);
-        if (r.length < 3) return null;
-        const [a, b, c] = r.slice(-3);
-        // a-len > b-len < c-len — valley — next block should be short (b-len) → predict flip
-        if (a.len >= 3 && b.len === 1 && c.len >= 3) {
-            return { name: 'REVERSAL-VALLEY', code: flip(seq[n - 1]), weight: 1.1, tier: 2 };
-        }
-        // a-len < b-len > c-len — peak
-        if (a.len === 1 && b.len >= 3 && c.len >= 3) {
-            return { name: 'REVERSAL-PEAK', code: seq[n - 1], weight: 1.05, tier: 2 };
-        }
-        return null;
-    },
-
-    // 22. Transition matrix recent-window
-    transitionRecent(seq) {
-        const n = seq.length; if (n < 20) return null;
-        const win = seq.slice(-20);
-        let tt = 0, tx = 0, xt = 0, xx = 0;
-        for (let i = 1; i < win.length; i++) {
-            const a = win[i - 1], b = win[i];
-            if (a === 'T' && b === 'T') tt++;
-            else if (a === 'T' && b === 'X') tx++;
-            else if (a === 'X' && b === 'T') xt++;
-            else xx++;
-        }
-        const last = win[win.length - 1];
-        let pT, pX;
-        if (last === 'T') { pT = tt / (tt + tx || 1); pX = 1 - pT; }
-        else { pT = xt / (xt + xx || 1); pX = 1 - pT; }
-        if (Math.abs(pT - pX) < 0.15) return null;
-        return { name: `TRANS-W20`, code: pT > pX ? 'T' : 'X', weight: 0.85 + Math.abs(pT - pX) * 0.8, tier: 3 };
-    },
-
-    // 23. Entropy — low entropy = predictable
-    entropy(seq) {
-        if (seq.length < 15) return null;
-        const win = seq.slice(-15);
-        const p = win.filter(x => x === 'T').length / 15;
-        if (p === 0 || p === 1) return null;
-        const H = -(p * Math.log2(p) + (1 - p) * Math.log2(1 - p));
-        if (H > 0.85) return null; // high entropy → skip
-        // low entropy → predict majority
-        return { name: `LOW-ENTROPY-${H.toFixed(2)}`, code: p > 0.5 ? 'T' : 'X', weight: 1.0, tier: 3 };
-    },
-
-    // 24. Symmetric — mirror half-window
-    symmetric(seq) {
-        const n = seq.length; if (n < 8) return null;
-        const half = Math.min(6, Math.floor(n / 2));
-        const L = seq.slice(-half * 2, -half);
-        const R = seq.slice(-half);
-        let match = 0;
-        for (let i = 0; i < half; i++) if (L[i] === R[i]) match++;
-        if (match >= half - 1 && match >= 4) {
-            return { name: 'SYMMETRIC', code: flip(R[half - 1]), weight: 1.0, tier: 3 };
-        }
-        return null;
+        if (avg >= 13.5) votes.push({ name: 'SUM-HIGH', code: 'X', weight: 0.9 });
+        if (avg <= 7.5) votes.push({ name: 'SUM-LOW', code: 'T', weight: 0.9 });
     }
-};
 
-// ============================================================
-// AGGREGATE — weighted vote by tier
-// ============================================================
-function tierMultiplier(tier) {
-    return tier === 1 ? 1.6 : tier === 2 ? 1.2 : 1.0;
+    return votes;
 }
 
-function aggregateVotes(votes) {
-    if (!votes.length) return null;
-    let wT = 0, wX = 0;
-    const detail = [];
-    for (const v of votes) {
-        if (!v || !v.code) continue;
-        const w = (v.weight || 1.0) * tierMultiplier(v.tier || 3);
-        if (v.code === 'T') wT += w; else wX += w;
-        detail.push({ name: v.name, code: v.code, weight: +w.toFixed(3), tier: v.tier });
+// ============================================================
+// BAYESIAN COMBINE — p(T) từ nhiều nguồn
+// ============================================================
+function bayesianCombine(regimePred, structuralVotes, db, regime) {
+    // prior từ regime history
+    const rs = db.regimeStats[regime.name] || { correct: 0, total: 0 };
+    const regimePrior = rs.total >= 5 ? (rs.correct / rs.total) : 0.5;
+
+    // Convert predictions thành p(T)
+    // regimePred: code ∈ {T,X} weight w → p = w / (w + (1-w))  ... dùng softmax
+    let logOddsT = 0;
+
+    const addVote = (code, weight, name) => {
+        // p(code=T) = weight / (1 + weight) nếu code=T, ngược lại 1/(1+weight)
+        // Dùng logit
+        const w = Math.max(0.1, weight);
+        if (code === 'T') logOddsT += Math.log(w);
+        else logOddsT -= Math.log(w);
+    };
+
+    // Base prior 0
+    // Regime predictor
+    addVote(regimePred.code, regimePred.weight * (0.8 + regimePrior * 0.4), regimePred.name);
+
+    // Structural votes
+    for (const v of structuralVotes) {
+        const ps = db.patternStats[v.name] || { win: 0, total: 0 };
+        const wr = ps.total >= 3 ? ps.win / ps.total : 0.5;
+        const adapted = v.weight * (0.6 + wr * 0.8);
+        addVote(v.code, adapted, v.name);
     }
-    const total = wT + wX;
-    if (total === 0) return null;
+
+    const pT = 1 / (1 + Math.exp(-logOddsT));
+    const code = pT >= 0.5 ? 'T' : 'X';
+    const strength = Math.abs(pT - 0.5) * 2;
+
     return {
-        code: wT >= wX ? 'T' : 'X',
-        strength: Math.max(wT, wX) / total,
-        detail,
-        wT: +wT.toFixed(3),
-        wX: +wX.toFixed(3)
+        code,
+        strength: Math.max(0.5, Math.min(0.95, 0.5 + strength * 0.45)),
+        pT,
+        regimeName: regime.name,
+        regimeConf: regime.confidence
     };
 }
 
 // ============================================================
-// ADAPTIVE WEIGHT
+// META — invert khi regime đang thua
 // ============================================================
-function adaptWeights(votes, db) {
-    const stats = db.patternStats || {};
-    return votes.map(v => {
-        if (!v) return v;
-        const s = stats[v.name];
-        if (!s || s.total < 3) return v;
-        const wr = s.win / s.total;
-        const mult = 0.55 + wr * 1.1;
-        const streakBonus = Math.max(-0.3, Math.min(0.4, (s.streak || 0) * 0.06));
-        return { ...v, weight: Math.max(0.3, (v.weight || 1) * mult + streakBonus) };
-    });
-}
-
-function updatePatternStats(db, patternName, wasCorrect) {
-    if (!patternName || ['CHỜ', 'META', 'ENSEMBLE', 'GUARD', 'INVERT', 'BOOST'].some(x => patternName.includes(x))) return;
-    if (!db.patternStats) db.patternStats = {};
-    const s = db.patternStats[patternName] || { win: 0, total: 0, streak: 0 };
-    s.total += 1;
-    if (wasCorrect) { s.win += 1; s.streak = s.streak >= 0 ? s.streak + 1 : 1; }
-    else { s.streak = s.streak <= 0 ? s.streak - 1 : -1; }
-    if (s.total > 50) { s.win *= 0.95; s.total *= 0.95; s.win = Math.round(s.win); s.total = Math.round(s.total); }
-    db.patternStats[patternName] = s;
+function metaAdjust(pred, db, regimeName) {
+    // Kiểm tra 15 phiên gần — nếu regime hiện tại đang thua nặng → invert hoặc giảm conf
+    const rs = db.regimeStats[regimeName];
+    if (rs && rs.total >= 10) {
+        const wr = rs.correct / rs.total;
+        if (wr < 0.35) {
+            return { ...pred, code: flip(pred.code), strength: 0.55, meta: `INVERT-${regimeName}-${(wr*100).toFixed(0)}%` };
+        }
+        if (wr > 0.72) {
+            return { ...pred, strength: Math.min(0.95, pred.strength + 0.08), meta: `BOOST-${regimeName}-${(wr*100).toFixed(0)}%` };
+        }
+    }
+    return pred;
 }
 
 // ============================================================
-// BALANCE + META
-// ============================================================
-function balanceGuard(aggregated, db) {
-    if (!aggregated) return aggregated;
-    const r50 = db.meta?.recent50 || [];
-    if (r50.length < 10) return aggregated;
-    const predT = r50.filter(x => x.pred === 'T').length;
-    const predX = r50.filter(x => x.pred === 'X').length;
-    const tot = predT + predX;
-    if (tot < 10) return aggregated;
-    const pX = predX / tot;
-    const devT = Math.max(0, pX - 0.60);
-    const devX = Math.max(0, 0.40 - pX);
-    if (devT > 0.02 && aggregated.code !== 'T') return { ...aggregated, code: 'T', strength: 0.70, guard: `BAL-T+${(devT * 100).toFixed(0)}` };
-    if (devX > 0.02 && aggregated.code !== 'X') return { ...aggregated, code: 'X', strength: 0.70, guard: `BAL-X+${(devX * 100).toFixed(0)}` };
-    return aggregated;
-}
-
-function metaPredictor(aggregated, db) {
-    const r50 = (db.meta?.recent50 || []).slice(-20);
-    if (r50.length < 8) return aggregated;
-    const wr = r50.filter(x => x.correct).length / r50.length;
-    if (wr < 0.40) return { ...aggregated, code: flip(aggregated.code), strength: 0.55, meta: `INVERT-${(wr * 100).toFixed(0)}%` };
-    if (wr > 0.70) return { ...aggregated, strength: Math.min(0.95, aggregated.strength + 0.10), meta: `BOOST-${(wr * 100).toFixed(0)}%` };
-    return aggregated;
-}
-
-// ============================================================
-// ENGINE PIPELINE
+// FULL PIPELINE
 // ============================================================
 function runEngine(seq, sums, db) {
-    if (!seq || seq.length < 4) return { code: null, label: 'CHỜ', tiLe: 'CHỜ', detail: [] };
-
-    const raw = [];
-    const push = fn => { const r = fn(); if (r) raw.push(r); };
-    push(() => detectors.bet(seq));
-    push(() => detectors.longStreak(seq));
-    push(() => detectors.block3(seq));
-    push(() => detectors.block4(seq));
-    push(() => detectors.block2(seq));
-    push(() => detectors.compositeGrammar(seq));
-    push(() => detectors.palindromeBlock(seq));
-    push(() => detectors.tttxRepeating(seq));
-    push(() => detectors.descendingBlocks(seq));
-    push(() => detectors.alt11(seq));
-    push(() => detectors.pat121(seq));
-    push(() => detectors.pat22(seq));
-    push(() => detectors.pat131(seq));
-    push(() => detectors.cycle(seq));
-    push(() => detectors.markov(seq));
-    push(() => detectors.sumTrend(seq, sums));
-    push(() => detectors.boundary(seq, sums));
-    push(() => detectors.sumParity(sums));
-    push(() => detectors.sumCluster(sums));
-    push(() => detectors.antiRatio(seq));
-    push(() => detectors.reversal(seq));
-    push(() => detectors.transitionRecent(seq));
-    push(() => detectors.entropy(seq));
-    push(() => detectors.symmetric(seq));
-
-    const adapted = adaptWeights(raw, db);
-    let agg = aggregateVotes(adapted);
-
-    if (!agg) {
-        const tRatio = seq.filter(x => x === 'T').length / seq.length;
-        agg = { code: tRatio >= 0.5 ? 'X' : 'T', strength: 0.50, detail: [], fallback: 'ANTI-RATIO' };
+    if (!seq || seq.length < 6) {
+        return { code: null, label: 'CHỜ', tiLe: 'CHỜ', detail: [], regime: 'COLD' };
     }
 
-    const guarded = balanceGuard(agg, db);
-    const final = metaPredictor(guarded, db);
-
-    const conf = Math.max(0.50, Math.min(0.95, final.strength));
-    const patternName = final.guard || final.meta || (final.detail?.[0]?.name) || 'ENSEMBLE';
+    const regime = detectRegime(seq);
+    const regimePred = predictByRegime(regime, seq);
+    const structural = structuralDetectors(seq, sums);
+    const combined = bayesianCombine(regimePred, structural, db, regime);
+    const final = metaAdjust(combined, db, regime.name);
 
     return {
         code: final.code,
-        label: patternName,
-        tiLe: (conf * 100).toFixed(1) + '%',
-        detail: final.detail || [],
-        strength: conf
+        label: final.meta || `${regime.name}:${regimePred.name}`,
+        tiLe: (final.strength * 100).toFixed(1) + '%',
+        detail: [
+            { regime: regime.name, regimeConf: regime.confidence, regimePred: regimePred.name, regimeW: regimePred.weight },
+            ...structural
+        ],
+        regime: regime.name,
+        strength: final.strength,
+        pT: final.pT
     };
 }
 
 // ============================================================
-// FETCH + PROCESS
+// UPDATE STATS khi có kết quả
+// ============================================================
+function updateStats(db, pred, actual) {
+    if (!pred || !pred.code) return;
+    const correct = pred.code === actual;
+
+    if (!db.meta) db.meta = { totalPred: 0, totalWin: 0, recent50: [] };
+    db.meta.totalPred = (db.meta.totalPred || 0) + 1;
+    if (correct) db.meta.totalWin = (db.meta.totalWin || 0) + 1;
+    db.meta.recent50.push({ pred: pred.code, actual, correct, regime: pred.regime });
+    if (db.meta.recent50.length > 50) db.meta.recent50.shift();
+
+    // regime stats
+    const rName = pred.regime || 'CHAOS';
+    if (!db.regimeStats[rName]) db.regimeStats[rName] = { correct: 0, total: 0 };
+    db.regimeStats[rName].total++;
+    if (correct) db.regimeStats[rName].correct++;
+
+    // pattern stats
+    const pName = pred.label || 'UNKNOWN';
+    if (!db.patternStats) db.patternStats = {};
+    const ps = db.patternStats[pName] || { win: 0, total: 0 };
+    ps.total++;
+    if (correct) ps.win++;
+    if (ps.total > 50) { ps.win *= 0.95; ps.total *= 0.95; ps.win = Math.round(ps.win); ps.total = Math.round(ps.total); }
+    db.patternStats[pName] = ps;
+}
+
+// ============================================================
+// FETCH + PROCESS LOOP
 // ============================================================
 async function fetchApi(url) {
     for (let i = 0; i < 3; i++) {
@@ -607,22 +435,14 @@ async function processGame(game) {
     const sums = list.map(getSum).filter(s => s >= 3 && s <= 18);
     if (seq.length < 6) return;
 
-    if (!db.meta) db.meta = { totalPred: 0, totalWin: 0, recent50: [] };
-
+    // chấm phiên trước
     const prev = db.history[db.history.length - 1];
     if (prev && safeInt(prev.phienDuDoan) === session) {
         const actual = getResult(latest);
-        const correct = prev.DU_DOAN_CODE && prev.DU_DOAN_CODE === actual;
         prev.ketQua = actual;
         prev.ketQuaLabel = label(actual);
-        prev.trangThai = !prev.DU_DOAN_CODE ? 'BỎ QUA' : (correct ? 'ĐÚNG' : 'SAI');
-        if (prev.DU_DOAN_CODE) {
-            db.meta.totalPred = (db.meta.totalPred || 0) + 1;
-            if (correct) db.meta.totalWin = (db.meta.totalWin || 0) + 1;
-            db.meta.recent50.push({ pred: prev.DU_DOAN_CODE, actual, correct });
-            if (db.meta.recent50.length > 50) db.meta.recent50.shift();
-            updatePatternStats(db, prev.patternName, correct);
-        }
+        prev.trangThai = !prev.DU_DOAN_CODE ? 'BỎ QUA' : (prev.DU_DOAN_CODE === actual ? 'ĐÚNG' : 'SAI');
+        updateStats(db, { code: prev.DU_DOAN_CODE, label: prev.patternName, regime: prev.regime }, actual);
     }
 
     const pred = runEngine(seq, sums, db);
@@ -638,6 +458,7 @@ async function processGame(game) {
         DU_DOAN: pred.code ? label(pred.code) : 'CHỜ',
         TI_LE: pred.tiLe,
         patternName: pred.label,
+        regime: pred.regime,
         detail: pred.detail,
         trangThai: 'ĐANG CHỜ'
     });
@@ -654,26 +475,35 @@ setInterval(() => { processGame('md5'); processGame('taixiu'); }, 5000);
 // ============================================================
 app.get('/', (req, res) => {
     res.send(`<div style="font-family:sans-serif;padding:20px">
-        <h2 style="color:green;">🚀 BACKEND v3 — 24 DETECTORS</h2>
+        <h2 style="color:green;">🚀 BACKEND v4 — REGIME BAYESIAN</h2>
         <ul>
             <li><a href="/api/predict/md5">/api/predict/md5</a></li>
             <li><a href="/api/predict/taixiu">/api/predict/taixiu</a></li>
             <li><a href="/api/history/all">/api/history/all</a></li>
             <li><a href="/api/stats/md5">/api/stats/md5</a></li>
             <li><a href="/api/stats/taixiu">/api/stats/taixiu</a></li>
-            <li><a href="/api/analyze?seq=TTTXTTTXTTT">/api/analyze — test engine với chuỗi bất kỳ</a></li>
+            <li><a href="/api/analyze?seq=TTTXTTTXTTT">/api/analyze</a></li>
+            <li><a href="/api/regime?seq=TXTXTXXTXT">/api/regime — xem regime hiện tại</a></li>
         </ul>
     </div>`);
 });
 
-// Test engine với chuỗi tùy ý
 app.get('/api/analyze', (req, res) => {
     const seqStr = String(req.query.seq || '').toUpperCase().replace(/[^TX]/g, '');
-    if (seqStr.length < 4) return res.status(400).json({ success: false, error: 'seq phải >= 4 ký tự T/X' });
+    if (seqStr.length < 4) return res.status(400).json({ success: false, error: 'seq >= 4 ký tự' });
     const seq = seqStr.split('');
     const db = readDB('md5');
     const pred = runEngine(seq, [], db);
-    res.json({ success: true, seq: seqStr, length: seqStr.length, prediction: pred });
+    res.json({ success: true, seq: seqStr, prediction: pred });
+});
+
+app.get('/api/regime', (req, res) => {
+    const seqStr = String(req.query.seq || '').toUpperCase().replace(/[^TX]/g, '');
+    if (seqStr.length < 4) return res.status(400).json({ success: false, error: 'seq >= 4 ký tự' });
+    const seq = seqStr.split('');
+    const regime = detectRegime(seq);
+    const bs = blockStats(seq);
+    res.json({ success: true, seq: seqStr, regime, blockStats: bs, entropy: binaryEntropy(seq) });
 });
 
 app.get('/api/predict/:game', async (req, res) => {
@@ -697,6 +527,7 @@ app.get('/api/predict/:game', async (req, res) => {
         duDoanCode: pred.code,
         tiLe: pred.tiLe,
         reason: pred.label,
+        regime: pred.regime,
         detail: pred.detail
     });
 });
@@ -710,7 +541,7 @@ app.get('/api/history/all', (req, res) => {
                 phien: it.phien, phienDuDoan: it.phienDuDoan, tong: it.tong, xucXac: it.xucXac,
                 ketQua: it.ketQua, ketQuaLabel: it.ketQuaLabel,
                 duDoanCode: it.DU_DOAN_CODE, duDoan: it.DU_DOAN, tiLe: it.TI_LE,
-                pattern: { type: it.patternName }, trangThai: it.trangThai
+                pattern: { type: it.patternName }, regime: it.regime, trangThai: it.trangThai
             }))
         };
     }
@@ -729,8 +560,8 @@ app.get('/api/stats/:game', (req, res) => {
         success: true, game,
         totalPredicted: m.totalPred || 0,
         totalWin: m.totalWin || 0,
-        winRate: wr,
-        recent50WinRate: r50wr,
+        winRate: wr, recent50WinRate: r50wr,
+        regimeStats: db.regimeStats || {},
         patternStats: db.patternStats || {}
     });
 });
@@ -745,21 +576,21 @@ app.get('/:game', (req, res) => {
 
     const getBadge = (type) => {
         if (!type) return 'badge-default';
-        if (type.startsWith('BỆT') || type.startsWith('LONG-STREAK')) return 'badge-bet';
-        if (type.includes('BLOCK') || type.includes('COMPOSITE') || type.includes('ABAB') || type.includes('PALIN')) return 'badge-block';
-        if (type.includes('MARKOV') || type.includes('BAL-')) return 'badge-markov';
-        if (type.includes('META') || type.includes('INVERT') || type.includes('BOOST')) return 'badge-meta';
-        if (type.includes('CẦU-') || type.includes('CYCLE') || type.includes('TTTX')) return 'badge-cycle';
+        if (type.startsWith('PERSIST')) return 'badge-bet';
+        if (type.includes('ANTIPERSIST') || type.includes('ALT')) return 'badge-alt';
+        if (type.includes('BLOCK') || type.includes('COMPOSITE') || type.includes('TTTX')) return 'badge-block';
+        if (type.includes('CHAOS') || type.includes('MARKOV')) return 'badge-chaos';
+        if (type.includes('INVERT') || type.includes('BOOST')) return 'badge-meta';
         return 'badge-default';
     };
 
     const html = `<!DOCTYPE html><html lang="vi"><head>
     <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>HOANG VIP WIN v3</title>
+    <title>HOANG VIP WIN v4</title>
     <style>
     *{box-sizing:border-box}
     body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e27;color:#e6eef6;padding:12px;margin:0}
-    .header{background:linear-gradient(135deg,#1e3a8a,#3b82f6);padding:16px;border-radius:14px;margin-bottom:12px;box-shadow:0 8px 24px rgba(59,130,246,.3);text-align:center}
+    .header{background:linear-gradient(135deg,#1e3a8a,#3b82f6);padding:16px;border-radius:14px;margin-bottom:12px;text-align:center}
     h1{color:#fff;font-size:20px;margin:0;font-weight:800;text-transform:uppercase}
     .stats{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;justify-content:center}
     .stat{background:#0f172a;padding:8px 14px;border-radius:8px;border:1px solid #334155;font-size:12px}
@@ -774,16 +605,16 @@ app.get('/:game', (req, res) => {
     .sum{display:inline-block;padding:4px 10px;border-radius:6px;background:#334155;color:#fbbf24;font-weight:800;font-size:14px}
     .session{font-family:monospace;font-size:11px;color:#64748b}
     .ti-le{font-size:12px;color:#cbd5e1;font-weight:600}
-    .badge{display:inline-block;padding:4px 8px;border-radius:6px;font-size:10px;font-weight:700;white-space:nowrap}
+    .badge{display:inline-block;padding:4px 8px;border-radius:6px;font-size:10px;font-weight:700;white-space:nowrap;max-width:140px;overflow:hidden;text-overflow:ellipsis}
     .badge-bet{background:#78350f;color:#fcd34d}
+    .badge-alt{background:#7c2d12;color:#fed7aa}
     .badge-block{background:#14532d;color:#86efac}
-    .badge-markov{background:#1e3a8a;color:#93c5fd}
-    .badge-cycle{background:#1e40af;color:#93c5fd}
+    .badge-chaos{background:#312e81;color:#a5b4fc}
+    .badge-meta{background:#831843;color:#fbcfe8}
     .badge-default{background:#334155;color:#cbd5e1}
-    .badge-meta{background:#7c2d12;color:#fed7aa}
     </style><script>setTimeout(()=>location.reload(),10000)</script></head>
     <body>
-      <div class="header"><h1>🎯 HOANG VIP WIN v3 - ${game.toUpperCase()}</h1></div>
+      <div class="header"><h1>🎯 HOANG VIP WIN v4 - ${game.toUpperCase()}</h1></div>
       <div class="stats">
         <div class="stat">Tổng: <b>${m.totalPred || 0}</b></div>
         <div class="stat">Thắng: <b>${m.totalWin || 0}</b></div>
@@ -791,7 +622,7 @@ app.get('/:game', (req, res) => {
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>PHIÊN</th><th>XX</th><th>TỔNG</th><th>KQ</th><th>PHIÊN DĐ</th><th>DỰ ĐOÁN</th><th>TỈ LỆ</th><th>LOẠI CẦU</th><th>TT</th>
+          <th>PHIÊN</th><th>XX</th><th>TỔNG</th><th>KQ</th><th>PHIÊN DĐ</th><th>DỰ ĐOÁN</th><th>TỈ LỆ</th><th>REGIME / CẦU</th><th>TT</th>
         </tr></thead><tbody>
         ${rows.map(it => {
             const dice = (it.xucXac || []).join('-');
@@ -815,4 +646,4 @@ app.get('/:game', (req, res) => {
     res.send(html);
 });
 
-app.listen(PORT, () => console.log(`Server v3 chạy trên port ${PORT}`));
+app.listen(PORT, () => console.log(`Server v4 chạy trên port ${PORT}`));
