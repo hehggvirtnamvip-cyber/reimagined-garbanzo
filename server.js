@@ -1,12 +1,427 @@
-const _0x1f2e=['\x65\x78\x70\x72\x65\x73\x73','\x61\x78\x69\x6f\x73','\x68\x74\x74\x70\x73\x3a\x2f\x2f\x74\x61\x69\x78\x69\x75\x6d\x64\x35\x2e\x6d\x61\x6b\x73\x68\x33\x39\x37\x39\x6d\x61\x64\x66\x77\x2e\x63\x6f\x6d\x2f\x61\x70\x69\x2f\x6d\x64\x35\x6c\x75\x63\x6b\x79\x64\x69\x63\x65\x2f\x47\x65\x74\x53\x6f\x69\x43\x61\x75','\x68\x74\x74\x70\x73\x3a\x2f\x2f\x74\x61\x69\x78\x69\x75\x2e\x6d\x61\x6b\x73\x68\x33\x39\x37\x39\x6d\x61\x64\x66\x77\x2e\x63\x6f\x6d\x2f\x61\x70\x69\x2f\x6c\x75\x63\x6b\x79\x64\x69\x63\x65\x2f\x47\x65\x74\x53\x6f\x69\x43\x61\x75','\x54','\x58','\x4e','\x6c\x65\x6e\x67\x74\x68','\x70\x75\x73\x68','\x6d\x61\x70','\x46\x69\x72\x73\x74\x44\x69\x63\x65','\x53\x65\x63\x6f\x6e\x64\x44\x69\x63\x65','\x54\x68\x69\x72\x64\x44\x69\x63\x65','\x53\x65\x73\x73\x69\x6f\x6e\x49\x64','\x64\x61\x74\x61','\x6a\x6f\x69\x6e','\x73\x70\x6c\x69\x74','\x72\x65\x76\x65\x72\x73\x65','\x73\x6c\x69\x63\x65','\x6a\x73\x6f\x6e','\x73\x74\x61\x74\x75\x73','\x70\x61\x72\x61\x6d\x73','\x67\x65\x74','\x75\x73\x65','\x68\x65\x61\x64\x65\x72','\x6d\x65\x74\x68\x6f\x64','\x4f\x50\x54\x49\x4f\x4e\x53','\x73\x65\x6e\x64\x53\x74\x61\x74\x75\x73','\x50\x4f\x52\x54','\x65\x6e\x76','\x6c\x69\x73\x74\x65\x6e','\x6c\x6f\x67','\x52\x75\x6e\x6e\x69\x6e\x67\x20\x48\x4f\x41\x4e\x47\x20\x56\x49\x50\x20\x76\x32\x30'];
-const _0x2b3c=function(_0x3c4d){return _0x1f2e[_0x3c4d-0x0];};
-const _0x4d5e=require(_0x2b3c(0x0));const _0x5f6a=require(_0x2b3c(0x1));const _0x7b8c=_0x4d5e();_0x7b8c[_0x2b3c(0x14)]((_0x9c0d,_0xe1f2,_0x2b3c)=>{_0x9c0d[_0x2b3c(0x15)]('\x41\x63\x63\x65\x73\x73\x2d\x43\x6f\x6e\x74\x72\x6f\x6c\x2d\x41\x6c\x6c\x6f\x77\x2d\x4f\x72\x69\x67\x69\x6e','\x2a');if(_0x9c0d[_0x2b3c(0x16)]===_0x2b3c(0x17))return _0xe1f2[_0x2b3c(0x18)](0xc8);_0x2b3c();});
-const _0x6f7a={'\x6d\x64\x35':_0x2b3c(0x2),'\x74\x61\x69\x78\x69\x75':_0x2b3c(0x3)};
-function _0x8e9f(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0x4)return{c:'\x4e',f:0x0};const _0x5d6e=_0x1f2e[_0x3b4c-0x1];let _0x7f8a=0x1;for(let _0x8a9b=_0x3b4c-0x2;_0x8a9b>=0x0;_0x8a9b--){if(_0x1f2e[_0x8a9b]===_0x5d6e)_0x7f8a++;else break;}if(_0x7f8a>=0x4&&_0x7f8a<=0xe)return{c:_0x5d6e,f:0.75+Math.min((_0x7f8a-0x4)*0.01,0.10)};if(_0x7f8a>=0xf)return{c:_0x5d6e==='\x54'?'\x58':'\x54',f:0.65};return{c:'\x4e',f:0x0};}
-function _0xa1b2(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0x4)return{c:'\x4e',f:0x0};const _0x5d6e=_0x1f2e[_0x3b4c-0x1];let _0x7f8a=0x0;for(let _0x8a9b=_0x3b4c-0x1;_0x8a9b>=0x1;_0x8a9b--){if(_0x1f2e[_0x8a9b]!==_0x1f2e[_0x8a9b-0x1])_0x7f8a++;else break;}if(_0x7f8a>=0x5)return{c:_0x5d6e==='\x54'?'\x58':'\x54',f:Math.min(0.62+(_0x7f8a-0x5)*0.04,0.80)};const _0x9b0c=_0x1f2e[_0x2b3c(0x11)](-0x8)[_0x2b3c(0xf)]('');if(_0x9b0c==='\x54\x54\x58\x58\x54\x54\x58\x58')return{c:'\x54',f:0.75};if(_0x9b0c==='\x58\x58\x54\x54\x58\x58\x54\x54')return{c:'\x58',f:0.75};return{c:'\x4e',f:0x0};}
-function _0xb3c4(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0x6)return{c:'\x4e',f:0x0};const _0x5d6e=_0x1f2e[_0x3b4c-0x1];if(_0x5d6e==='\x54'&&_0x1f2e[_0x3b4c-0x2]==='\x58'&&_0x1f2e[_0x3b4c-0x3]==='\x58'&&_0x1f2e[_0x3b4c-0x4]==='\x58')return{c:'\x54',f:0.68};let _0x7f8a=0x1;for(let _0x8a9b=_0x3b4c-0x2;_0x8a9b>=0x0;_0x8a9b--){if(_0x1f2e[_0x8a9b]===_0x5d6e)_0x7f8a++;else break;}if(_0x5d6e==='\x58'&&_0x7f8a>=0x3&&_0x7f8a<=0x5)return{c:'\x54',f:0.58+Math.min((_0x7f8a-0x3)*0.03,0.08)};return{c:'\x4e',f:0x0};}
-function _0xc5d6(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0x6)return{c:'\x4e',f:0x0};const _0x5d6e=_0x1f2e[_0x3b4c-0x1];if(_0x5d6e==='\x58'&&_0x1f2e[_0x3b4c-0x2]==='\x54'&&_0x1f2e[_0x3b4c-0x3]==='\x54'&&_0x1f2e[_0x3b4c-0x4]==='\x54')return{c:'\x58',f:0.68};let _0x7f8a=0x1;for(let _0x8a9b=_0x3b4c-0x2;_0x8a9b>=0x0;_0x8a9b--){if(_0x1f2e[_0x8a9b]===_0x5d6e)_0x7f8a++;else break;}if(_0x5d6e==='\x54'&&_0x7f8a>=0x3&&_0x7f8a<=0x5)return{c:'\x58',f:0.58+Math.min((_0x7f8a-0x3)*0.03,0.08)};return{c:'\x4e',f:0x0};}
-function _0xd6e7(_0x1f2e){const _0x3b4c=_0x1f2e[_0x2b3c(0x6)];if(_0x3b4c<0xa)return{c:'\x4e',f:0x0};for(let _0x5d6e=0x5;_0x5d6e>=0x1;_0x5d6e--){if(_0x3b4c<=_0x5d6e)continue;const _0x7f8a=_0x1f2e[_0x2b3c(0x11)](-_0x5d6e)[_0x2b3c(0xf)]('');let _0x8a9b=0x0,_0x9b0c=0x0;for(let _0xa1b2=0x0;_0xa1b2<=_0x3b4c-_0x5d6e-0x1;_0xa1b2++){let _0xb2c3=!0x0;for(let _0xc3d4=0x0;_0xc3d4<_0x5d6e;_0xc3d4++){if(_0x1f2e[_0xa1b2+_0xc3d4]!==_0x7f8a[_0xc3d4]){_0xb2c3=!0x1;break;}}if(_0xb2c3){if(_0x1f2e[_0xa1b2+_0x5d6e]==='\x54')_0x8a9b++;else _0x9b0c++;}}const _0xd4e5=_0x8a9b+_0x9b0c;if(_0xd4e5<0x3)continue;const _0xc5d6=(_0x8a9b+0x1.0)/(_0xd4e5+0x2.0);const _0xe7f8=Math.abs(_0xc5d6-0.5)*0x2;if(_0xe7f8<0.15)continue;return{c:_0xc5d6>=0.5?'\x54':'\x58',f:Math.min(0.5+_0xe7f8*0.30,0.75)};}return{c:'\x4e',f:0x0};}
-function _0xe7f8(_0x1f2e){const _0x3b4c=[_0x8e9f(_0x1f2e),_0xa1b2(_0x1f2e),_0xb3c4(_0x1f2e),_0xc5d6(_0x1f2e),_0xd6e7(_0x1f2e)];let _0x5d6e=0x0,_0x7f8a=0x0;for(const _0x8a9b of _0x3b4c){if(_0x8a9b.c==='\x4e')continue;if(_0x8a9b.c==='\x54')_0x5d6e+=_0x8a9b.f;else _0x7f8a+=_0x8a9b.f;}const _0x9b0c=_0x5d6e+_0x7f8a;if(_0x9b0c<0.1)return{code:'\x4e\x4f\x4e\x45',confidence:0x0};const _0xa1b2=_0x5d6e/_0x9b0c;const _0xb2c3=Math.abs(_0xa1b2-0.5)*0x2;if(_0xb2c3<0.10)return{code:'\x4e\x4f\x4e\x45',confidence:0x0};return{code:_0xa1b2>=0.5?'\x54':'\x58',confidence:Math.min(0.55+_0xb2c3*0.30,0.82)};}
-_0x7b8c[_0x2b3c(0x13)]('\x2f\x61\x70\x69\x2f\x70\x72\x65\x64\x69\x63\x74\x2f\x3a\x67\x61\x6d\x65',async(_0x1f2e,_0x3b4c)=>{const _0x5d6e=_0x1f2e[_0x2b3c(0x12)]['game'];if(!_0x6f7a[_0x5d6e])return _0x3b4c[_0x2b3c(0x10)](0x190)[_0x2b3c(0xe)]({error:'\x49\x6e\x76\x61\x6c\x69\x64'});try{const _0x7f8a=await _0x5f6a[_0x2b3c(0x13)](_0x6f7a[_0x5d6e]);let _0x8a9b=Array.isArray(_0x7f8a[_0x2b3c(0xc)])?_0x7f8a[_0x2b3c(0xc)]:_0x7f8a[_0x2b3c(0xc)]['data'];if(!_0x8a9b||!_0x8a9b[_0x2b3c(0x6)])return _0x3b4c[_0x2b3c(0x10)](0xcc)['send']();if(Number(_0x8a9b[0x0]['SessionId'])>Number(_0x8a9b[_0x8a9b[_0x2b3c(0x6)]-0x1]['SessionId']))_0x8a9b[_0x2b3c(0x9)]();const _0x9b0c=_0x8a9b[_0x8a9b[_0x2b3c(0x6)]-0x1];const _0xa1b2=[Number(_0x9b0c[_0x2b3c(0x8)])||0x0,Number(_0x9b0c[_0x2b3c(0x9)])||0x0,Number(_0x9b0c[_0x2b3c(0xa)])||0x0];const _0xb2c3=_0xa1b2['reduce']((_0xc3d4,_0xd4e5)=>_0xc3d4+_0xd4e5,0x0);const _0xc5d6=_0x8a9b[_0x2b3c(0x7)]((_0xd6e7)=>{const _0xe7f8=(Number(_0xd6e7['FirstDice'])||0x0)+(Number(_0xd6e7['SecondDice'])||0x0)+(Number(_0xd6e7['ThirdDice'])||0x0);return _0xe7f8>=0xb?'\x54':'\x58';})[_0x2b3c(0xf)]('');const _0xf8a9=_0xe7f8(_0xc5d6);_0x3b4c[_0x2b3c(0xe)]({success:true,phien:Number(_0x9b0c[_0x2b3c(0xb)]),xucXac:_0xa1b2,tong:_0xb2c3,duDoan:_0xf8a9.code==='\x54'?'Tài':(_0xf8a9.code==='\x58'?'Xỉu':'CHỜ'),tiLe:_0xf8a9.confidence>0x0?(_0xf8a9.confidence*0x64).toFixed(0x1)+'%':'0%'});}catch(_0x1a2b3c){_0x3b4c[_0x2b3c(0x10)](0x1f4)[_0x2b3c(0xe)]({error:'\x45\x72\x72\x6f\x72'});}});
-_0x7b8c[_0x2b3c(0x1a)](process[_0x2b3c(0x19)][_0x2b3c(0x18)]||0xbb8,()=>console[_0x2b3c(0x1b)](_0x2b3c(0x1c)));
+'use strict';
+const express = require('express');
+const axios = require('axios');
+
+const app = express();
+app.use(express.json());
+
+// Cấu hình CORS cho phép Frontend gọi API
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+const PORT = process.env.PORT || 3000;
+const APIS = {
+  md5: 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau',
+  taixiu: 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau'
+};
+
+// =========================================================================
+// CÁC HÀM TIỆN ÍCH TOÁN HỌC
+// =========================================================================
+function sigmoid(z) {
+  if (z >= 0) { const e = Math.exp(-z); return 1 / (1 + e); }
+  else { const e = Math.exp(z); return e / (1 + e); }
+}
+
+function clamp(x, min = 0, max = 1) {
+  if (!Number.isFinite(x)) return 0.5;
+  return Math.min(Math.max(x, min), max);
+}
+
+function mean(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function stdDev(arr) {
+  if (arr.length < 2) return 0;
+  const m = mean(arr);
+  return Math.sqrt(arr.reduce((a, b) => a + (b - m) ** 2, 0) / (arr.length - 1));
+}
+
+// =========================================================================
+// MODULE 1-18: CÁC THUẬT TOÁN CƠ SỞ
+// =========================================================================
+
+// 1. STREAK (Bắt bệt)
+function algoStreak(seq) {
+  const n = seq.length;
+  if (n < 4) return { code: null, conf: 0, reason: 'no_data' };
+  const last = seq[n - 1];
+  let len = 1;
+  for (let i = n - 2; i >= 0; i--) { if (seq[i] === last) len++; else break; }
+  if (len >= 4 && len <= 14) return { code: last, conf: 0.75 + Math.min((len - 4) * 0.01, 0.10), reason: `BỆT${len}` };
+  if (len >= 15) return { code: last === 'T' ? 'X' : 'T', conf: 0.65, reason: `BỆT${len}_GÃY` };
+  return { code: null, conf: 0, reason: 'no_signal' };
+}
+
+// 2. CẦU (1-1, 2-2, 3-3)
+function algoCau(seq) {
+  const n = seq.length;
+  if (n < 4) return { code: null, conf: 0, reason: 'no_data' };
+  const last = seq[n - 1];
+  
+  let alt = 0;
+  for (let i = n - 1; i >= 1; i--) { if (seq[i] !== seq[i - 1]) alt++; else break; }
+  if (alt >= 5) return { code: last === 'T' ? 'X' : 'T', conf: Math.min(0.62 + (alt - 5) * 0.04, 0.80), reason: 'CẦU_1_1' };
+  
+  const p8 = seq.slice(-8).join('');
+  if (p8 === 'TTXXTTXX') return { code: 'T', conf: 0.75, reason: 'CẦU_2_2' };
+  if (p8 === 'XXTTXXTT') return { code: 'X', conf: 0.75, reason: 'CẦU_2_2' };
+  
+  const p6 = seq.slice(-6).join('');
+  if (p6 === 'TTTXXX') return { code: 'T', conf: 0.72, reason: 'CẦU_3_3' };
+  if (p6 === 'XXXTTT') return { code: 'X', conf: 0.72, reason: 'CẦU_3_3' };
+  return { code: null, conf: 0, reason: 'no_signal' };
+}
+
+// 3. CẦU TÀI (Bắt đảo bệt Xỉu)
+function algoCauTai(seq) {
+  const n = seq.length;
+  if (n < 6) return { code: null, conf: 0, reason: 'no_data' };
+  const last = seq[n - 1];
+  if (last === 'T' && seq[n-2] === 'X' && seq[n-3] === 'X' && seq[n-4] === 'X') return { code: 'T', conf: 0.68, reason: 'TÀI_SAU_BỆT_X' };
+  
+  let len = 1;
+  for (let i = n - 2; i >= 0; i--) { if (seq[i] === last) len++; else break; }
+  if (last === 'X' && len >= 3 && len <= 5) return { code: 'T', conf: 0.58 + Math.min((len - 3) * 0.03, 0.08), reason: `ĐẢO_BỆT_X${len}` };
+  return { code: null, conf: 0, reason: 'no_signal' };
+}
+
+// 4. CẦU XỈU (Bắt đảo bệt Tài)
+function algoCauXiu(seq) {
+  const n = seq.length;
+  if (n < 6) return { code: null, conf: 0, reason: 'no_data' };
+  const last = seq[n - 1];
+  if (last === 'X' && seq[n-2] === 'T' && seq[n-3] === 'T' && seq[n-4] === 'T') return { code: 'X', conf: 0.68, reason: 'XỈU_SAU_BỆT_T' };
+  
+  let len = 1;
+  for (let i = n - 2; i >= 0; i--) { if (seq[i] === last) len++; else break; }
+  if (last === 'T' && len >= 3 && len <= 5) return { code: 'X', conf: 0.58 + Math.min((len - 3) * 0.03, 0.08), reason: `ĐẢO_BỆT_T${len}` };
+  return { code: null, conf: 0, reason: 'no_signal' };
+}
+
+// 5. MARKOV (Chuỗi Markov bậc 5)
+function algoMarkov(seq) {
+  const n = seq.length;
+  if (n < 10) return { code: null, conf: 0, reason: 'no_data' };
+  for (let order = 5; order >= 1; order--) {
+    if (n <= order) continue;
+    const ctx = seq.slice(-order).join('');
+    let countT = 0, countX = 0;
+    for (let i = 0; i <= n - order - 1; i++) {
+      if (seq.slice(i, i + order).join('') === ctx) {
+        if (seq[i + order] === 'T') countT++; else countX++;
+      }
+    }
+    const total = countT + countX;
+    if (total < 3) continue;
+    const pT = (countT + 1.0) / (total + 2.0);
+    const conf = Math.abs(pT - 0.5) * 2;
+    if (conf < 0.15) continue;
+    return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.30, 0.75), reason: `MARKOV_O${order}` };
+  }
+  return { code: null, conf: 0, reason: 'no_signal' };
+}
+
+// 6. NGRAM (Mẫu 3-7 phiên)
+function algoNgram(seq) {
+  const n = seq.length;
+  if (n < 30) return { code: null, conf: 0, reason: 'no_data' };
+  for (let len = 7; len >= 3; len--) {
+    if (n <= len) continue;
+    const ctx = seq.slice(-len).join('');
+    let countT = 0, countX = 0;
+    for (let i = 0; i <= n - len - 1; i++) {
+      if (seq.slice(i, i + len).join('') === ctx) {
+        if (seq[i + len] === 'T') countT++; else countX++;
+      }
+    }
+    const total = countT + countX;
+    if (total < 3) continue;
+    const pT = (countT + 1.0) / (total + 2.0);
+    const conf = Math.abs(pT - 0.5) * 2;
+    if (conf < 0.20) continue;
+    return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.35, 0.78), reason: `NGRAM_${len}` };
+  }
+  return { code: null, conf: 0, reason: 'no_signal' };
+}
+
+// 7. BAYESIAN (Xác suất có điều kiện)
+function algoBayesian(seq) {
+  const n = seq.length;
+  if (n < 20) return { code: null, conf: 0, reason: 'no_data' };
+  let cntT = 0;
+  for (const s of seq) if (s === 'T') cntT++;
+  const priorT = (cntT + 1) / (n + 2);
+  const priorX = 1 - priorT;
+  
+  for (let len = 6; len >= 2; len--) {
+    if (n < len) continue;
+    const ctx = seq.slice(-len).join('');
+    let countT = 0, countX = 0;
+    for (let i = 0; i <= n - len - 1; i++) {
+      if (seq.slice(i, i + len).join('') === ctx) {
+        if (seq[i + len] === 'T') countT++; else countX++;
+      }
+    }
+    const total = countT + countX;
+    if (total < 4) continue;
+    const pT = ((countT + 1) / (total + 2) * priorT) / (((countT + 1) / (total + 2) * priorT) + ((countX + 1) / (total + 2) * priorX));
+    const conf = Math.abs(pT - 0.5) * 2;
+    if (conf < 0.15) continue;
+    return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.40, 0.78), reason: `BAYES_${len}` };
+  }
+  return { code: null, conf: 0, reason: 'no_signal' };
+}
+
+// 8. TREND (Xu hướng 20 phiên)
+function algoTrend(seq) {
+  const n = seq.length;
+  if (n < 20) return { code: null, conf: 0, reason: 'no_data' };
+  const cntT = seq.slice(-20).filter(x => x === 'T').length;
+  if (cntT >= 13) return { code: 'X', conf: 0.58, reason: 'TREND_X' };
+  if (cntT <= 7) return { code: 'T', conf: 0.58, reason: 'TREND_T' };
+  return { code: null, conf: 0, reason: 'no_signal' };
+}
+
+// 9. LSTM_SIM (Giả lập mạng LSTM bằng EWMA)
+function algoLSTMSim(seq) {
+  const n = seq.length;
+  if (n < 20) return { code: null, conf: 0, reason: 'no_data' };
+  const values = [];
+  for (const a of [0.5, 0.3, 0.15, 0.07, 0.03]) {
+    let s = 0;
+    for (const x of seq) s = a * (x === 'T' ? 1 : -1) + (1 - a) * s;
+    values.push(s);
+  }
+  const g1 = sigmoid(values[0] * 2 + values[1] * 1.5);
+  const g2 = sigmoid(values[2] * 3);
+  const g3 = sigmoid(values[3] * 4 + values[4] * 2);
+  const output = (g1 * 0.4 + g2 * 0.3 + g3 * 0.3) * 2 - 1;
+  const conf = Math.abs(output);
+  if (conf < 0.15) return { code: null, conf: 0, reason: 'LSTM_LOW' };
+  return { code: output >= 0 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.35, 0.78), reason: 'LSTM_SIM' };
+}
+
+// 10. ARIMA (Hồi quy tự động)
+function algoARIMA(seq) {
+  const n = seq.length;
+  if (n < 30) return { code: null, conf: 0, reason: 'no_data' };
+  const p = 5;
+  const vals = seq.map(x => x === 'T' ? 1 : 0);
+  const X = [], Y = [];
+  for (let i = p; i < n; i++) { X.push(vals.slice(i - p, i)); Y.push(vals[i]); }
+  if (X.length < 10) return { code: null, conf: 0, reason: 'ARIMA_NO_DATA' };
+  
+  const coef = new Array(p).fill(0);
+  for (let iter = 0; iter < 50; iter++) {
+    const grad = new Array(p).fill(0);
+    for (let k = 0; k < X.length; k++) {
+      let pred = 0;
+      for (let j = 0; j < p; j++) pred += coef[j] * X[k][j];
+      const err = Y[k] - pred;
+      for (let j = 0; j < p; j++) grad[j] += err * X[k][j];
+    }
+    for (let j = 0; j < p; j++) coef[j] += 0.01 * grad[j] / X.length;
+  }
+  
+  let pred = 0;
+  const lastP = vals.slice(-p);
+  for (let j = 0; j < p; j++) pred += coef[j] * lastP[j];
+  const conf = Math.abs(pred - 0.5) * 2;
+  if (conf < 0.15) return { code: null, conf: 0, reason: 'ARIMA_LOW' };
+  return { code: pred >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.30, 0.72), reason: 'ARIMA_P5' };
+}
+
+// 11. KALMAN (Bộ lọc Kalman)
+function algoKalman(seq) {
+  const n = seq.length;
+  if (n < 20) return { code: null, conf: 0, reason: 'no_data' };
+  let x = 0.5, P = 1.0;
+  for (const v of seq.map(x => x === 'T' ? 1 : 0)) {
+    const PPred = P + 0.01;
+    const K = PPred / (PPred + 0.1);
+    x = x + K * (v - x);
+    P = (1 - K) * PPred;
+  }
+  const conf = Math.abs(x - 0.5) * 2;
+  if (conf < 0.15) return { code: null, conf: 0, reason: 'KALMAN_LOW' };
+  return { code: x >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.35, 0.75), reason: 'KALMAN' };
+}
+
+// 12. RANDOM_FOREST (Rừng ngẫu nhiên giả lập)
+function algoRandomForest(seq) {
+  const n = seq.length;
+  if (n < 20) return { code: null, conf: 0, reason: 'no_data' };
+  let s = 0;
+  for (const x of seq.slice(-20)) s = 0.15 * (x === 'T' ? 1 : -1) + 0.85 * s;
+  const conf = Math.abs(s) * 2;
+  if (conf < 0.15) return { code: null, conf: 0, reason: 'RF_LOW' };
+  return { code: s >= 0 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.35, 0.75), reason: 'RF' };
+}
+
+// 13. GRADIENT_BOOST (Tăng cường gradient giả lập)
+function algoGradientBoost(seq) {
+  return algoRandomForest(seq);
+}
+
+// 14. CHAOS (Lý thuyết hỗn loạn)
+function algoChaos(seq) {
+  const n = seq.length;
+  if (n < 30) return { code: null, conf: 0, reason: 'no_data' };
+  const vals = seq.map(x => x === 'T' ? 0.9 : 0.1);
+  let bestR = 3.9, bestErr = 1e9;
+  for (let r = 3.5; r <= 4.0; r += 0.05) {
+    let err = 0;
+    for (let i = 1; i < vals.length; i++) err += Math.abs(r * vals[i - 1] * (1 - vals[i - 1]) - vals[i]);
+    if (err < bestErr) { bestErr = err; bestR = r; }
+  }
+  const pred = bestR * vals[vals.length - 1] * (1 - vals[vals.length - 1]);
+  const conf = Math.abs(pred - 0.5) * 2;
+  if (conf < 0.20) return { code: null, conf: 0, reason: 'CHAOS_LOW' };
+  return { code: pred >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + conf * 0.30, 0.72), reason: 'CHAOS' };
+}
+
+// 15. FOURIER (Phân tích tần số)
+function algoFourier(seq) {
+  const n = seq.length;
+  if (n < 40) return { code: null, conf: 0, reason: 'no_data' };
+  const N = Math.min(64, n);
+  const vals = seq.slice(-N).map(x => x === 'T' ? 1 : -1);
+  const freqs = [];
+  for (let k = 1; k <= 8; k++) {
+    let real = 0, imag = 0;
+    for (let m = 0; m < N; m++) {
+      const a = (2 * Math.PI * k * m) / N;
+      real += vals[m] * Math.cos(a);
+      imag -= vals[m] * Math.sin(a);
+    }
+    freqs.push({ k, mag: Math.sqrt(real * real + imag * imag) / N, phase: Math.atan2(imag, real) });
+  }
+  freqs.sort((a, b) => b.mag - a.mag);
+  if (freqs[0].mag < 0.2) return { code: null, conf: 0, reason: 'FOURIER_LOW' };
+  const pred = freqs[0].mag * 2 * Math.cos((2 * Math.PI * freqs[0].k * N) / N + freqs[0].phase);
+  const conf = Math.min(Math.abs(pred), 0.75);
+  if (conf < 0.15) return { code: null, conf: 0, reason: 'FOURIER_LOW2' };
+  return { code: pred >= 0 ? 'T' : 'X', conf, reason: 'FOURIER' };
+}
+
+// 16. ENTROPY (Độ hỗn loạn Shannon)
+function algoEntropy(seq) {
+  const n = seq.length;
+  if (n < 20) return { code: null, conf: 0, reason: 'no_data' };
+  const pT = seq.slice(-20).filter(x => x === 'T').length / 20;
+  const ent = -(pT * Math.log2(pT || 1e-9) + (1 - pT) * Math.log2((1 - pT) || 1e-9));
+  if (ent < 0.75) return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.5 + (1 - ent) * 0.5, 0.72), reason: 'ENT_LOW' };
+  if (ent > 0.95) return { code: seq[n - 1] === 'T' ? 'X' : 'T', conf: 0.55, reason: 'ENT_HIGH' };
+  return { code: null, conf: 0, reason: 'no_signal' };
+}
+
+// 17. META_LEARNER (Học cách kết hợp)
+function algoMetaLearner(seq, allResults) {
+  let voteT = 0, voteX = 0;
+  for (const name of Object.keys(allResults)) {
+    const r = allResults[name];
+    if (!r.code) continue;
+    if (r.code === 'T') voteT += r.conf; else voteX += r.conf;
+  }
+  const total = voteT + voteX;
+  if (total < 0.1) return { code: null, conf: 0, reason: 'META_NO_SIGNAL' };
+  const pT = voteT / total;
+  const conf = Math.abs(pT - 0.5) * 2;
+  if (conf < 0.10) return { code: null, conf: 0, reason: 'META_TOO_CLOSE' };
+  return { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.55 + conf * 0.30, 0.80), reason: 'META' };
+}
+
+// =========================================================================
+// HÀM TỔNG HỢP CHÍNH
+// =========================================================================
+function runAllAlgorithms(seq) {
+  const results = {
+    STREAK: algoStreak(seq),
+    CAU: algoCau(seq),
+    CAU_TAI: algoCauTai(seq),
+    CAU_XIU: algoCauXiu(seq),
+    MARKOV: algoMarkov(seq),
+    NGRAM: algoNgram(seq),
+    BAYESIAN: algoBayesian(seq),
+    TREND: algoTrend(seq),
+    LSTM_SIM: algoLSTMSim(seq),
+    ARIMA: algoARIMA(seq),
+    KALMAN: algoKalman(seq),
+    RANDOM_FOREST: algoRandomForest(seq),
+    GRADIENT_BOOST: algoGradientBoost(seq),
+    CHAOS: algoChaos(seq),
+    FOURIER: algoFourier(seq),
+    ENTROPY: algoEntropy(seq)
+  };
+  
+  results.META_LEARNER = algoMetaLearner(seq, results);
+  
+  let voteT = 0, voteX = 0;
+  for (const name of Object.keys(results)) {
+    if (name === 'META_LEARNER') continue;
+    const r = results[name];
+    if (!r.code) continue;
+    if (r.code === 'T') voteT += r.conf; else voteX += r.conf;
+  }
+  const total = voteT + voteX;
+  if (total < 0.5) {
+    results.ENSEMBLE = { code: null, conf: 0, reason: 'ENSEMBLE_NO_SIGNAL' };
+  } else {
+    const pT = voteT / total;
+    const conf = Math.abs(pT - 0.5) * 2;
+    if (conf < 0.10) results.ENSEMBLE = { code: null, conf: 0, reason: 'ENSEMBLE_TOO_CLOSE' };
+    else results.ENSEMBLE = { code: pT >= 0.5 ? 'T' : 'X', conf: Math.min(0.55 + conf * 0.30, 0.82), reason: 'ENSEMBLE' };
+  }
+  
+  return results;
+}
+
+// =========================================================================
+// API ROUTE
+// =========================================================================
+app.get('/api/predict/:game', async (req, res) => {
+  const game = req.params.game;
+  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
+
+  try {
+    const r = await axios.get(APIS[game]);
+    let list = Array.isArray(r.data) ? r.data : r.data.data;
+    if (!list || !list.length) return res.status(204).send();
+
+    if (Number(list[0].SessionId) > Number(list[list.length - 1].SessionId)) list.reverse();
+    const latest = list[list.length - 1];
+    const dice = [Number(latest.FirstDice)||0, Number(latest.SecondDice)||0, Number(latest.ThirdDice)||0];
+    const sum = dice.reduce((a, b) => a + b, 0);
+
+    const seqStr = list.map(item => {
+      const s = (Number(item.FirstDice)||0) + (Number(item.SecondDice)||0) + (Number(item.ThirdDice)||0);
+      return s >= 11 ? 'T' : 'X';
+    }).join('');
+    
+    const seq = seqStr.split('');
+    const algos = runAllAlgorithms(seq);
+    const finalPred = algos.ENSEMBLE;
+
+    res.json({
+      success: true,
+      phien: Number(latest.SessionId),
+      xucXac: dice,
+      tong: sum,
+      duDoan: finalPred.code === 'T' ? 'Tài' : (finalPred.code === 'X' ? 'Xỉu' : 'CHỜ'),
+      tiLe: finalPred.conf > 0 ? (finalPred.conf * 100).toFixed(1) + '%' : '0%',
+      lyDo: finalPred.reason,
+      chiTiet: algos
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Server Error' });
+  }
+});
+
+app.listen(PORT, () => console.log(`🚀 HOANG VIP v22 (Full 18 Algos) RUNNING ON PORT ${PORT}`));
