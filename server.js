@@ -1,20 +1,11 @@
 /**
  * ========================================================================
- * HOANG VIP v10 — FULL ENGINE
+ * HOANG VIP v10 FINAL — FULL ENGINE (KHÔNG BỎ GÌ)
  * ========================================================================
- * v10 nâng cấp so với v9:
- *  ✅ Ensemble Voting (đa pattern bỏ phiếu)
- *  ✅ Markov Chain bậc 1-2-3 (học từ lịch sử)
- *  ✅ Stoploss / Bankroll Protection
- *  ✅ Telegram Webhook thông báo
- *  ✅ Time-of-day Analysis
- *  ✅ Cầu theo Tổng xúc xắc (Chẵn/Lẻ, Cao/Thấp)
- *  ✅ Exponential Smoothing confidence
- *  ✅ Hazard-rate phân tích bệt
- *
- * 🔒 TOÀN BỘ THUẬT TOÁN NẰM SERVER-SIDE
- *    UI chỉ hiển thị: tên cầu, %, kết quả
- *    API public: KHÔNG trả weights / công thức / markov table
+ * - Pattern 18+ / Ensemble Voting / Markov b1-3 / Hazard / Smoothing
+ * - Stoploss / Time-of-day / Cầu Chẵn-Lẻ / Cầu Cao-Thấp
+ * - Telegram / Backtest Tool
+ * 🔒 Toàn bộ thuật toán server-side, HTML/API KHÔNG lộ logic
  * ========================================================================
  */
 
@@ -66,6 +57,8 @@ const now = () => new Date().toISOString();
 const safeInt = (x, def = 0) => { const n = parseInt(x, 10); return Number.isFinite(n) ? n : def; };
 const flip = c => c === 'T' ? 'X' : (c === 'X' ? 'T' : null);
 const labelFromTX = c => c === 'T' ? 'Tài' : (c === 'X' ? 'Xỉu' : null);
+const labelFromParity = c => c === 'E' ? 'Chẵn' : (c === 'O' ? 'Lẻ' : null);
+const labelFromHalf = c => c === 'H' ? 'Cao' : (c === 'L' ? 'Thấp' : null);
 
 function safeReadJson(fp, fb = null) {
   try {
@@ -110,13 +103,11 @@ function itemToResult(item) {
 }
 function itemToParity(item) {
   const s = itemToSum(item);
-  if (s < 3) return null;
-  return s % 2 === 0 ? 'E' : 'O';
+  return s < 3 ? null : (s % 2 === 0 ? 'E' : 'O');
 }
 function itemToHalf(item) {
   const s = itemToSum(item);
-  if (s < 3) return null;
-  return s <= 10 ? 'L' : 'H';
+  return s < 3 ? null : (s <= 10 ? 'L' : 'H');
 }
 
 // ============ DB ============
@@ -125,10 +116,7 @@ function defaultDB() {
     version: VERSION,
     createdAt: now(), updatedAt: now(),
     history: [],
-    stats: {
-      total: 0, wins: 0, losses: 0, skips: 0,
-      currentStreak: 0, maxWinStreak: 0, maxLossStreak: 0
-    },
+    stats: { total: 0, wins: 0, losses: 0, skips: 0, currentStreak: 0, maxWinStreak: 0, maxLossStreak: 0 },
     signalStats: { total: 0, wins: 0, losses: 0, accuracy: 0 },
     byType: {},
     timeStats: {},
@@ -163,9 +151,8 @@ function saveDatabase(game, db) {
 }
 
 // ========================================================================
-// 🎯 SERVER-SIDE ENGINE — KHÔNG BAO GIỜ EXPORT RA API
+// 🎯 ENGINE (SERVER-SIDE ONLY)
 // ========================================================================
-
 function analyzeStreak(seq) {
   const n = seq.length;
   if (n === 0) return { type: null, length: 0 };
@@ -175,7 +162,6 @@ function analyzeStreak(seq) {
   return { type: last, length: len };
 }
 
-// ---------- HAZARD RATE ----------
 function computeHazardRates(db, field = 'ketQua') {
   const hist = (db.history || []).filter(h => h[field]);
   const streaks = [];
@@ -190,22 +176,15 @@ function computeHazardRates(db, field = 'ketQua') {
   }
   if (cur !== null) streaks.push({ type: cur, len: curLen });
 
-  const maxL = 15;
   const hazard = {};
-  for (let L = 2; L <= maxL; L++) {
-    let atL = 0, brokeAtL = 0;
-    // Đếm streak đạt độ dài L và streak kế tiếp có đổi type không
-    for (let i = 0; i < streaks.length - 1; i++) {
-      if (streaks[i].len >= L) atL++;
-      if (streaks[i].len === L && streaks[i + 1].type !== streaks[i].type) brokeAtL++;
-    }
-    if (atL >= 3) hazard[L] = brokeAtL / Math.max(1, streaks.filter(s => s.len === L).length);
-    else hazard[L] = 0.5;
+  for (let L = 2; L <= 15; L++) {
+    const atL = streaks.filter(s => s.len === L).length;
+    const brokeL = streaks.filter((s, i) => s.len === L && i < streaks.length - 1 && streaks[i + 1].type !== s.type).length;
+    hazard[L] = atL >= 3 ? brokeL / atL : 0.5;
   }
   return hazard;
 }
 
-// ---------- MARKOV CHAIN bậc 1-3 ----------
 function buildMarkov(seq, order = 2) {
   const counts = {};
   for (let i = order; i < seq.length; i++) {
@@ -222,34 +201,23 @@ function markovPredict(counts, seq, order) {
   const c = counts[key];
   if (!c) return null;
   const total = c.T + c.X;
-  if (total < 3) return null; // insufficient
-  return {
-    next: c.T >= c.X ? 'T' : 'X',
-    prob: Math.max(c.T, c.X) / total,
-    samples: total
-  };
+  if (total < 3) return null;
+  return { next: c.T >= c.X ? 'T' : 'X', prob: Math.max(c.T, c.X) / total, samples: total };
 }
 
-// ---------- PATTERN DETECT (giữ v9 + mở rộng) ----------
 function detectPatterns(seq) {
   const n = seq.length;
   if (n < 4) return [];
   const last = seq[n - 1];
   const results = [];
 
-  // BỆT
   const s = analyzeStreak(seq);
   if (s.length >= 4) {
-    if (s.length <= 7) {
-      results.push({ type: `BỆT_${s.length}`, next: last, confidence: Math.min(0.66 + (s.length - 4) * 0.04, 0.85), family: 'bet' });
-    } else if (s.length <= 10) {
-      results.push({ type: `BỆT_${s.length}_NGHI`, next: last, confidence: 0.55, family: 'bet' });
-    } else {
-      results.push({ type: `BỆT_${s.length}_GÃY`, next: flip(last), confidence: 0.62, family: 'bet' });
-    }
+    if (s.length <= 7) results.push({ type: `BỆT_${s.length}`, next: last, confidence: Math.min(0.66 + (s.length - 4) * 0.04, 0.85), family: 'bet' });
+    else if (s.length <= 10) results.push({ type: `BỆT_${s.length}_NGHI`, next: last, confidence: 0.55, family: 'bet' });
+    else results.push({ type: `BỆT_${s.length}_GÃY`, next: flip(last), confidence: 0.62, family: 'bet' });
   }
 
-  // 1-1
   {
     let alt = 0;
     for (let i = n - 1; i >= 1; i--) { if (seq[i] !== seq[i - 1]) alt++; else break; }
@@ -264,40 +232,23 @@ function detectPatterns(seq) {
   const T = 'T', X = 'X';
 
   const cycleMap = [
-    ['CẦU_2_2', [T,T,X,X,T,T,X,X], T],
-    ['CẦU_2_2', [X,X,T,T,X,X,T,T], X],
-    ['CẦU_2_2', [T,T,X,X,T,T], X],
-    ['CẦU_2_2', [X,X,T,T,X,X], T],
-    ['CẦU_2_2', [T,T,X,X], T],
-    ['CẦU_2_2', [X,X,T,T], X],
-    ['CẦU_3_3', [T,T,T,X,X,X,T,T,T], X],
-    ['CẦU_3_3', [X,X,X,T,T,T,X,X,X], T],
-    ['CẦU_3_3', [T,T,T,X,X,X], T],
-    ['CẦU_3_3', [X,X,X,T,T,T], X],
-    ['CẦU_4_4', [T,T,T,T,X,X,X,X], T],
-    ['CẦU_4_4', [X,X,X,X,T,T,T,T], X],
-    ['CẦU_5_5', [T,T,T,T,T,X,X,X,X,X], T],
-    ['CẦU_5_5', [X,X,X,X,X,T,T,T,T,T], X],
-    ['CẦU_1_2_1', [T,X,X,T,X,X,T,X], T],
-    ['CẦU_1_2_1', [X,T,T,X,T,T,X,T], X],
-    ['CẦU_1_2_1', [T,X,X,T,X], X],
-    ['CẦU_1_2_1', [X,T,T,X,T], T],
-    ['CẦU_2_1_2', [T,T,X,T,T,X], T],
-    ['CẦU_2_1_2', [X,X,T,X,X,T], X],
-    ['CẦU_1_3_1', [T,X,X,X,T], X],
-    ['CẦU_1_3_1', [X,T,T,T,X], T],
-    ['CẦU_2_1_1', [T,T,X,T,T,X,T,T], X],
-    ['CẦU_2_1_1', [X,X,T,X,X,T,X,X], T],
-    ['CẦU_1_1_2', [T,X,T,T,X,T,T], X],
-    ['CẦU_1_1_2', [X,T,X,X,T,X,X], T],
-    ['CẦU_3_2_3', [T,T,T,X,X,T,T,T], X],
-    ['CẦU_3_2_3', [X,X,X,T,T,X,X,X], T],
-    ['CẦU_2_3_2', [T,T,X,X,X,T,T], X],
-    ['CẦU_2_3_2', [X,X,T,T,T,X,X], T],
-    ['CẦU_3_1_3', [T,T,T,X,T,T,T], X],
-    ['CẦU_3_1_3', [X,X,X,T,X,X,X], T],
-    ['CẦU_MIRROR', [T,X,X,T], T],
-    ['CẦU_MIRROR', [X,T,T,X], X],
+    ['CẦU_2_2', [T,T,X,X,T,T,X,X], T], ['CẦU_2_2', [X,X,T,T,X,X,T,T], X],
+    ['CẦU_2_2', [T,T,X,X,T,T], X], ['CẦU_2_2', [X,X,T,T,X,X], T],
+    ['CẦU_2_2', [T,T,X,X], T], ['CẦU_2_2', [X,X,T,T], X],
+    ['CẦU_3_3', [T,T,T,X,X,X,T,T,T], X], ['CẦU_3_3', [X,X,X,T,T,T,X,X,X], T],
+    ['CẦU_3_3', [T,T,T,X,X,X], T], ['CẦU_3_3', [X,X,X,T,T,T], X],
+    ['CẦU_4_4', [T,T,T,T,X,X,X,X], T], ['CẦU_4_4', [X,X,X,X,T,T,T,T], X],
+    ['CẦU_5_5', [T,T,T,T,T,X,X,X,X,X], T], ['CẦU_5_5', [X,X,X,X,X,T,T,T,T,T], X],
+    ['CẦU_1_2_1', [T,X,X,T,X,X,T,X], T], ['CẦU_1_2_1', [X,T,T,X,T,T,X,T], X],
+    ['CẦU_1_2_1', [T,X,X,T,X], X], ['CẦU_1_2_1', [X,T,T,X,T], T],
+    ['CẦU_2_1_2', [T,T,X,T,T,X], T], ['CẦU_2_1_2', [X,X,T,X,X,T], X],
+    ['CẦU_1_3_1', [T,X,X,X,T], X], ['CẦU_1_3_1', [X,T,T,T,X], T],
+    ['CẦU_2_1_1', [T,T,X,T,T,X,T,T], X], ['CẦU_2_1_1', [X,X,T,X,X,T,X,X], T],
+    ['CẦU_1_1_2', [T,X,T,T,X,T,T], X], ['CẦU_1_1_2', [X,T,X,X,T,X,X], T],
+    ['CẦU_3_2_3', [T,T,T,X,X,T,T,T], X], ['CẦU_3_2_3', [X,X,X,T,T,X,X,X], T],
+    ['CẦU_2_3_2', [T,T,X,X,X,T,T], X], ['CẦU_2_3_2', [X,X,T,T,T,X,X], T],
+    ['CẦU_3_1_3', [T,T,T,X,T,T,T], X], ['CẦU_3_1_3', [X,X,X,T,X,X,X], T],
+    ['CẦU_MIRROR', [T,X,X,T], T], ['CẦU_MIRROR', [X,T,T,X], X]
   ];
   cycleMap.sort((a, b) => b[1].length - a[1].length);
   for (const [type, tail, next] of cycleMap) {
@@ -308,7 +259,6 @@ function detectPatterns(seq) {
     }
   }
 
-  // Tăng/giảm tiến
   {
     const blocks = [];
     let curT = seq[0], curL = 1;
@@ -320,162 +270,94 @@ function detectPatterns(seq) {
     if (blocks.length >= 3) {
       const last3 = blocks.slice(-3);
       const [a, b, c] = last3.map(x => x.len);
-      if (a < b && b < c && c <= 5) {
-        results.push({ type: 'CẦU_TĂNG_TIẾN', next: flip(last3[2].type), confidence: 0.60, family: 'progression' });
-      } else if (a > b && b > c && a <= 5) {
-        results.push({ type: 'CẦU_GIẢM_TIẾN', next: flip(last3[2].type), confidence: 0.58, family: 'progression' });
-      }
+      if (a < b && b < c && c <= 5) results.push({ type: 'CẦU_TĂNG_TIẾN', next: flip(last3[2].type), confidence: 0.60, family: 'progression' });
+      else if (a > b && b > c && a <= 5) results.push({ type: 'CẦU_GIẢM_TIẾN', next: flip(last3[2].type), confidence: 0.58, family: 'progression' });
     }
   }
 
-  // Chu kỳ lặp 5/6/7
   for (const period of [5, 6, 7]) {
     if (n < period * 2) continue;
-    const p1 = seq.slice(-period * 2, -period).join('');
-    const p2 = seq.slice(-period).join('');
-    if (p1 === p2) {
+    if (seq.slice(-period * 2, -period).join('') === seq.slice(-period).join(''))
       results.push({ type: `CẦU_LẶP_${period}`, next: seq[n - period], confidence: 0.68, family: 'periodic' });
-    }
   }
-
   return results;
 }
 
-// ---------- ENSEMBLE VOTING ----------
 function ensembleVote(patterns, markov, hazard, seq) {
-  let votes = { T: 0, X: 0 };
-  let detail = [];
-
-  for (const p of patterns) {
-    const weight = p.confidence;
-    votes[p.next] += weight;
-    detail.push({ type: p.type, next: p.next, conf: p.confidence, weight });
-  }
-
-  // Markov vote
-  if (markov) {
-    const w = markov.prob * 0.8; // scale down vì có thể thiếu sample
-    votes[markov.next] += w;
-    detail.push({ type: `MARKOV_b${markov.samples >= 5 ? 'R' : '?'}`, next: markov.next, conf: markov.prob, weight: w });
-  }
-
-  // Hazard vote cho bệt dài
+  const votes = { T: 0, X: 0 };
+  const detail = [];
+  for (const p of patterns) { votes[p.next] += p.confidence; detail.push({ type: p.type, next: p.next, conf: p.confidence }); }
+  if (markov) { const w = markov.prob * 0.8; votes[markov.next] += w; detail.push({ type: 'MARKOV', next: markov.next, conf: markov.prob }); }
   const streak = analyzeStreak(seq);
   if (streak.length >= 6 && hazard) {
     const h = hazard[Math.min(streak.length, 15)] || 0.5;
-    if (h > 0.55) {
-      const w = (h - 0.5) * 1.2;
-      votes[flip(streak.type)] += w;
-      detail.push({ type: 'HAZARD', next: flip(streak.type), conf: h, weight: w });
-    }
+    if (h > 0.55) { const w = (h - 0.5) * 1.2; votes[flip(streak.type)] += w; detail.push({ type: 'HAZARD', next: flip(streak.type), conf: h }); }
   }
-
   const total = votes.T + votes.X;
   if (total === 0) return { next: null, confidence: 0, votes, detail };
-
   const next = votes.T >= votes.X ? 'T' : 'X';
   const rawProb = Math.max(votes.T, votes.X) / total;
-
-  // Agreement bonus: càng nhiều pattern đồng thuận → tăng conf
   const agreeing = detail.filter(d => d.next === next).length;
-  const totalSig = detail.length;
-  const agreement = totalSig > 0 ? agreeing / totalSig : 0;
-
-  // Scale to realistic range (0.5 - 0.92)
+  const agreement = detail.length > 0 ? agreeing / detail.length : 0;
   let confidence = 0.5 + (rawProb - 0.5) * 0.6 + agreement * 0.15;
   confidence = Math.max(0.35, Math.min(0.92, confidence));
-
-  return { next, confidence, votes, detail, agreement, totalVotes: totalSig };
+  return { next, confidence, votes, detail, agreement, totalVotes: detail.length };
 }
 
-// ---------- EXPONENTIAL SMOOTHING cho byType ----------
 function smoothConfidence(type, rawConf, db, alpha = 0.3) {
   const t = db.byType[type];
   if (!t || t.total < 5) return rawConf;
   const acc = t.wins / t.total;
-  // Blend với historical accuracy
   return rawConf * (1 - alpha) + acc * alpha;
 }
 
-// ---------- STOPLOSS ----------
 function checkStoploss(db, session) {
   const sl = db.stoploss || { active: false, recoverUntil: 0, reason: '' };
-  if (sl.active && session < sl.recoverUntil) {
-    return { active: true, reason: sl.reason, recoverUntil: sl.recoverUntil };
-  }
-  // Auto-clear nếu qua thời gian
-  if (sl.active && session >= sl.recoverUntil) {
-    db.stoploss = { active: false, recoverUntil: 0, reason: '' };
-  }
+  if (sl.active && session < sl.recoverUntil) return { active: true, reason: sl.reason, recoverUntil: sl.recoverUntil };
+  if (sl.active && session >= sl.recoverUntil) db.stoploss = { active: false, recoverUntil: 0, reason: '' };
   return { active: false };
 }
 function updateStoploss(db, wasCorrect, wasPredict, session) {
-  if (!wasPredict) return;
-  const sl = db.stoploss || { active: false, recoverUntil: 0, reason: '' };
-  if (wasCorrect) return;
-  // Vừa thua — kiểm tra streak
+  if (!wasPredict || wasCorrect) return;
   const recent = db.history.slice(-STOPLOSS_LOSS_STREAK).filter(h => h.trangThai === 'SAI');
   if (recent.length >= STOPLOSS_LOSS_STREAK) {
-    db.stoploss = {
-      active: true,
-      recoverUntil: session + STOPLOSS_RECOVER_SESSIONS,
-      reason: `Thua ${STOPLOSS_LOSS_STREAK} phiên liên tiếp`
-    };
+    db.stoploss = { active: true, recoverUntil: session + STOPLOSS_RECOVER_SESSIONS, reason: `Thua ${STOPLOSS_LOSS_STREAK} phiên liên tiếp` };
     console.log(`[STOPLOSS] Active — nghỉ đến phiên ${session + STOPLOSS_RECOVER_SESSIONS}`);
   }
 }
 
-// ---------- MAIN PREDICT ----------
 function runPrediction(db, seq, game, session) {
   const empty = {
     code: null, label: null, tiLe: 'CHỜ',
     pattern: { type: 'NONE', confidence: 0 },
     streak: analyzeStreak(seq || []),
     shouldPredict: false,
-    stoploss: { active: false }
+    stoploss: { active: false },
+    secondary: null
   };
   if (!Array.isArray(seq) || seq.length < 4) return empty;
 
-  // Stoploss check
   const sl = checkStoploss(db, session);
-  if (sl.active) {
-    return { ...empty, stoploss: sl, tiLe: 'NGHỈ' };
-  }
+  if (sl.active) return { ...empty, stoploss: sl, tiLe: 'NGHỈ' };
 
-  // Patterns
   const patterns = detectPatterns(seq);
-
-  // Markov bậc 1,2,3
-  const markovs = [1, 2, 3].map(o => {
-    const counts = buildMarkov(seq, o);
-    return markovPredict(counts, seq, o);
-  }).filter(Boolean);
+  const markovs = [1, 2, 3].map(o => markovPredict(buildMarkov(seq, o), seq, o)).filter(Boolean);
   const markov = markovs.length > 0 ? markovs.reduce((best, m) => (!best || m.prob > best.prob) ? m : best) : null;
-
-  // Hazard
   const hazard = computeHazardRates(db);
-
-  // Ensemble
   const vote = ensembleVote(patterns, markov, hazard, seq);
 
-  if (!vote.next) {
-    return { ...empty, pattern: { type: 'NONE', confidence: 0 }, stoploss: { active: false } };
-  }
+  if (!vote.next) return { ...empty, stoploss: { active: false } };
 
-  // Smooth theo lịch sử của type chính
   const mainPattern = patterns.find(p => p.next === vote.next);
   let finalConf = vote.confidence;
   if (mainPattern) finalConf = smoothConfidence(mainPattern.type, finalConf, db, 0.25);
 
-  // Chỉ predict khi đủ điều kiện
   const shouldPredict = finalConf >= MIN_CONFIDENCE && vote.totalVotes >= ENSEMBLE_MIN_VOTES;
 
-  // Gộp tên cầu để hiển thị (KHÔNG lộ chi tiết)
   let displayType = 'NONE';
   if (patterns.length > 0) {
-    const topPatterns = patterns.filter(p => p.next === vote.next).slice(0, 2);
-    if (topPatterns.length > 0) displayType = topPatterns.map(p => p.type).join('+');
-    else displayType = patterns[0].type;
+    const top = patterns.filter(p => p.next === vote.next).slice(0, 2);
+    displayType = top.length > 0 ? top.map(p => p.type).join('+') : patterns[0].type;
   } else if (markov) {
     displayType = 'MARKOV';
   }
@@ -484,44 +366,114 @@ function runPrediction(db, seq, game, session) {
     code: shouldPredict ? vote.next : null,
     label: shouldPredict ? labelFromTX(vote.next) : null,
     tiLe: shouldPredict ? (finalConf * 100).toFixed(1) + '%' : 'CHỜ',
-    pattern: {
-      type: displayType,
-      confidence: Number(finalConf.toFixed(3)),
-      // KHÔNG trả votes/detail/hazard về client
-    },
+    pattern: { type: displayType, confidence: Number(finalConf.toFixed(3)) },
     streak: analyzeStreak(seq),
     shouldPredict,
-    stoploss: { active: false }
+    stoploss: { active: false },
+    secondary: null
   };
 }
 
-// ========================================================================
-// TELEGRAM NOTIFY
-// ========================================================================
-async function notifyTelegram(game, session, pred) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT) return;
-  if (!pred.shouldPredict) return;
-  const conf = parseFloat(pred.tiLe);
-  if (!(conf >= TELEGRAM_MIN_CONF * 100)) return;
+// ============ SECONDARY PREDICT: Chẵn/Lẻ + Cao/Thấp ============
+function runSecondaryPrediction(db, list) {
+  const paritySeq = list.slice(-MAX_HISTORY).map(itemToParity).filter(Boolean);
+  const halfSeq = list.slice(-MAX_HISTORY).map(itemToHalf).filter(Boolean);
 
-  const text = `🎯 <b>${game.toUpperCase()} #${session + 1}</b>\n` +
-    `📊 <b>${pred.label}</b> (${pred.tiLe})\n` +
-    `🎲 Cầu: ${pred.pattern.type}\n` +
-    `⏰ ${new Date().toLocaleTimeString('vi-VN')}`;
+  const result = { parity: null, half: null };
 
-  try {
-    await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      chat_id: TELEGRAM_CHAT, text, parse_mode: 'HTML'
-    }, { timeout: 5000 });
-    console.log(`[TELEGRAM] Sent ${game} #${session + 1}`);
-  } catch (e) {
-    console.error(`[TELEGRAM ERR]`, e?.message);
+  // Chẵn/Lẻ — chỉ predict nếu bệt >= 5 hoặc 1-1 >= 6
+  if (paritySeq.length >= 6) {
+    const st = analyzeStreak(paritySeq);
+    if (st.length >= 5 && st.length <= 8) {
+      result.parity = { code: st.type, label: labelFromParity(st.type), tiLe: (0.62 + Math.min((st.length - 5) * 0.04, 0.15) * 100).toFixed(1) + '%', pattern: `BỆT_${st.length}` };
+    } else if (st.length >= 9) {
+      const opp = st.type === 'E' ? 'O' : 'E';
+      result.parity = { code: opp, label: labelFromParity(opp), tiLe: '62.0%', pattern: `BỆT_${st.length}_GÃY` };
+    }
   }
+
+  // Cao/Thấp — tương tự
+  if (halfSeq.length >= 6) {
+    const st = analyzeStreak(halfSeq);
+    if (st.length >= 5 && st.length <= 8) {
+      result.half = { code: st.type, label: labelFromHalf(st.type), tiLe: (0.62 + Math.min((st.length - 5) * 0.04, 0.15) * 100).toFixed(1) + '%', pattern: `BỆT_${st.length}` };
+    } else if (st.length >= 9) {
+      const opp = st.type === 'H' ? 'L' : 'H';
+      result.half = { code: opp, label: labelFromHalf(opp), tiLe: '62.0%', pattern: `BỆT_${st.length}_GÃY` };
+    }
+  }
+
+  return result;
 }
 
-// ========================================================================
-// FETCH
-// ========================================================================
+// ============ BACKTEST ============
+function runBacktest(db, window = 100) {
+  const hist = (db.history || []).slice(-window);
+  let total = 0, wins = 0, losses = 0;
+  const byPattern = {};
+  const results = [];
+
+  // Replay: từ phiên thứ 5 trở đi, dùng dữ liệu trước đó để predict
+  for (let i = 4; i < hist.length; i++) {
+    const upTo = hist.slice(0, i);
+    const seq = upTo.map(h => h.ketQua).filter(Boolean);
+    if (seq.length < 4) continue;
+
+    const fakeDb = { ...db, history: upTo, byType: {} }; // tránh dùng byType của tương lai
+    const pred = runPrediction(fakeDb, seq, 'backtest', hist[i].phien);
+    if (!pred.shouldPredict) continue;
+
+    const actual = hist[i].ketQua;
+    const correct = pred.code === actual;
+    total++;
+    if (correct) wins++; else losses++;
+
+    const pType = pred.pattern.type;
+    if (!byPattern[pType]) byPattern[pType] = { total: 0, wins: 0 };
+    byPattern[pType].total++;
+    if (correct) byPattern[pType].wins++;
+
+    results.push({
+      phien: hist[i].phien,
+      predict: pred.code,
+      actual,
+      correct,
+      tiLe: pred.tiLe,
+      pattern: pType
+    });
+  }
+
+  const accuracy = total > 0 ? Number((wins / total * 100).toFixed(2)) : 0;
+
+  // Group by 20 để xem xu hướng
+  const chunks = [];
+  for (let i = 0; i < results.length; i += 20) {
+    const c = results.slice(i, i + 20);
+    const cw = c.filter(x => x.correct).length;
+    chunks.push({
+      range: `${i + 1}-${Math.min(i + 20, results.length)}`,
+      accuracy: Number((cw / c.length * 100).toFixed(1)),
+      total: c.length
+    });
+  }
+
+  return { total, wins, losses, accuracy, byPattern, results: results.slice(-50), chunks };
+}
+
+// ============ TELEGRAM ============
+async function notifyTelegram(game, session, pred) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT || !pred.shouldPredict) return;
+  const conf = parseFloat(pred.tiLe);
+  if (!(conf >= TELEGRAM_MIN_CONF * 100)) return;
+  const text = `🎯 <b>${game.toUpperCase()} #${session + 1}</b>\n📊 <b>${pred.label}</b> (${pred.tiLe})\n🎲 Cầu: ${pred.pattern.type}\n⏰ ${new Date().toLocaleTimeString('vi-VN')}`;
+  try {
+    await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+      { chat_id: TELEGRAM_CHAT, text, parse_mode: 'HTML' }, { timeout: 5000 });
+    console.log(`[TELEGRAM] Sent ${game} #${session + 1}`);
+  } catch (e) { console.error(`[TELEGRAM ERR]`, e?.message); }
+}
+
+// ============ FETCH ============
 async function fetchWithRetry(url, attempts = FETCH_RETRIES) {
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
@@ -549,9 +501,7 @@ function parseHistoryResponse(data) {
   return arr;
 }
 
-// ========================================================================
-// MAIN TICK
-// ========================================================================
+// ============ MAIN TICK ============
 async function processGameTick(game) {
   try {
     const api = APIS[game];
@@ -570,7 +520,6 @@ async function processGameTick(game) {
     const seq = list.slice(-MAX_HISTORY).map(itemToResult).filter(Boolean);
     if (seq.length < 4) return;
 
-    // Evaluate previous
     const prev = db.history[db.history.length - 1];
     if (prev && safeInt(prev.phienDuDoan) === session) {
       const actual = itemToResult(latest);
@@ -613,13 +562,12 @@ async function processGameTick(game) {
         db.signalStats.accuracy = db.signalStats.total > 0
           ? Number((db.signalStats.wins / db.signalStats.total * 100).toFixed(2)) : 0;
 
-        // Update stoploss
         updateStoploss(db, correct, true, session);
       }
     }
 
-    // New prediction
     const pred = runPrediction(db, seq, game, session);
+    const secondary = runSecondaryPrediction(db, list);
 
     db.history.push({
       phien: session,
@@ -627,23 +575,24 @@ async function processGameTick(game) {
       tong: itemToSum(latest),
       ketQua: itemToResult(latest),
       ketQuaLabel: labelFromTX(itemToResult(latest)),
+      parity: itemToParity(latest),
+      half: itemToHalf(latest),
       phienDuDoan: session + 1,
       DU_DOAN_CODE: pred.shouldPredict ? pred.code : null,
       DU_DOAN: pred.shouldPredict ? pred.label : (pred.stoploss?.active ? 'NGHỈ' : 'CHỜ'),
       TI_LE: pred.tiLe,
       pattern: pred.pattern,
       streak: pred.streak,
+      secondary,
       trangThai: 'ĐANG CHỜ',
       thoiGian: now()
     });
     if (db.history.length > MAX_HISTORY) db.history.splice(0, db.history.length - MAX_HISTORY);
     db.lastProcessedSession = session;
-
     saveDatabase(game, db);
 
     console.log(`[TICK] ${game} #${session} ${itemToSum(latest)}(${labelFromTX(itemToResult(latest))}) → ${pred.shouldPredict ? pred.label : (pred.stoploss?.active ? 'NGHỈ' : 'CHỜ')} [${pred.pattern.type} ${pred.tiLe}]`);
 
-    // Telegram only once per session
     if (pred.shouldPredict && db.lastSignaledSession !== session) {
       db.lastSignaledSession = session;
       notifyTelegram(game, session, pred).catch(() => {});
@@ -653,24 +602,18 @@ async function processGameTick(game) {
   }
 }
 
-// ========================================================================
-// POLLING
-// ========================================================================
+// ============ POLLING ============
 let pollingActive = true;
 function startPolling() {
   async function tick() {
     if (!pollingActive) return;
-    await Promise.all(Object.keys(APIS).map(async g => {
-      try { await processGameTick(g); } catch {}
-    }));
+    await Promise.all(Object.keys(APIS).map(async g => { try { await processGameTick(g); } catch {} }));
     if (pollingActive) setTimeout(tick, POLL_INTERVAL_MS);
   }
   tick();
 }
 
-// ========================================================================
-// FORMAT (chỉ những field AN TOÀN, KHÔNG lộ thuật toán)
-// ========================================================================
+// ============ FORMAT (SAFE) ============
 function formatItem(it) {
   if (!it) return null;
   return {
@@ -679,18 +622,24 @@ function formatItem(it) {
     tong: it.tong ?? 0,
     ketQua: it.ketQua || null,
     ketQuaLabel: it.ketQuaLabel || labelFromTX(it.ketQua),
+    parity: it.parity || null,
+    half: it.half || null,
     phienDuDoan: it.phienDuDoan,
     duDoan: it.DU_DOAN || 'CHỜ',
     duDoanCode: it.DU_DOAN_CODE || null,
     tiLe: it.TI_LE || 'CHỜ',
-    pattern: it.pattern && it.pattern.type ? { type: it.pattern.type } : null, // CHỈ tên
+    pattern: it.pattern?.type ? { type: it.pattern.type } : null,
+    secondary: it.secondary ? {
+      parity: it.secondary.parity ? { label: it.secondary.parity.label, tiLe: it.secondary.parity.tiLe } : null,
+      half: it.secondary.half ? { label: it.secondary.half.label, tiLe: it.secondary.half.tiLe } : null
+    } : null,
     trangThai: it.trangThai || null,
     thoiGian: it.thoiGian || null
   };
 }
 
 // ========================================================================
-// API PUBLIC (không lộ thuật toán)
+// API PUBLIC
 // ========================================================================
 app.get('/api/predict/:game', async (req, res) => {
   const game = req.params.game;
@@ -699,29 +648,30 @@ app.get('/api/predict/:game', async (req, res) => {
     const r = await fetchWithRetry(APIS[game]);
     const list = parseHistoryResponse(r.data);
     if (!list.length) return res.status(204).send();
-
     const seq = list.slice(-MAX_HISTORY).map(itemToResult).filter(Boolean);
     const db = loadDatabase(game);
     const latest = list[list.length - 1];
     const cs = safeInt(latest.SessionId || latest.session);
     const pred = runPrediction(db, seq, game, cs);
+    const secondary = runSecondaryPrediction(db, list);
 
     return res.json({
-      ok: true,
-      game,
+      ok: true, game,
       phien: cs,
       xucXac: itemToDice(latest),
       tong: itemToSum(latest),
       ketQua: itemToResult(latest),
       ketQuaLabel: labelFromTX(itemToResult(latest)),
+      parity: itemToParity(latest),
+      half: itemToHalf(latest),
       phienDuDoan: cs + 1,
       duDoan: pred.shouldPredict ? pred.label : (pred.stoploss?.active ? 'NGHỈ' : 'CHỜ'),
       duDoanCode: pred.shouldPredict ? pred.code : null,
       tiLe: pred.tiLe,
-      // CHỈ trả tên pattern, không trả chi tiết
-      pattern: pred.pattern && pred.pattern.type !== 'NONE' ? pred.pattern.type : null,
+      pattern: pred.pattern?.type && pred.pattern.type !== 'NONE' ? pred.pattern.type : null,
       shouldPredict: pred.shouldPredict,
       stoploss: pred.stoploss?.active ? { active: true, reason: pred.stoploss.reason } : { active: false },
+      secondary,
       serverTime: now()
     });
   } catch (e) {
@@ -769,6 +719,32 @@ function handleHistoryAll(req, res) {
 }
 app.get('/api/history/all', handleHistoryAll);
 
+// ============ BACKTEST API ============
+app.get('/api/backtest/:game', (req, res) => {
+  const game = req.params.game;
+  if (!DB_FILES[game]) return res.status(400).json({ ok: false, error: 'Bàn chơi không hợp lệ.' });
+  const db = loadDatabase(game);
+  const window = Math.max(20, Math.min(500, safeInt(req.query.window, 100)));
+  const result = runBacktest(db, window);
+  return res.json({ ok: true, game, window, ...result });
+});
+
+// ============ TIME ANALYSIS API ============
+app.get('/api/time-analysis/:game', (req, res) => {
+  const game = req.params.game;
+  if (!DB_FILES[game]) return res.status(400).json({ ok: false, error: 'Bàn chơi không hợp lệ.' });
+  const db = loadDatabase(game);
+  const out = {};
+  for (const slot of ['Sang', 'Chieu', 'Toi', 'Dem']) {
+    const t = db.timeStats[slot];
+    out[slot] = t ? {
+      total: t.total, wins: t.wins,
+      accuracy: t.total > 0 ? Number((t.wins / t.total * 100).toFixed(2)) : 0
+    } : { total: 0, wins: 0, accuracy: 0 };
+  }
+  return res.json({ ok: true, game, slots: out });
+});
+
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true, version: VERSION, uptime: process.uptime(),
@@ -777,16 +753,16 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// CSV Export
+// ============ CSV EXPORT ============
 app.get('/api/export/:game', (req, res) => {
   const game = req.params.game;
   if (!DB_FILES[game]) return res.status(400).send('Invalid game');
   const db = loadDatabase(game);
-  let csv = 'Phiên,XúcXắc,Tổng,KếtQuả,PhiênDựĐoán,DựĐoán,TỉLệ,LoạiCầu,TrạngThái,ThờiGian\n';
+  let csv = 'Phiên,XúcXắc,Tổng,KếtQuả,ChẵnLẻ,CaoThấp,PhiênDựĐoán,DựĐoán,TỉLệ,LoạiCầu,TrạngThái,ThờiGian\n';
   db.history.forEach(it => {
     const dice = (it.xucXac || []).join('-');
     const pType = it.pattern?.type || '';
-    csv += `${it.phien},"${dice}",${it.tong || ''},${it.ketQuaLabel || ''},${it.phienDuDoan},${it.DU_DOAN || ''},${it.TI_LE || ''},"${pType}",${it.trangThai || ''},${it.thoiGian || ''}\n`;
+    csv += `${it.phien},"${dice}",${it.tong || ''},${it.ketQuaLabel || ''},${it.parity || ''},${it.half || ''},${it.phienDuDoan},${it.DU_DOAN || ''},${it.TI_LE || ''},"${pType}",${it.trangThai || ''},${it.thoiGian || ''}\n`;
   });
   res.header('Content-Type', 'text/csv; charset=utf-8');
   res.attachment(`lich_su_${game}.csv`);
@@ -794,7 +770,7 @@ app.get('/api/export/:game', (req, res) => {
 });
 
 // ========================================================================
-// UI — KHÔNG CÓ LOGIC THUẬT TOÁN NÀO TRONG HTML
+// UI — KHÔNG LOGIC THUẬT TOÁN
 // ========================================================================
 app.get('/:game', (req, res) => {
   const game = req.params.game;
@@ -806,11 +782,9 @@ app.get('/:game', (req, res) => {
   const rows = db.history.slice(-50).reverse();
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   const slActive = db.stoploss?.active;
+  const latestItem = db.history[db.history.length - 1];
 
-  const shortType = t => t
-    .replace(/^CẦU_/, '')
-    .replace(/_/g, '-')
-    .replace(/^BỆT_/, 'BỆT ');
+  const shortType = t => t.replace(/^CẦU_/, '').replace(/_/g, '-').replace(/^BỆT_/, 'BỆT ');
 
   const html = `<!DOCTYPE html>
 <html lang="vi">
@@ -831,6 +805,12 @@ app.get('/:game', (req, res) => {
     border-radius:12px;margin-bottom:14px;border:1px solid #ef4444;text-align:center}
   .stoploss-banner .t{font-weight:700;color:#fecaca;font-size:13px}
   .stoploss-banner .r{font-size:11px;color:#fca5a5;margin-top:4px}
+  .signal-box{background:linear-gradient(135deg,#064e3b,#065f46);padding:14px;
+    border-radius:12px;margin-bottom:14px;border:1px solid #10b981;}
+  .signal-box .title{font-size:12px;color:#6ee7b7;font-weight:600;margin-bottom:8px}
+  .signal-main{font-size:22px;font-weight:800;color:#fff;margin-bottom:4px}
+  .signal-sub{font-size:11px;color:#a7f3d0}
+  .signal-secondary{font-size:11px;color:#6ee7b7;margin-top:8px;padding-top:8px;border-top:1px solid rgba(16,185,129,0.3)}
   .stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px}
   .stat-card{background:linear-gradient(135deg,#1e293b,#0f172a);padding:10px;border-radius:10px;
     text-align:center;border:1px solid #334155;}
@@ -869,6 +849,7 @@ app.get('/:game', (req, res) => {
   .link-box{background:linear-gradient(135deg,#064e3b,#065f46);padding:12px;border-radius:12px;
     margin-bottom:14px;border:1px solid #10b981}
   .link-box .title{font-size:12px;color:#6ee7b7;font-weight:600;margin-bottom:6px}
+  .acc-good{color:#22c55e}.acc-mid{color:#eab308}.acc-bad{color:#ef4444}
 </style>
 <script>
   setTimeout(()=>location.reload(), 10000);
@@ -892,6 +873,18 @@ app.get('/:game', (req, res) => {
     <div class="r">${db.stoploss.reason} — hồi phục sau phiên ${db.stoploss.recoverUntil}</div>
   </div>` : ''}
 
+  ${latestItem && latestItem.DU_DOAN_CODE ? `
+  <div class="signal-box">
+    <div class="title">🎯 TÍN HIỆU PHIÊN #${latestItem.phienDuDoan}</div>
+    <div class="signal-main ${latestItem.DU_DOAN_CODE === 'T' ? 'tai' : 'xiu'}">${latestItem.DU_DOAN} — ${latestItem.TI_LE}</div>
+    <div class="signal-sub">Cầu: ${latestItem.pattern?.type || 'N/A'}</div>
+    ${latestItem.secondary && (latestItem.secondary.parity || latestItem.secondary.half) ? `
+    <div class="signal-secondary">
+      ${latestItem.secondary.parity ? `⚖️ ${latestItem.secondary.parity.label} (${latestItem.secondary.parity.tiLe})` : ''}
+      ${latestItem.secondary.half ? ` | 📊 ${latestItem.secondary.half.label} (${latestItem.secondary.half.tiLe})` : ''}
+    </div>` : ''}
+  </div>` : ''}
+
   <div class="stats-grid">
     <div class="stat-card"><div class="label">Dự đoán</div><div class="value blue">${db.stats.total}</div></div>
     <div class="stat-card"><div class="label">Thắng</div><div class="value green">${db.stats.wins}</div></div>
@@ -903,14 +896,9 @@ app.get('/:game', (req, res) => {
 
   <div class="link-box">
     <div class="title">🔗 API</div>
-    <div class="link-row">
-      <span>${baseUrl}/api/predict/${game}</span>
-      <button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}', this)">Copy</button>
-    </div>
-    <div class="link-row">
-      <span>${baseUrl}/json/${game}</span>
-      <button class="copy-btn" onclick="copyText('${baseUrl}/json/${game}', this)">Copy</button>
-    </div>
+    <div class="link-row"><span>${baseUrl}/api/predict/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/predict/${game}', this)">Copy</button></div>
+    <div class="link-row"><span>${baseUrl}/json/${game}</span><button class="copy-btn" onclick="copyText('${baseUrl}/json/${game}', this)">Copy</button></div>
+    <div class="link-row"><span>${baseUrl}/api/backtest/${game}?window=100</span><button class="copy-btn" onclick="copyText('${baseUrl}/api/backtest/${game}?window=100', this)">Copy</button></div>
   </div>
 
   <div class="section-title">📊 50 phiên gần nhất</div>
@@ -962,14 +950,18 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 HOANG VIP v${VERSION} — FULL ENGINE`);
   console.log(`========================================`);
   console.log(`Port: ${PORT} | Poll: ${POLL_INTERVAL_MS}ms | MinConf: ${MIN_CONFIDENCE}`);
-  console.log(`✅ Ensemble Voting + Markov b1-3 + Hazard + Stoploss`);
-  console.log(`✅ UI/HTML KHÔNG chứa logic thuật toán`);
+  console.log(`✅ Ensemble + Markov + Hazard + Smoothing + Stoploss`);
+  console.log(`✅ Secondary: Chẵn/Lẻ + Cao/Thấp`);
+  console.log(`✅ Backtest + Time Analysis + CSV Export`);
+  console.log(`✅ UI/HTML 0 dòng logic thuật toán`);
   console.log(`✅ Telegram: ${TELEGRAM_TOKEN ? 'ON' : 'OFF'}`);
   console.log(`Endpoints:`);
-  console.log(`  /${Object.keys(APIS)[0]}            (UI)`);
-  console.log(`  /api/predict/{game}   (JSON predict)`);
-  console.log(`  /json/{game}          (JSON full)`);
-  console.log(`  /api/health           (health)`);
+  console.log(`  /${Object.keys(APIS)[0]}                        (UI)`);
+  console.log(`  /api/predict/{game}               (predict)`);
+  console.log(`  /json/{game}                      (data)`);
+  console.log(`  /api/backtest/{game}?window=100   (backtest)`);
+  console.log(`  /api/time-analysis/{game}         (time)`);
+  console.log(`  /api/health                       (health)`);
   console.log(`========================================`);
   startPolling();
 });
