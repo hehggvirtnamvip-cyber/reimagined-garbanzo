@@ -1,14 +1,12 @@
 {
-  "name": "hoang-vip-secure",
-  "version": "15.0.0",
+  "name": "hoang-vip-v18-secure",
+  "version": "18.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "install": "node-gyp rebuild"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "axios": "^1.6.0",
-    "node-gyp": "^10.0.0"
+    "axios": "^1.6.0"
   }
 }
