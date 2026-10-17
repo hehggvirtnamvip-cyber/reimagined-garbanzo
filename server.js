@@ -1,9 +1,8 @@
 'use strict';
 
 // language: JavaScript (Node.js >= 18), file: server.js
-// *regime-switch engine: 6 regime detectors (PERSIST / ANTI-PERSIST / ALTERNATE / BLOCK / CHAOS / TREND)
-// *bayesian-weighted ensemble with online learning per regime
-// *target: chuỗi thực ảnh (đảo liên tục) + bệt dài + block + composite*
+// *40+ pattern matchers: bệt, 1-1, 2-2, 3-3, 4-4, 1-2-1, 2-1-2, 1-3-1, 3-1-3, 2-3-2, 3-2-3, 1-4-1, 4-2, 2-4, nghiêng, so le, gối, đảo, nhảy cóc, zic-zac, bẻ, xóc đĩa, đối xứng, lặp kép, bậc thang, tam giác, hỗn hợp, mixed-block*
+// *regime Bayesian + pattern-library dual layer*
 
 const express = require('express');
 const axios = require('axios');
@@ -37,14 +36,8 @@ function readDB(g) {
     const p = path.join(DB_DIR, `db_${g}.json`);
     try { if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) {}
     return {
-        history: [],
-        lastProcessedSession: null,
-        // Bayesian priors: regime -> { correct, total }
-        regimeStats: {},
-        // Pattern-level tracking
-        patternStats: {},
-        // Sliding window memory of last 200 predictions
-        mem: [],
+        history: [], lastProcessedSession: null,
+        regimeStats: {}, patternStats: {}, mem: [],
         meta: { totalPred: 0, totalWin: 0, recent50: [] }
     };
 }
@@ -64,27 +57,24 @@ function getResult(item) {
 }
 
 // ============================================================
-// RUN-LENGTH + STATISTICAL HELPERS
+// RUN-LENGTH + STATISTICAL
 // ============================================================
 function rle(seq) {
-    const out = []; let cur = seq[0], len = 1;
+    const out = []; if (!seq.length) return out;
+    let cur = seq[0], len = 1;
     for (let i = 1; i < seq.length; i++) {
         if (seq[i] === cur) len++;
         else { out.push({ ch: cur, len }); cur = seq[i]; len = 1; }
     }
-    if (cur) out.push({ ch: cur, len });
+    out.push({ ch: cur, len });
     return out;
 }
-
-// entropy của chuỗi nhị phân
 function binaryEntropy(arr) {
     if (!arr.length) return 0;
     const p = arr.filter(x => x === 'T').length / arr.length;
     if (p === 0 || p === 1) return 0;
     return -(p * Math.log2(p) + (1 - p) * Math.log2(1 - p));
 }
-
-// run lengths distribution — mean/std của block
 function blockStats(seq) {
     const r = rle(seq);
     if (r.length < 2) return { mean: 1, std: 0, max: 1, count: r.length };
@@ -95,255 +85,440 @@ function blockStats(seq) {
 }
 
 // ============================================================
-// REGIME DETECTION — 6 regimes
-// Mỗi regime quyết định CÁCH predict, không phải predict cái gì
+// PATTERN LIBRARY — 40+ cầu
+// Mỗi entry: { name, check(seq, rle, sums) => { code, conf } | null }
 // ============================================================
-function detectRegime(seq) {
-    if (!seq || seq.length < 8) return { name: 'COLD', confidence: 0.5 };
-    const n = seq.length;
-    const win = seq.slice(-Math.min(30, n));
-    const bs = blockStats(win);
-    const ent = binaryEntropy(win);
-    const r = rle(win);
+const PATTERN_LIBRARY = [
 
-    // 1. PERSIST — bệt dài đang chạy
-    const last = win[win.length - 1];
-    let streak = 1;
-    for (let i = win.length - 2; i >= 0; i--) { if (win[i] === last) streak++; else break; }
-    if (streak >= 4) {
-        return { name: 'PERSIST', confidence: Math.min(0.95, 0.6 + (streak - 3) * 0.08), streak, last };
-    }
+    // --- BỆT / STREAK (3 loại) ---
+    { name: 'BỆT-3-THEO', check: (s, r) => {
+        if (!r.length || r[r.length-1].len !== 3) return null;
+        return { code: r[r.length-1].ch, conf: 0.70 };
+    }},
+    { name: 'BỆT-4-THEO', check: (s, r) => {
+        if (!r.length || r[r.length-1].len !== 4) return null;
+        return { code: r[r.length-1].ch, conf: 0.75 };
+    }},
+    { name: 'BỆT-5-7-THEO', check: (s, r) => {
+        if (!r.length) return null;
+        const l = r[r.length-1].len;
+        if (l < 5 || l > 7) return null;
+        return { code: r[r.length-1].ch, conf: 0.68 };
+    }},
+    { name: 'BỆT-8-10-GÃY', check: (s, r) => {
+        if (!r.length) return null;
+        const l = r[r.length-1].len;
+        if (l < 8 || l > 10) return null;
+        return { code: flip(r[r.length-1].ch), conf: 0.80 };
+    }},
+    { name: 'BỆT-11+CHẮC-GÃY', check: (s, r) => {
+        if (!r.length) return null;
+        if (r[r.length-1].len < 11) return null;
+        return { code: flip(r[r.length-1].ch), conf: 0.88 };
+    }},
 
-    // 2. ANTI-PERSIST — đảo liên tục sau 1-3 phiên (như ảnh)
-    //    Metric: mean block length thấp + entropy trung bình
-    if (bs.mean <= 2.2 && r.length >= 6) {
-        // check ratio of 1-length blocks
-        const shortBlocks = r.filter(b => b.len === 1).length;
-        const ratio = shortBlocks / r.length;
-        if (ratio >= 0.45) {
-            return { name: 'ANTI-PERSIST', confidence: Math.min(0.90, 0.5 + ratio * 0.5), meanBlk: bs.mean, shortRatio: ratio };
+    // --- 1-1 ALTERNATE ---
+    { name: 'CẦU-1-1', check: (s) => {
+        const n = s.length; if (n < 6) return null;
+        let alt = 0;
+        for (let i = n - 1; i >= 1; i--) { if (s[i] !== s[i-1]) alt++; else break; }
+        if (alt >= 4 && alt <= 12) return { code: flip(s[n-1]), conf: 0.65 + Math.min(alt, 10) * 0.03 };
+        return null;
+    }},
+
+    // --- 2-2 ---
+    { name: 'CẦU-2-2', check: (s) => {
+        if (s.length < 8) return null;
+        const tail = s.slice(-6).join('');
+        if (['TTXXTT','XXTTXX'].includes(tail)) return { code: flip(s[s.length-1]), conf: 0.72 };
+        if (['TTXXTTXX','XXTTXXTT'].includes(s.slice(-8).join(''))) return { code: s[s.length-1], conf: 0.75 };
+        return null;
+    }},
+
+    // --- 3-3 ---
+    { name: 'CẦU-3-3', check: (s) => {
+        if (s.length < 6) return null;
+        const tail = s.slice(-6).join('');
+        if (['TTTXXX','XXXTTT'].includes(tail)) return { code: flip(s[s.length-1]), conf: 0.78 };
+        if (['TTTXXXTTT','XXXTTTXXX'].includes(s.slice(-9).join(''))) return { code: s[s.length-1], conf: 0.75 };
+        return null;
+    }},
+
+    // --- 4-4 ---
+    { name: 'CẦU-4-4', check: (s) => {
+        if (s.length < 8) return null;
+        const tail = s.slice(-8).join('');
+        if (['TTTTXXXX','XXXXTTTT'].includes(tail)) return { code: flip(s[s.length-1]), conf: 0.82 };
+        return null;
+    }},
+
+    // --- 1-2-1 ---
+    { name: 'CẦU-1-2-1', check: (s) => {
+        if (s.length < 5) return null;
+        const tail = s.slice(-5).join('');
+        if (tail === 'TXXTX') return { code: 'X', conf: 0.72 };
+        if (tail === 'XTTXT') return { code: 'T', conf: 0.72 };
+        if (s.slice(-6).join('') === 'TXXTXX') return { code: 'T', conf: 0.75 };
+        if (s.slice(-6).join('') === 'XTTXTT') return { code: 'X', conf: 0.75 };
+        return null;
+    }},
+
+    // --- 2-1-2 ---
+    { name: 'CẦU-2-1-2', check: (s) => {
+        if (s.length < 5) return null;
+        const tail = s.slice(-5).join('');
+        if (tail === 'TTXTT') return { code: 'T', conf: 0.72 };
+        if (tail === 'XXTXX') return { code: 'X', conf: 0.72 };
+        return null;
+    }},
+
+    // --- 1-3-1 ---
+    { name: 'CẦU-1-3-1', check: (s) => {
+        if (s.length < 5) return null;
+        const tail = s.slice(-5).join('');
+        if (tail === 'TXXXT') return { code: 'X', conf: 0.70 };
+        if (tail === 'XTTTX') return { code: 'T', conf: 0.70 };
+        return null;
+    }},
+
+    // --- 3-1-3 ---
+    { name: 'CẦU-3-1-3', check: (s) => {
+        if (s.length < 7) return null;
+        const tail = s.slice(-7).join('');
+        if (tail === 'TTT X TTT'.replace(/ /g,'')) return { code: 'T', conf: 0.74 };
+        if (tail === 'XXX T XXX'.replace(/ /g,'')) return { code: 'X', conf: 0.74 };
+        return null;
+    }},
+
+    // --- 2-3-2 ---
+    { name: 'CẦU-2-3-2', check: (s) => {
+        if (s.length < 7) return null;
+        const t = s.slice(-7).join('');
+        if (t === 'TTXXXTT') return { code: 'T', conf: 0.72 };
+        if (t === 'XXTTTXX') return { code: 'X', conf: 0.72 };
+        return null;
+    }},
+
+    // --- 3-2-3 ---
+    { name: 'CẦU-3-2-3', check: (s) => {
+        if (s.length < 8) return null;
+        const t = s.slice(-8).join('');
+        if (t === 'TTTXXTTT') return { code: 'T', conf: 0.74 };
+        if (t === 'XXXTTXXX') return { code: 'X', conf: 0.74 };
+        return null;
+    }},
+
+    // --- 1-4-1 ---
+    { name: 'CẦU-1-4-1', check: (s) => {
+        if (s.length < 6) return null;
+        const t = s.slice(-6).join('');
+        if (t === 'TXXXXT') return { code: 'X', conf: 0.72 };
+        if (t === 'XTTTTX') return { code: 'T', conf: 0.72 };
+        return null;
+    }},
+
+    // --- 4-2 / 2-4 ---
+    { name: 'CẦU-4-2', check: (s) => {
+        if (s.length < 6) return null;
+        const t = s.slice(-6).join('');
+        if (t === 'TTTTXX') return { code: 'X', conf: 0.76 };
+        if (t === 'XXXXTT') return { code: 'T', conf: 0.76 };
+        return null;
+    }},
+    { name: 'CẦU-2-4', check: (s) => {
+        if (s.length < 6) return null;
+        const t = s.slice(-6).join('');
+        if (t === 'TTXXXX') return { code: 'X', conf: 0.76 };
+        if (t === 'XXTTTT') return { code: 'T', conf: 0.76 };
+        return null;
+    }},
+
+    // --- NGHIÊNG (block giảm dần) ---
+    { name: 'CẦU-NGHIÊNG-GIẢM', check: (s, r) => {
+        if (r.length < 3) return null;
+        const [a, b, c] = r.slice(-3);
+        if (a.len > b.len && b.len > c.len) return { code: flip(s[s.length-1]), conf: 0.70 };
+        return null;
+    }},
+    { name: 'CẦU-NGHIÊNG-TĂNG', check: (s, r) => {
+        if (r.length < 3) return null;
+        const [a, b, c] = r.slice(-3);
+        if (a.len < b.len && b.len < c.len) return { code: flip(s[s.length-1]), conf: 0.70 };
+        return null;
+    }},
+
+    // --- SO LE (1-2-1-2...) ---
+    { name: 'CẦU-SO-LE', check: (s, r) => {
+        if (r.length < 4) return null;
+        const sizes = r.slice(-4).map(b => b.len);
+        if (sizes.every((x, i) => i % 2 === 0 ? x === sizes[0] : x === sizes[1]) && sizes[0] !== sizes[1]) {
+            return { code: flip(s[s.length-1]), conf: 0.72 };
         }
-    }
+        return null;
+    }},
 
-    // 3. ALTERNATE — 1-1 thuần (T X T X T X)
-    let altRun = 0;
-    for (let i = win.length - 1; i >= 1; i--) { if (win[i] !== win[i - 1]) altRun++; else break; }
-    if (altRun >= 4) {
-        return { name: 'ALTERNATE', confidence: Math.min(0.92, 0.5 + altRun * 0.06), altRun };
-    }
+    // --- GỐI (block lớn kẹp block nhỏ) ---
+    { name: 'CẦU-GỐI', check: (s, r) => {
+        if (r.length < 3) return null;
+        const [a, b, c] = r.slice(-3);
+        if (a.len >= 3 && b.len === 1 && c.len >= 3) return { code: flip(s[s.length-1]), conf: 0.72 };
+        return null;
+    }},
 
-    // 4. BLOCK — block đều đặn (3-3, 4-4, 2-2)
-    if (r.length >= 3) {
-        const last3 = r.slice(-3).map(b => b.len);
-        if (last3[0] === last3[1] && last3[1] === last3[2]) {
-            return { name: 'BLOCK', confidence: 0.80, blockSize: last3[0], color: r[r.length - 1].ch };
+    // --- ĐẢO (reversal sau bệt) ---
+    { name: 'CẦU-ĐẢO', check: (s, r) => {
+        if (r.length < 4) return null;
+        const last = r[r.length-1];
+        const prev = r[r.length-2];
+        if (prev.len >= 3 && last.len <= 2) return { code: flip(s[s.length-1]), conf: 0.65 };
+        return null;
+    }},
+
+    // --- NHẢY CÓC (block size nhảy cóc) ---
+    { name: 'CẦU-NHẢY-CÓC', check: (s, r) => {
+        if (r.length < 4) return null;
+        const sizes = r.slice(-4).map(b => b.len);
+        if (sizes[0] === sizes[2] && sizes[1] === sizes[3] && sizes[0] !== sizes[1]) {
+            return { code: sizes[sizes.length-1] === sizes[1] ? flip(s[s.length-1]) : s[s.length-1], conf: 0.70 };
         }
-    }
+        return null;
+    }},
 
-    // 5. TREND — phân phối lệch mạnh về 1 phía
-    const tRatio = win.filter(x => x === 'T').length / win.length;
-    if (tRatio >= 0.65 || tRatio <= 0.35) {
-        return { name: 'TREND', confidence: 0.65, tRatio };
-    }
+    // --- ZIC-ZAC (1-2-1-2-1) ---
+    { name: 'CẦU-ZIC-ZAC', check: (s, r) => {
+        if (r.length < 5) return null;
+        const sizes = r.slice(-5).map(b => b.len);
+        if (sizes[0] === 1 && sizes[1] === 2 && sizes[2] === 1 && sizes[3] === 2 && sizes[4] === 1) {
+            return { code: flip(s[s.length-1]), conf: 0.74 };
+        }
+        return null;
+    }},
 
-    // 6. CHAOS — không có pattern rõ
-    return { name: 'CHAOS', confidence: 0.40, entropy: ent, meanBlk: bs.mean };
-}
+    // --- BẺ (block cuối dài bất thường) ---
+    { name: 'CẦU-BẺ', check: (s, r) => {
+        if (r.length < 4) return null;
+        const last = r[r.length-1];
+        const prev3 = r.slice(-4, -1).map(b => b.len);
+        const avg = prev3.reduce((a,b)=>a+b,0)/3;
+        if (last.len >= avg * 2.5 && last.len >= 4) return { code: flip(s[s.length-1]), conf: 0.70 };
+        return null;
+    }},
+
+    // --- XÓC ĐĨA (block 2 xen 1) ---
+    { name: 'CẦU-XÓC-ĐĨA', check: (s, r) => {
+        if (r.length < 5) return null;
+        const sizes = r.slice(-5).map(b => b.len);
+        const pattern = sizes.join('-');
+        if (['2-1-2-1-2','1-2-1-2-1'].includes(pattern)) return { code: flip(s[s.length-1]), conf: 0.72 };
+        return null;
+    }},
+
+    // --- ĐỐI XỨNG (mirror block) ---
+    { name: 'CẦU-ĐỐI-XỨNG', check: (s, r) => {
+        if (r.length < 4) return null;
+        const sizes = r.slice(-4).map(b => b.len);
+        if (sizes[0] === sizes[3] && sizes[1] === sizes[2] && sizes[0] !== sizes[1]) {
+            return { code: flip(s[s.length-1]), conf: 0.73 };
+        }
+        return null;
+    }},
+
+    // --- LẶP KÉP (chu kỳ 2 block lặp) ---
+    { name: 'CẦU-LẶP-KÉP', check: (s, r) => {
+        if (r.length < 4) return null;
+        const A = r.slice(-4, -2);
+        const B = r.slice(-2);
+        if (A[0].ch === B[0].ch && A[0].len === B[0].len && A[1].ch === B[1].ch && A[1].len === B[1].len) {
+            return { code: A[0].ch, conf: 0.78 };
+        }
+        return null;
+    }},
+
+    // --- BẬC THANG ---
+    { name: 'CẦU-BẬC-THANG', check: (s, r) => {
+        if (r.length < 4) return null;
+        const sizes = r.slice(-4).map(b => b.len);
+        if ((sizes[0]+1 === sizes[1] && sizes[1]+1 === sizes[2] && sizes[2]+1 === sizes[3]) ||
+            (sizes[0]-1 === sizes[1] && sizes[1]-1 === sizes[2] && sizes[2]-1 === sizes[3])) {
+            return { code: flip(s[s.length-1]), conf: 0.68 };
+        }
+        return null;
+    }},
+
+    // --- TAM GIÁC (block tăng rồi giảm) ---
+    { name: 'CẦU-TAM-GIÁC', check: (s, r) => {
+        if (r.length < 5) return null;
+        const sizes = r.slice(-5).map(b => b.len);
+        if (sizes[0] < sizes[1] && sizes[1] < sizes[2] && sizes[2] > sizes[3] && sizes[3] > sizes[4]) {
+            return { code: flip(s[s.length-1]), conf: 0.70 };
+        }
+        if (sizes[0] > sizes[1] && sizes[1] > sizes[2] && sizes[2] < sizes[3] && sizes[3] < sizes[4]) {
+            return { code: flip(s[s.length-1]), conf: 0.70 };
+        }
+        return null;
+    }},
+
+    // --- MARKOV / LẶP CHUỖI ---
+    { name: 'LẶP-CHUỖI-5', check: (s) => {
+        if (s.length < 10) return null;
+        if (s.slice(-10, -5).join('') === s.slice(-5).join('')) return { code: s[s.length-5], conf: 0.75 };
+        return null;
+    }},
+    { name: 'LẶP-CHUỖI-6', check: (s) => {
+        if (s.length < 12) return null;
+        if (s.slice(-12, -6).join('') === s.slice(-6).join('')) return { code: s[s.length-6], conf: 0.75 };
+        return null;
+    }},
+    { name: 'LẶP-CHUỖI-7', check: (s) => {
+        if (s.length < 14) return null;
+        if (s.slice(-14, -7).join('') === s.slice(-7).join('')) return { code: s[s.length-7], conf: 0.75 };
+        return null;
+    }},
+
+    // --- HỖN HỢP ---
+    { name: 'TTTX-REPEAT', check: (s) => {
+        if (s.length < 8) return null;
+        const t = s.slice(-8).join('');
+        if (t === 'TTTXTTTX') return { code: 'T', conf: 0.78 };
+        if (t === 'XXXTXXXT') return { code: 'X', conf: 0.78 };
+        return null;
+    }},
+    { name: 'TTXX-TTXX-REPEAT', check: (s) => {
+        if (s.length < 8) return null;
+        const t = s.slice(-8).join('');
+        if (t === 'TTXXTTXX') return { code: 'T', conf: 0.72 };
+        if (t === 'XXTTXXTT') return { code: 'X', conf: 0.72 };
+        return null;
+    }},
+
+    // --- ANTI-RATIO ---
+    { name: 'ANTI-RATIO-10', check: (s) => {
+        if (s.length < 10) return null;
+        const t = s.slice(-10).filter(x => x === 'T').length;
+        if (t >= 8) return { code: 'X', conf: 0.60 };
+        if (t <= 2) return { code: 'T', conf: 0.60 };
+        return null;
+    }},
+
+    // --- SUM-BASED (chỉ chạy khi có sums) ---
+    { name: 'SUM-HIGH-REVERSAL', check: (s, r, sums) => {
+        if (!sums || sums.length < 5) return null;
+        const last5 = sums.slice(-5);
+        const avg = last5.reduce((a,b)=>a+b,0)/5;
+        if (avg >= 14) return { code: 'X', conf: 0.65 };
+        return null;
+    }},
+    { name: 'SUM-LOW-REVERSAL', check: (s, r, sums) => {
+        if (!sums || sums.length < 5) return null;
+        const last5 = sums.slice(-5);
+        const avg = last5.reduce((a,b)=>a+b,0)/5;
+        if (avg <= 7) return { code: 'T', conf: 0.65 };
+        return null;
+    }},
+
+    // --- BOUNDARY (sum 10-11 xuất hiện liên tiếp) ---
+    { name: 'SUM-NEAR-BOUNDARY', check: (s, r, sums) => {
+        if (!sums || sums.length < 3) return null;
+        const last3 = sums.slice(-3);
+        const near = last3.filter(x => x === 10 || x === 11).length;
+        if (near >= 2) {
+            const l = last3[last3.length-1];
+            return { code: l === 10 ? 'X' : 'T', conf: 0.62 };
+        }
+        return null;
+    }}
+];
 
 // ============================================================
-// PREDICTOR PER REGIME
-// Mỗi regime có chiến thuật dự đoán riêng
+// RUN FULL PATTERN LIBRARY
 // ============================================================
-function predictByRegime(regime, seq) {
-    const n = seq.length;
-    const last = seq[n - 1];
-
-    switch (regime.name) {
-        case 'PERSIST': {
-            // Bệt đang chạy: theo nếu <= 6, gãy nếu 7-9, chắc gãy nếu >= 10
-            const s = regime.streak;
-            if (s <= 6) return { code: last, weight: 1.5 + (s - 4) * 0.1, name: `PERSIST-THEO-${s}` };
-            if (s <= 9) return { code: last, weight: 1.0, name: `PERSIST-RỦI-${s}` };
-            return { code: flip(last), weight: 1.7, name: `PERSIST-GÃY-${s}` };
-        }
-        case 'ANTI-PERSIST': {
-            // Đảo liên tục: 50% đảo tiếp, nhưng block 2-3 xen kẽ
-            // Dùng transition matrix window cuối để xác định
-            const win = seq.slice(-15);
-            let tt = 0, tx = 0, xt = 0, xx = 0;
-            for (let i = 1; i < win.length; i++) {
-                const a = win[i - 1], b = win[i];
-                if (a === 'T' && b === 'T') tt++;
-                else if (a === 'T' && b === 'X') tx++;
-                else if (a === 'X' && b === 'T') xt++;
-                else xx++;
-            }
-            // P(next | last)
-            let pSame, pFlip;
-            if (last === 'T') { pSame = tt / (tt + tx || 1); pFlip = 1 - pSame; }
-            else { pSame = xx / (xx + xt || 1); pFlip = 1 - pSame; }
-            // Anti-persist → ưu tiên đảo nếu recent cho thấy flip rate cao
-            const code = pFlip > pSame ? flip(last) : last;
-            return { code, weight: 1.2 + Math.abs(pFlip - pSame) * 0.8, name: `ANTIPERSIST-${code === last ? 'THEO' : 'ĐẢO'}` };
-        }
-        case 'ALTERNATE': {
-            // 1-1 đảo → flip
-            return { code: flip(last), weight: 1.4, name: `ALT-${regime.altRun}` };
-        }
-        case 'BLOCK': {
-            // Block đều: nếu vừa hết block → flip; đang giữa block → theo
-            const r = rle(seq);
-            const lastBlk = r[r.length - 1];
-            if (lastBlk.len < regime.blockSize) {
-                // đang giữa block → theo
-                return { code: last, weight: 1.3, name: `BLOCK-THEO-${regime.blockSize}` };
-            }
-            // vừa hết block → flip
-            return { code: flip(last), weight: 1.4, name: `BLOCK-FLIP-${regime.blockSize}` };
-        }
-        case 'TREND': {
-            // Trend: theo trend
-            const code = regime.tRatio >= 0.65 ? 'T' : 'X';
-            return { code, weight: 1.0, name: `TREND-${code}` };
-        }
-        case 'CHAOS':
-        default: {
-            // Không có pattern → dùng markov bậc 3-4 làm fallback
-            for (const order of [3, 4]) {
-                if (seq.length < order + 5) continue;
-                const key = seq.slice(-order).join('');
-                let t = 0, x = 0;
-                for (let i = order; i < seq.length; i++) {
-                    if (seq.slice(i - order, i).join('') === key) {
-                        if (seq[i] === 'T') t++; else x++;
-                    }
-                }
-                if (t + x >= 3) {
-                    const code = t > x ? 'T' : 'X';
-                    const conf = Math.max(t, x) / (t + x);
-                    return { code, weight: 0.7 + conf * 0.5, name: `CHAOS-MARKOV-${order}` };
-                }
-            }
-            // cuối cùng: anti-ratio
-            const tRatio = seq.slice(-15).filter(x => x === 'T').length / Math.min(15, seq.length);
-            const code = tRatio > 0.5 ? 'X' : 'T';
-            return { code, weight: 0.6, name: `CHAOS-ANTI-RATIO` };
-        }
-    }
-}
-
-// ============================================================
-// STRUCTURAL DETECTORS — vẫn dùng để boost khi regime không đủ
-// (giữ các pattern mạnh từ v3)
-// ============================================================
-function structuralDetectors(seq, sums) {
+function runPatternLibrary(seq, sums) {
+    const r = rle(seq);
     const votes = [];
-    const n = seq.length;
-
-    // Block-3-repeat
-    if (n >= 8) {
-        const r = rle(seq);
-        if (r.length >= 4) {
-            const last4 = r.slice(-4);
-            if (last4.every(b => b.len === 3)) {
-                votes.push({ name: `BLK3-CYCLE`, code: flip(last4[3].ch), weight: 1.5 });
-            }
-        }
+    for (const p of PATTERN_LIBRARY) {
+        try {
+            const res = p.check(seq, r, sums);
+            if (res && res.code) votes.push({ name: p.name, code: res.code, weight: res.conf });
+        } catch (e) {}
     }
-
-    // Composite grammar
-    if (n >= 8) {
-        const r = rle(seq);
-        for (const k of [2, 3]) {
-            if (r.length < k * 2) continue;
-            const grpA = r.slice(-k * 2, -k);
-            const grpB = r.slice(-k);
-            let match = true;
-            for (let i = 0; i < k; i++) {
-                if (grpA[i].ch !== grpB[i].ch || grpA[i].len !== grpB[i].len) { match = false; break; }
-            }
-            if (match) {
-                votes.push({ name: `COMPOSITE-${k}`, code: grpA[0].ch, weight: 1.4 + k * 0.1 });
-                break;
-            }
-        }
-    }
-
-    // TTTX-repeat
-    const s = seq.join('');
-    if (s.endsWith('TTTXTTTX') || s.endsWith('TTTXTTTXTTT')) votes.push({ name: 'TTTX-REPEAT', code: 'T', weight: 1.55 });
-    if (s.endsWith('XXXTXXXT') || s.endsWith('XXXTXXXTXXX')) votes.push({ name: 'XXXT-REPEAT', code: 'X', weight: 1.55 });
-
-    // Sum cluster
-    if (sums && sums.length >= 6) {
-        const last6 = sums.slice(-6);
-        const avg = last6.reduce((a, b) => a + b, 0) / 6;
-        if (avg >= 13.5) votes.push({ name: 'SUM-HIGH', code: 'X', weight: 0.9 });
-        if (avg <= 7.5) votes.push({ name: 'SUM-LOW', code: 'T', weight: 0.9 });
-    }
-
     return votes;
 }
 
 // ============================================================
-// BAYESIAN COMBINE — p(T) từ nhiều nguồn
+// REGIME DETECTION (giữ v4 nhưng tinh chỉnh)
 // ============================================================
-function bayesianCombine(regimePred, structuralVotes, db, regime) {
-    // prior từ regime history
-    const rs = db.regimeStats[regime.name] || { correct: 0, total: 0 };
-    const regimePrior = rs.total >= 5 ? (rs.correct / rs.total) : 0.5;
+function detectRegime(seq) {
+    if (!seq || seq.length < 8) return { name: 'COLD', confidence: 0.5 };
+    const win = seq.slice(-Math.min(30, seq.length));
+    const bs = blockStats(win);
+    const ent = binaryEntropy(win);
+    const r = rle(win);
 
-    // Convert predictions thành p(T)
-    // regimePred: code ∈ {T,X} weight w → p = w / (w + (1-w))  ... dùng softmax
+    const last = win[win.length - 1];
+    let streak = 1;
+    for (let i = win.length - 2; i >= 0; i--) { if (win[i] === last) streak++; else break; }
+    if (streak >= 4) return { name: 'PERSIST', confidence: Math.min(0.95, 0.6 + (streak - 3) * 0.08), streak, last };
+
+    if (bs.mean <= 2.2 && r.length >= 6) {
+        const shortRatio = r.filter(b => b.len === 1).length / r.length;
+        if (shortRatio >= 0.45) return { name: 'ANTI-PERSIST', confidence: Math.min(0.90, 0.5 + shortRatio * 0.5), meanBlk: bs.mean, shortRatio };
+    }
+
+    let altRun = 0;
+    for (let i = win.length - 1; i >= 1; i--) { if (win[i] !== win[i-1]) altRun++; else break; }
+    if (altRun >= 4) return { name: 'ALTERNATE', confidence: Math.min(0.92, 0.5 + altRun * 0.06), altRun };
+
+    if (r.length >= 3) {
+        const last3 = r.slice(-3).map(b => b.len);
+        if (last3[0] === last3[1] && last3[1] === last3[2]) return { name: 'BLOCK', confidence: 0.80, blockSize: last3[0], color: r[r.length-1].ch };
+    }
+
+    const tRatio = win.filter(x => x === 'T').length / win.length;
+    if (tRatio >= 0.65 || tRatio <= 0.35) return { name: 'TREND', confidence: 0.65, tRatio };
+
+    return { name: 'CHAOS', confidence: 0.40, entropy: ent, meanBlk: bs.mean };
+}
+
+// ============================================================
+// BAYESIAN COMBINE — pattern library + regime prior
+// ============================================================
+function bayesianCombine(votes, db) {
+    if (!votes.length) return { code: null, strength: 0.5, detail: [] };
+
     let logOddsT = 0;
+    const detail = [];
 
-    const addVote = (code, weight, name) => {
-        // p(code=T) = weight / (1 + weight) nếu code=T, ngược lại 1/(1+weight)
-        // Dùng logit
-        const w = Math.max(0.1, weight);
-        if (code === 'T') logOddsT += Math.log(w);
-        else logOddsT -= Math.log(w);
-    };
-
-    // Base prior 0
-    // Regime predictor
-    addVote(regimePred.code, regimePred.weight * (0.8 + regimePrior * 0.4), regimePred.name);
-
-    // Structural votes
-    for (const v of structuralVotes) {
+    for (const v of votes) {
+        // adaptive per-pattern win rate
         const ps = db.patternStats[v.name] || { win: 0, total: 0 };
         const wr = ps.total >= 3 ? ps.win / ps.total : 0.5;
-        const adapted = v.weight * (0.6 + wr * 0.8);
-        addVote(v.code, adapted, v.name);
+        const adaptedConf = v.weight * (0.55 + wr * 0.9);
+        const w = Math.max(0.2, adaptedConf);
+        if (v.code === 'T') logOddsT += Math.log(w * 2);
+        else logOddsT -= Math.log(w * 2);
+        detail.push({ name: v.name, code: v.code, w: +adaptedConf.toFixed(3) });
     }
 
     const pT = 1 / (1 + Math.exp(-logOddsT));
     const code = pT >= 0.5 ? 'T' : 'X';
-    const strength = Math.abs(pT - 0.5) * 2;
+    const strength = Math.max(0.5, Math.min(0.95, 0.5 + Math.abs(pT - 0.5) * 0.9));
 
-    return {
-        code,
-        strength: Math.max(0.5, Math.min(0.95, 0.5 + strength * 0.45)),
-        pT,
-        regimeName: regime.name,
-        regimeConf: regime.confidence
-    };
+    // top 3 contributing patterns
+    const top = detail.sort((a, b) => Math.abs(b.w - 0.5) - Math.abs(a.w - 0.5)).slice(0, 3);
+    const topName = top.map(t => t.name).join('+');
+
+    return { code, strength, pT, detail: top, label: topName };
 }
 
 // ============================================================
-// META — invert khi regime đang thua
+// META ADJUST — invert khi regime thua nặng
 // ============================================================
 function metaAdjust(pred, db, regimeName) {
-    // Kiểm tra 15 phiên gần — nếu regime hiện tại đang thua nặng → invert hoặc giảm conf
     const rs = db.regimeStats[regimeName];
     if (rs && rs.total >= 10) {
         const wr = rs.correct / rs.total;
-        if (wr < 0.35) {
-            return { ...pred, code: flip(pred.code), strength: 0.55, meta: `INVERT-${regimeName}-${(wr*100).toFixed(0)}%` };
-        }
-        if (wr > 0.72) {
-            return { ...pred, strength: Math.min(0.95, pred.strength + 0.08), meta: `BOOST-${regimeName}-${(wr*100).toFixed(0)}%` };
-        }
+        if (wr < 0.35) return { ...pred, code: flip(pred.code), strength: 0.55, meta: `INVERT-${regimeName}-${(wr*100).toFixed(0)}%` };
+        if (wr > 0.72) return { ...pred, strength: Math.min(0.95, pred.strength + 0.08), meta: `BOOST-${regimeName}-${(wr*100).toFixed(0)}%` };
     }
     return pred;
 }
@@ -352,52 +527,59 @@ function metaAdjust(pred, db, regimeName) {
 // FULL PIPELINE
 // ============================================================
 function runEngine(seq, sums, db) {
-    if (!seq || seq.length < 6) {
-        return { code: null, label: 'CHỜ', tiLe: 'CHỜ', detail: [], regime: 'COLD' };
-    }
+    if (!seq || seq.length < 6) return { code: null, label: 'CHỜ', tiLe: 'CHỜ', detail: [], regime: 'COLD' };
 
     const regime = detectRegime(seq);
-    const regimePred = predictByRegime(regime, seq);
-    const structural = structuralDetectors(seq, sums);
-    const combined = bayesianCombine(regimePred, structural, db, regime);
+    const votes = runPatternLibrary(seq, sums);
+
+    // Luôn có ít nhất 1 vote: nếu pattern library im → dùng regime fallback
+    if (!votes.length) {
+        // regime-based fallback
+        const last = seq[seq.length-1];
+        if (regime.name === 'PERSIST') {
+            votes.push({ name: `PERSIST-FALLBACK-${regime.streak}`, code: regime.streak <= 6 ? last : flip(last), weight: 0.6 });
+        } else if (regime.name === 'ALTERNATE') {
+            votes.push({ name: 'ALT-FALLBACK', code: flip(last), weight: 0.6 });
+        } else {
+            const tRatio = seq.slice(-15).filter(x => x === 'T').length / Math.min(15, seq.length);
+            votes.push({ name: 'ANTI-RATIO-FALLBACK', code: tRatio > 0.5 ? 'X' : 'T', weight: 0.55 });
+        }
+    }
+
+    const combined = bayesianCombine(votes, db);
     const final = metaAdjust(combined, db, regime.name);
 
     return {
         code: final.code,
-        label: final.meta || `${regime.name}:${regimePred.name}`,
+        label: final.meta || final.label || 'ENSEMBLE',
         tiLe: (final.strength * 100).toFixed(1) + '%',
-        detail: [
-            { regime: regime.name, regimeConf: regime.confidence, regimePred: regimePred.name, regimeW: regimePred.weight },
-            ...structural
-        ],
+        detail: final.detail,
         regime: regime.name,
         strength: final.strength,
-        pT: final.pT
+        pT: final.pT,
+        patternCount: votes.length
     };
 }
 
 // ============================================================
-// UPDATE STATS khi có kết quả
+// UPDATE STATS
 // ============================================================
 function updateStats(db, pred, actual) {
     if (!pred || !pred.code) return;
     const correct = pred.code === actual;
-
     if (!db.meta) db.meta = { totalPred: 0, totalWin: 0, recent50: [] };
     db.meta.totalPred = (db.meta.totalPred || 0) + 1;
     if (correct) db.meta.totalWin = (db.meta.totalWin || 0) + 1;
     db.meta.recent50.push({ pred: pred.code, actual, correct, regime: pred.regime });
     if (db.meta.recent50.length > 50) db.meta.recent50.shift();
 
-    // regime stats
     const rName = pred.regime || 'CHAOS';
     if (!db.regimeStats[rName]) db.regimeStats[rName] = { correct: 0, total: 0 };
     db.regimeStats[rName].total++;
     if (correct) db.regimeStats[rName].correct++;
 
-    // pattern stats
-    const pName = pred.label || 'UNKNOWN';
     if (!db.patternStats) db.patternStats = {};
+    const pName = pred.label || 'UNKNOWN';
     const ps = db.patternStats[pName] || { win: 0, total: 0 };
     ps.total++;
     if (correct) ps.win++;
@@ -406,7 +588,7 @@ function updateStats(db, pred, actual) {
 }
 
 // ============================================================
-// FETCH + PROCESS LOOP
+// FETCH + LOOP
 // ============================================================
 async function fetchApi(url) {
     for (let i = 0; i < 3; i++) {
@@ -435,7 +617,6 @@ async function processGame(game) {
     const sums = list.map(getSum).filter(s => s >= 3 && s <= 18);
     if (seq.length < 6) return;
 
-    // chấm phiên trước
     const prev = db.history[db.history.length - 1];
     if (prev && safeInt(prev.phienDuDoan) === session) {
         const actual = getResult(latest);
@@ -475,17 +656,23 @@ setInterval(() => { processGame('md5'); processGame('taixiu'); }, 5000);
 // ============================================================
 app.get('/', (req, res) => {
     res.send(`<div style="font-family:sans-serif;padding:20px">
-        <h2 style="color:green;">🚀 BACKEND v4 — REGIME BAYESIAN</h2>
+        <h2 style="color:green;">🚀 BACKEND v5 — 40+ PATTERN LIBRARY</h2>
+        <p>Tổng cộng <b>${PATTERN_LIBRARY.length}</b> pattern matcher đang chạy.</p>
         <ul>
             <li><a href="/api/predict/md5">/api/predict/md5</a></li>
             <li><a href="/api/predict/taixiu">/api/predict/taixiu</a></li>
             <li><a href="/api/history/all">/api/history/all</a></li>
             <li><a href="/api/stats/md5">/api/stats/md5</a></li>
             <li><a href="/api/stats/taixiu">/api/stats/taixiu</a></li>
-            <li><a href="/api/analyze?seq=TTTXTTTXTTT">/api/analyze</a></li>
-            <li><a href="/api/regime?seq=TXTXTXXTXT">/api/regime — xem regime hiện tại</a></li>
+            <li><a href="/api/analyze?seq=TTTXTTTXTTT">/api/analyze — test engine</a></li>
+            <li><a href="/api/patterns">/api/patterns — xem toàn bộ pattern library</a></li>
+            <li><a href="/api/regime?seq=TXTXTXXTXT">/api/regime — regime hiện tại</a></li>
         </ul>
     </div>`);
+});
+
+app.get('/api/patterns', (req, res) => {
+    res.json({ success: true, count: PATTERN_LIBRARY.length, patterns: PATTERN_LIBRARY.map(p => p.name) });
 });
 
 app.get('/api/analyze', (req, res) => {
@@ -494,7 +681,13 @@ app.get('/api/analyze', (req, res) => {
     const seq = seqStr.split('');
     const db = readDB('md5');
     const pred = runEngine(seq, [], db);
-    res.json({ success: true, seq: seqStr, prediction: pred });
+    // cũng chạy pattern library thô để debug
+    const r = rle(seq);
+    const rawVotes = runPatternLibrary(seq, []);
+    res.json({
+        success: true, seq: seqStr, length: seqStr.length, prediction: pred,
+        detectedPatterns: rawVotes, rle: r.map(b => `${b.ch}${b.len}`)
+    });
 });
 
 app.get('/api/regime', (req, res) => {
@@ -503,7 +696,7 @@ app.get('/api/regime', (req, res) => {
     const seq = seqStr.split('');
     const regime = detectRegime(seq);
     const bs = blockStats(seq);
-    res.json({ success: true, seq: seqStr, regime, blockStats: bs, entropy: binaryEntropy(seq) });
+    res.json({ success: true, seq: seqStr, regime, blockStats: bs, entropy: +binaryEntropy(seq).toFixed(3), rle: rle(seq).map(b => `${b.ch}${b.len}`).join(',') });
 });
 
 app.get('/api/predict/:game', async (req, res) => {
@@ -525,9 +718,8 @@ app.get('/api/predict/:game', async (req, res) => {
         phienDuDoan: session + 1,
         duDoan: pred.code ? label(pred.code) : 'CHỜ',
         duDoanCode: pred.code,
-        tiLe: pred.tiLe,
-        reason: pred.label,
-        regime: pred.regime,
+        tiLe: pred.tiLe, reason: pred.label,
+        regime: pred.regime, patternCount: pred.patternCount,
         detail: pred.detail
     });
 });
@@ -536,14 +728,12 @@ app.get('/api/history/all', (req, res) => {
     const out = {};
     for (const g of ['md5', 'taixiu']) {
         const db = readDB(g);
-        out[g] = {
-            items: db.history.slice(-100).reverse().map(it => ({
-                phien: it.phien, phienDuDoan: it.phienDuDoan, tong: it.tong, xucXac: it.xucXac,
-                ketQua: it.ketQua, ketQuaLabel: it.ketQuaLabel,
-                duDoanCode: it.DU_DOAN_CODE, duDoan: it.DU_DOAN, tiLe: it.TI_LE,
-                pattern: { type: it.patternName }, regime: it.regime, trangThai: it.trangThai
-            }))
-        };
+        out[g] = { items: db.history.slice(-100).reverse().map(it => ({
+            phien: it.phien, phienDuDoan: it.phienDuDoan, tong: it.tong, xucXac: it.xucXac,
+            ketQua: it.ketQua, ketQuaLabel: it.ketQuaLabel,
+            duDoanCode: it.DU_DOAN_CODE, duDoan: it.DU_DOAN, tiLe: it.TI_LE,
+            pattern: { type: it.patternName }, regime: it.regime, trangThai: it.trangThai
+        })) };
     }
     res.json({ success: true, games: out });
 });
@@ -558,14 +748,16 @@ app.get('/api/stats/:game', (req, res) => {
     const r50wr = recent.length ? (recent.filter(x => x.correct).length / recent.length * 100).toFixed(1) + '%' : 'N/A';
     res.json({
         success: true, game,
-        totalPredicted: m.totalPred || 0,
-        totalWin: m.totalWin || 0,
+        totalPredicted: m.totalPred || 0, totalWin: m.totalWin || 0,
         winRate: wr, recent50WinRate: r50wr,
         regimeStats: db.regimeStats || {},
         patternStats: db.patternStats || {}
     });
 });
 
+// ============================================================
+// UI
+// ============================================================
 app.get('/:game', (req, res) => {
     const game = req.params.game;
     if (game !== 'md5' && game !== 'taixiu') return res.send('Trang không tồn tại');
@@ -576,17 +768,18 @@ app.get('/:game', (req, res) => {
 
     const getBadge = (type) => {
         if (!type) return 'badge-default';
-        if (type.startsWith('PERSIST')) return 'badge-bet';
-        if (type.includes('ANTIPERSIST') || type.includes('ALT')) return 'badge-alt';
-        if (type.includes('BLOCK') || type.includes('COMPOSITE') || type.includes('TTTX')) return 'badge-block';
+        if (type.startsWith('PERSIST') || type.startsWith('BỆT')) return 'badge-bet';
+        if (type.includes('ANTIPERSIST') || type.includes('ALT') || type.includes('1-1')) return 'badge-alt';
+        if (type.includes('BLOCK') || type.includes('COMPOSITE') || type.includes('TTTX') || type.includes('2-2') || type.includes('3-3') || type.includes('4-4')) return 'badge-block';
         if (type.includes('CHAOS') || type.includes('MARKOV')) return 'badge-chaos';
         if (type.includes('INVERT') || type.includes('BOOST')) return 'badge-meta';
+        if (type.includes('GỐI') || type.includes('ĐẢO') || type.includes('ZIC') || type.includes('SO-LE') || type.includes('XÓC')) return 'badge-alt';
         return 'badge-default';
     };
 
     const html = `<!DOCTYPE html><html lang="vi"><head>
     <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>HOANG VIP WIN v4</title>
+    <title>HOANG VIP WIN v5</title>
     <style>
     *{box-sizing:border-box}
     body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e27;color:#e6eef6;padding:12px;margin:0}
@@ -614,11 +807,12 @@ app.get('/:game', (req, res) => {
     .badge-default{background:#334155;color:#cbd5e1}
     </style><script>setTimeout(()=>location.reload(),10000)</script></head>
     <body>
-      <div class="header"><h1>🎯 HOANG VIP WIN v4 - ${game.toUpperCase()}</h1></div>
+      <div class="header"><h1>🎯 HOANG VIP WIN v5 - ${game.toUpperCase()}</h1></div>
       <div class="stats">
         <div class="stat">Tổng: <b>${m.totalPred || 0}</b></div>
         <div class="stat">Thắng: <b>${m.totalWin || 0}</b></div>
         <div class="stat">WinRate: <b>${wr}%</b></div>
+        <div class="stat">Patterns: <b>${PATTERN_LIBRARY.length}</b></div>
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
@@ -646,4 +840,4 @@ app.get('/:game', (req, res) => {
     res.send(html);
 });
 
-app.listen(PORT, () => console.log(`Server v4 chạy trên port ${PORT}`));
+app.listen(PORT, () => console.log(`Server v5 chạy trên port ${PORT} — ${PATTERN_LIBRARY.length} patterns`));
