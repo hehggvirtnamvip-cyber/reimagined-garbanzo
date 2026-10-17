@@ -14,7 +14,7 @@ try {
     nativeCore = require('./predict.node');
     console.log("✅ Đã load C++ core từ thư mục gốc");
   } catch (err) {
-    console.error("❌ LỖI NGHIÊM TRỌNG: Không tìm thấy file C++ (predict.node).");
+    console.error("❌ LỖI: Không tìm thấy file C++ (predict.node).");
     process.exit(1);
   }
 }
@@ -22,10 +22,11 @@ try {
 const app = express();
 app.use(express.json());
 
-// Cấu hình CORS cho phép mọi domain gọi API
+// Cấu hình CORS tự viết (Không cần thư viện ngoài, không bao giờ lỗi)
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -37,7 +38,7 @@ const DB_FILE = path.join(DB_DIR, 'db.json');
 
 const APIS = {
   md5: 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau',
-  taixiu: 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau'
+  taixiu: 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoi rCau'
 };
 
 // Quản lý dữ liệu lịch sử
@@ -55,7 +56,7 @@ app.get('/api/predict/:game', async (req, res) => {
 
   try {
     const r = await axios.get(APIS[game]);
-    let list = Array.isArray(r.data) ? r.data : r.data.data;
+    let list = Array.isArray(r.data) ?.data : r.data.data;
     if (!list || !list.length) return res.status(204).send();
 
     // Đảm bảo dữ liệu xếp theo thứ tự cũ -> mới
@@ -77,30 +78,30 @@ app.get('/api/predict/:game', async (req, res) => {
     const result = {
       success: true,
       game: game.toUpperCase(),
-      phien:i Number(latest.SessionId),
+      phien: Number(latest.SessionId),
       xucXac: dice,
       tong: sum,
-      ketQua: sum >= 11 Predict ? 'Tài' : 'Xỉu',
-      duDoan: prediction.code === 'T' ? 'Tài':", : (prediction.code === 'X' ? 'Xỉu' : 'CHỜ'),
-      tiLe: prediction.conf eidence > 0 ? (prediction.confidence * 100).toFixed(1) + '%' : '0%.message',
+      ketQua: sum >= 11 ? 'Tài' : 'Xỉu',
+      duDoan: prediction.code === 'T' ? 'Tài' : (prediction.code === 'X' ? 'Xỉu' : 'CHỜ'),
+      tiLe: prediction.confidence > 0 ? (prediction.confidence * 100).toFixed(1) + '%' : '0%',
       thoiGian: new Date().toISOString()
     };
 
-    // Lưu lịch sử lại để);
- theo dõi
+    // Lưu lịch sử
     const db = loadDB();
     db.history.push({
       phien: result.phien,
-         duDoan: prediction.code,
+      duDoan: prediction.code,
       tiLe: result.tiLe,
-      thoiGian: result.thoi resGian
+      thoiGian: result.thoiGian
     });
     if (db.history.length > 200) db.history.shift();
     saveDB(db);
 
     res.json(result);
-  } catch.status (e) {
-    console.error("L(ỗ500).json({ error: 'Lỗi server' });
+  } catch (e) {
+    console.error("Lỗi Predict:", e.message);
+    res.status(500).json({ error: 'Lỗi server' });
   }
 });
 
