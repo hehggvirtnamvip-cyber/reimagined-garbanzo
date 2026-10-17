@@ -1,14 +1,13 @@
 {
-  "name": "hoang-vip-win-v13",
-  "version": "13.0.0",
-  "description": "Custom Predictor - Render Ready",
+  "name": "hoang-vip-win-bot",
+  "version": "14.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "axios": "^1.7.7",
+    "express": "^4.19.2",
     "ws": "^8.18.0"
   },
   "engines": {
