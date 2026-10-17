@@ -28,7 +28,7 @@ const PORT = process.env.PORT || 3000;
 
 // Token của Telegram Bot (ĐÃ CẮM CỨNG THEO YÊU CẦU)
 // CẢNH BÁO: Token này đã bị lộ, cần đổi mới sau khi test thành công.
-const TELEGRAM_BOT_TOKEN = '8801717755:AAG_EpSnfyFXJDZfaEyT1L0XFrH3gtaJTHc';
+const TELEGRAM_BOT_TOKEN = '8801717755:AAGpGHJyN9zvpSuPPuGx2PCyq6TUrRu-nCU';
 
 // ID Telegram của Admin (ĐÃ CẮM CỨNG THEO YÊU CẦU)
 const ADMIN_CHAT_ID = '7757046138';
