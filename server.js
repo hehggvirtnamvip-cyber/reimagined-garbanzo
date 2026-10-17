@@ -1,1020 +1,682 @@
 'use strict';
 
-// ============================================================================
-// FILE: server.js
-// MÔ TẢ: Hệ thống Bot Bán Key Telegram + Web API Kích Hoạt Key Tự Động
-// TÁC GIẢ: HOANG VIP WIN
-// PHIÊN BẢN: 14.0.0
-// NGÔN NGỮ: JavaScript (Node.js >= 18)
-// THƯ VIỆN: express, axios, ws, crypto, fs, path, http
-// ============================================================================
+// ============================================================
+// server.js — v11 DEEP ADAPTIVE ENSEMBLE
+// Node.js >= 18 | express + axios
+// 14 layers | no random | no skip | online learning
+// ============================================================
 
-// ============================================================================
-// PHẦN 1: IMPORT CÁC THƯ VIỆN CẦN THIẾT
-// ============================================================================
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const http = require('http');
-const crypto = require('crypto');
-const { WebSocketServer } = require('ws');
 
-// ============================================================================
-// PHẦN 2: CẤU HÌNH HỆ THỐNG (CONFIG)
-// ============================================================================
-// Cổng chạy server (Render sẽ tự cấp phát qua biến môi trường PORT)
+const app = express();
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
+const API_MD5 = 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau';
+const API_TX  = 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau';
+const DB_DIR  = process.env.DB_DIR || __dirname;
+const TICK_MS = 5000;
+const MAX_HISTORY = 2000;
+const MAX_NGRAM_ENTRIES = 10000;
 
-// Token của Telegram Bot (ĐÃ CẮM CỨNG THEO YÊU CẦU)
-// CẢNH BÁO: Token này đã bị lộ, cần đổi mới sau khi test thành công.
-const TELEGRAM_BOT_TOKEN = '8801717755:AAGpGHJyN9zvpSuPPuGx2PCyq6TUrRu-nCU';
-
-// ID Telegram của Admin (ĐÃ CẮM CỨNG THEO YÊU CẦU)
-const ADMIN_CHAT_ID = '7757046138';
-
-// Đường dẫn thư mục lưu trữ dữ liệu
-const DATA_DIRECTORY = path.join(__dirname, 'data');
-const KEY_FILE_PATH = path.join(DATA_DIRECTORY, 'keys.json');
-
-// Bảng giá các gói (Đơn vị: VNĐ)
-const PRICE_LIST = {
-    '1d': 10000,
-    '7d': 50000,
-    '30d': 150000
-};
-
-// Số lần nhập sai tối đa trước khi khóa vĩnh viễn
-const MAXIMUM_FAIL_ATTEMPTS = 3;
-
-// Khởi tạo thư mục dữ liệu nếu chưa tồn tại
-if (!fs.existsSync(DATA_DIRECTORY)) {
-    fs.mkdirSync(DATA_DIRECTORY, { recursive: true });
+if (!fs.existsSync(DB_DIR)) {
+    try { fs.mkdirSync(DB_DIR, { recursive: true }); } catch (e) {}
 }
 
-// ============================================================================
-// PHẦN 3: CÁC HÀM TIỆN ÍCH (UTILITIES)
-// ============================================================================
+// ============================================================
+// LAYER 0 — UTILITIES
+// ============================================================
+const label  = c => (c === 'T' ? 'Tài' : c === 'X' ? 'Xỉu' : null);
+const flip   = c => (c === 'T' ? 'X' : c === 'X' ? 'T' : null);
+const clamp  = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const safeInt = (x, def = 0) => { const n = parseInt(x, 10); return Number.isFinite(n) ? n : def; };
+const sigmoid = x => 1 / (1 + Math.exp(-x));
+const logit   = p => Math.log(p / (1 - p));
 
-/**
- * Ghi log ra console kèm theo mốc thời gian.
- * @param {string} level - Cấp độ log (INFO, ERROR, WARN)
- * @param {...any} args - Các tham số cần log
- */
-function writeLog(level, ...args) {
-    const timestamp = new Date().toISOString();
-    const message = args.map(arg => {
-        if (typeof arg === 'object') {
-            return JSON.stringify(arg);
+const nowIso = () => new Date().toISOString();
+
+const getDice = item => [
+    safeInt(item?.FirstDice),
+    safeInt(item?.SecondDice),
+    safeInt(item?.ThirdDice)
+];
+const getSum = item => {
+    const s = getDice(item).reduce((a, b) => a + b, 0);
+    return (s >= 3 && s <= 18) ? s : safeInt(item?.DiceSum);
+};
+const getResult = item => {
+    const s = getSum(item);
+    return (s >= 3 && s <= 18) ? (s >= 11 ? 'T' : 'X') : null;
+};
+
+// ============================================================
+// LAYER 0b — PERSISTENCE & SCHEMA
+// ============================================================
+function defaultDB() {
+    return {
+        version: 11,
+        createdAt: nowIso(),
+        lastProcessedSession: null,
+        history: [],
+        meta: {
+            totalPred: 0,
+            totalWin: 0,
+            totalLose: 0,
+            winStreak: 0,
+            loseStreak: 0,
+            maxWinStreak: 0,
+            maxLoseStreak: 0,
+            recent50: [],          // { session, correct }
+            adaptiveLR: 0.03
+        },
+        ngrams: { 1:{}, 2:{}, 3:{}, 4:{}, 5:{}, 6:{}, 7:{}, 8:{} },
+        weights: {
+            bet: 1.0, alt: 1.0, block: 1.0, cycle: 1.0,
+            ngram: 1.0, sumTrend: 1.0, boundary: 1.0,
+            entropy: 1.0, markov: 1.0, regime: 1.0
+        },
+        kalman: { x: 0.5, p: 1.0, q: 0.01, r: 0.10 },
+        calibration: { scale: 1.0, samples: 0 },
+        contexts: {},              // L10
+        regime: { current: 'MIXED', entropyRecent: 0 }
+    };
+}
+
+function readDB(game) {
+    const p = path.join(DB_DIR, `db_${game}.json`);
+    try {
+        if (fs.existsSync(p)) {
+            const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+            const def = defaultDB();
+            // Merge an toàn — đảm bảo field mới luôn tồn tại
+            return {
+                ...def,
+                ...raw,
+                meta:       { ...def.meta, ...(raw.meta || {}) },
+                weights:    { ...def.weights, ...(raw.weights || {}) },
+                kalman:     { ...def.kalman, ...(raw.kalman || {}) },
+                calibration:{ ...def.calibration, ...(raw.calibration || {}) },
+                ngrams:     { ...def.ngrams, ...(raw.ngrams || {}) },
+                regime:     { ...def.regime, ...(raw.regime || {}) }
+            };
         }
-        return String(arg);
-    }).join(' ');
-    
-    const formattedLine = `[${timestamp}] [${level}] ${message}`;
-    
-    if (level === 'ERROR') {
-        console.error(formattedLine);
-    } else {
-        console.log(formattedLine);
+    } catch (e) {
+        console.error(`[readDB ${game}] ${e.message}`);
+    }
+    return defaultDB();
+}
+
+function saveDB(game, db) {
+    const p = path.join(DB_DIR, `db_${game}.json`);
+    try {
+        fs.writeFileSync(p, JSON.stringify(db, null, 2));
+    } catch (e) {
+        console.error(`[saveDB ${game}] ${e.message}`);
     }
 }
 
-/**
- * Đọc danh sách key từ file JSON.
- * @returns {Array} Mảng các đối tượng key
- */
-function loadKeysFromFile() {
-    try {
-        if (fs.existsSync(KEY_FILE_PATH)) {
-            const rawData = fs.readFileSync(KEY_FILE_PATH, 'utf8');
-            return JSON.parse(rawData);
+// ============================================================
+// LAYER 1 — SEQUENCE ABSTRACTION (RLE + BlockStats + Entropy)
+// ============================================================
+function computeRLE(seq) {
+    const out = [];
+    if (!seq.length) return out;
+    let cur = seq[0], len = 1;
+    for (let i = 1; i < seq.length; i++) {
+        if (seq[i] === cur) len++;
+        else { out.push({ ch: cur, len }); cur = seq[i]; len = 1; }
+    }
+    out.push({ ch: cur, len });
+    return out;
+}
+
+function computeBlockStats(rleArr) {
+    if (!rleArr.length) return { mean: 1, std: 0, max: 1, entropy: 0, distinct: 0 };
+    const lens = rleArr.map(b => b.len);
+    const mean = lens.reduce((a, b) => a + b, 0) / lens.length;
+    const variance = lens.reduce((a, b) => a + (b - mean) ** 2, 0) / lens.length;
+    const counts = {};
+    lens.forEach(l => (counts[l] = (counts[l] || 0) + 1));
+    let entropy = 0;
+    for (const k in counts) {
+        const p = counts[k] / lens.length;
+        entropy -= p * Math.log2(p);
+    }
+    return {
+        mean,
+        std: Math.sqrt(variance),
+        max: Math.max(...lens),
+        entropy,
+        distinct: Object.keys(counts).length
+    };
+}
+
+// Đếm streak hiện tại (cùng màu cuối)
+function currentStreak(seq) {
+    if (!seq.length) return 0;
+    const last = seq[seq.length - 1];
+    let c = 0;
+    for (let i = seq.length - 1; i >= 0; i--) {
+        if (seq[i] === last) c++;
+        else break;
+    }
+    return c;
+}
+
+// Đếm số lần đảo liên tiếp
+function currentAlternation(seq) {
+    if (seq.length < 2) return 0;
+    let c = 0;
+    for (let i = seq.length - 1; i >= 1; i--) {
+        if (seq[i] !== seq[i - 1]) c++;
+        else break;
+    }
+    return c;
+}
+
+// ============================================================
+// LAYER 2 — DEEP N-GRAM MEMORY
+// ============================================================
+function updateDeepMemory(db, seq) {
+    if (seq.length < 2) return;
+    const actual = seq[seq.length - 1];
+    for (let n = 1; n <= 8; n++) {
+        if (seq.length <= n) continue;
+        const key = seq.slice(-(n + 1), -1).join('');
+        if (!db.ngrams[n]) db.ngrams[n] = {};
+        if (!db.ngrams[n][key]) db.ngrams[n][key] = { T: 0, X: 0 };
+        db.ngrams[n][key][actual] += 1;
+
+        // Pruning: giữ bộ nhớ gọn
+        const size = Object.keys(db.ngrams[n]).length;
+        if (size > MAX_NGRAM_ENTRIES) {
+            const keys = Object.keys(db.ngrams[n]);
+            const toDelete = size - MAX_NGRAM_ENTRIES + 100;
+            for (let i = 0; i < toDelete; i++) delete db.ngrams[n][keys[i]];
         }
-    } catch (error) {
-        writeLog('ERROR', 'Lỗi đọc file keys.json:', error.message);
+    }
+}
+
+// Truy vấn N-Gram tốt nhất (bậc cao nhất có đủ mẫu)
+function queryBestNGram(db, seq, minSamples = 4) {
+    for (let len = 8; len >= 2; len--) {
+        if (seq.length < len) continue;
+        const key = seq.slice(-len).join('');
+        const mem = db.ngrams[len] && db.ngrams[len][key];
+        if (mem && (mem.T + mem.X) >= minSamples) {
+            const total = mem.T + mem.X;
+            const probT = mem.T / total;
+            return {
+                len,
+                probT,
+                total,
+                confidence: Math.abs(probT - 0.5) * 2,
+                code: probT >= 0.5 ? 'T' : 'X'
+            };
+        }
+    }
+    return null;
+}
+
+// ============================================================
+// LAYER 3 — FEATURE EXTRACTORS
+// ============================================================
+function extractFeatures(seq, sums, db) {
+    const features = [];
+    if (seq.length < 5) return { features, bStats: computeBlockStats([]), rleArr: [] };
+
+    const rleArr = computeRLE(seq);
+    const bStats = computeBlockStats(rleArr);
+    const n = seq.length;
+    const last = seq[n - 1];
+
+    // F1: Bệt (Streak)
+    const streak = currentStreak(seq);
+    if (streak >= 3) {
+        let code = last;
+        let conf = clamp(0.5 + (streak - 2) * 0.05, 0.5, 0.9);
+        if (streak >= 9) {
+            code = flip(code);
+            conf = 0.85;
+        }
+        features.push({ name: 'bet', code, conf, tag: `Streak(${streak})` });
+    }
+
+    // F2: Đảo 1-1
+    const alt = currentAlternation(seq);
+    if (alt >= 3) {
+        features.push({
+            name: 'alt',
+            code: flip(last),
+            conf: clamp(0.5 + alt * 0.05, 0.5, 0.85),
+            tag: `Alt(${alt})`
+        });
+    }
+
+    // F3: Block Repetition (a.len == b.len == c.len)
+    if (rleArr.length >= 3) {
+        const [a, b, c] = rleArr.slice(-3);
+        if (a.len === b.len && b.len === c.len) {
+            features.push({ name: 'block', code: flip(last), conf: 0.7, tag: `Block(${a.len}-${b.len}-${c.len})` });
+        }
+    }
+
+    // F4: Cycle Pattern (4,5,6)
+    if (n >= 8) {
+        for (const cycleLen of [4, 5, 6]) {
+            if (n >= cycleLen * 2 &&
+                seq.slice(-cycleLen * 2, -cycleLen).join('') === seq.slice(-cycleLen).join('')) {
+                features.push({
+                    name: 'cycle',
+                    code: seq[n - cycleLen],
+                    conf: 0.75,
+                    tag: `Cycle(${cycleLen})`
+                });
+                break;
+            }
+        }
+    }
+
+    // F5: Sum Trend
+    if (sums && sums.length >= 5) {
+        const recent5 = sums.slice(-5).reduce((a, b) => a + b, 0) / 5;
+        if (recent5 >= 13) features.push({ name: 'sumTrend', code: 'X', conf: 0.65, tag: 'SumHigh' });
+        else if (recent5 <= 8) features.push({ name: 'sumTrend', code: 'T', conf: 0.65, tag: 'SumLow' });
+    }
+
+    // F6: Boundary (10/11 gần đây)
+    if (sums && sums.length >= 3) {
+        const near = sums.slice(-3).filter(s => s === 10 || s === 11).length;
+        if (near >= 2) {
+            features.push({
+                name: 'boundary',
+                code: flip(last),
+                conf: 0.6,
+                tag: `Bound(${near})`
+            });
+        }
+    }
+
+    // F7: Low Entropy (predictable)
+    if (bStats.entropy < 1.2 && rleArr.length > 4) {
+        features.push({
+            name: 'entropy',
+            code: rleArr[rleArr.length - 1].ch,
+            conf: 0.6,
+            tag: `LowEntropy(${bStats.entropy.toFixed(2)})`
+        });
+    }
+
+    // F8: Markov bậc 3
+    if (n >= 8) {
+        const key = seq.slice(-3).join('');
+        let t = 0, x = 0;
+        for (let i = 3; i < n; i++) {
+            if (seq.slice(i - 3, i).join('') === key) {
+                if (seq[i] === 'T') t++;
+                else x++;
+            }
+        }
+        if (t + x >= 4) {
+            features.push({
+                name: 'markov',
+                code: t > x ? 'T' : 'X',
+                conf: clamp(Math.max(t, x) / (t + x), 0.5, 0.85),
+                tag: `Markov3(${t}/${x})`
+            });
+        }
+    }
+
+    // F9: N-Gram Deep
+    const ng = queryBestNGram(db, seq, 4);
+    if (ng && ng.confidence > 0.10) {
+        features.push({
+            name: 'ngram',
+            code: ng.code,
+            conf: clamp(0.5 + ng.confidence * 0.4, 0.5, 0.9),
+            tag: `NGram-${ng.len}(${ng.total})`
+        });
+    }
+
+    // F10: Regime-based (L11)
+    const regime = detectRegime(bStats, seq);
+    db.regime = regime;
+    if (regime.current === 'TREND' && streak >= 3) {
+        features.push({
+            name: 'regime',
+            code: last,
+            conf: 0.62,
+            tag: `Regime-TREND(${streak})`
+        });
+    } else if (regime.current === 'CHOP' && alt >= 2) {
+        features.push({
+            name: 'regime',
+            code: flip(last),
+            conf: 0.62,
+            tag: `Regime-CHOP(${alt})`
+        });
+    }
+
+    return { features, bStats, rleArr };
+}
+
+// ============================================================
+// LAYER 11 — REGIME DETECTOR
+// ============================================================
+function detectRegime(bStats, seq) {
+    const e = bStats.entropy;
+    let current = 'MIXED';
+    if (e < 1.2) current = 'TREND';
+    else if (e > 2.0) current = 'CHOP';
+    return { current, entropyRecent: e, at: nowIso() };
+}
+
+// ============================================================
+// LAYER 4 — KALMAN FILTER
+// ============================================================
+function kalmanUpdate(state, measurement) {
+    const q = state.q ?? 0.01;
+    const r = state.r ?? 0.10;
+    let x = state.x ?? 0.5;
+    let p = state.p ?? 1.0;
+
+    // Predict
+    p = p + q;
+
+    // Update
+    const k = p / (p + r);
+    x = x + k * (measurement - x);
+    p = (1 - k) * p;
+
+    return { x, p, q, r };
+}
+
+// ============================================================
+// LAYER 5 — BAYESIAN FUSION
+// ============================================================
+function bayesianFusion(features, weights) {
+    let logOddsT = 0;
+    const breakdown = [];
+
+    for (const f of features) {
+        const w = weights[f.name] ?? 1.0;
+        const effectiveW = (f.conf - 0.5) * 2 * w;
+        if (f.code === 'T') logOddsT += effectiveW;
+        else logOddsT -= effectiveW;
+
+        breakdown.push({
+            name: f.name,
+            tag: f.tag,
+            code: f.code,
+            conf: f.conf,
+            w,
+            effect: effectiveW
+        });
+    }
+
+    const probT = sigmoid(logOddsT);
+    return { probT, breakdown, logOddsT };
+}
+
+// ============================================================
+// LAYER 12 — CALIBRATION
+// ============================================================
+function calibrate(db, probRaw) {
+    const scale = clamp(db.calibration.scale ?? 1.0, 0.5, 1.2);
+    const p = 0.5 + (probRaw - 0.5) * scale;
+    return clamp(p, 0.01, 0.99);
+}
+
+function updateCalibration(db, probRaw, correct, predictedCode, actualCode) {
+    // Nếu model tự tin cao mà sai → giảm scale
+    // Nếu model tự tin cao mà đúng → tăng scale
+    const confidence = Math.abs(probRaw - 0.5) * 2; // 0..1
+    if (confidence < 0.3) return; // không học từ phiên mờ nhạt
+
+    const lr = 0.02;
+    if (correct) db.calibration.scale += lr * confidence;
+    else         db.calibration.scale -= lr * confidence;
+
+    db.calibration.scale = clamp(db.calibration.scale, 0.5, 1.2);
+    db.calibration.samples = (db.calibration.samples || 0) + 1;
+}
+
+// ============================================================
+// LAYER 6 — ONLINE GRADIENT DESCENT
+// ============================================================
+function updateWeights(db, breakdown, predictedCode, actualCode) {
+    const lr = clamp(db.meta.adaptiveLR ?? 0.03, 0.01, 0.08);
+
+    for (const b of breakdown) {
+        const key = b.name;
+        if (!(key in db.weights)) db.weights[key] = 1.0;
+
+        const featureCorrect = b.code === actualCode;
+        const delta = featureCorrect ? lr : -lr;
+
+        db.weights[key] = clamp(db.weights[key] + delta, 0.1, 3.0);
+    }
+
+    // Cập nhật adaptive LR: nếu thua nhiều → tăng LR để thích nghi nhanh
+    const m = db.meta;
+    if (m.totalPred >= 5) {
+        const wr = m.totalWin / m.totalPred;
+        if (wr < 0.45) m.adaptiveLR = clamp((m.adaptiveLR || 0.03) + 0.002, 0.01, 0.08);
+        else if (wr > 0.60) m.adaptiveLR = clamp((m.adaptiveLR || 0.03) - 0.002, 0.01, 0.08);
+    }
+}
+
+// ============================================================
+// LAYER 7 — DECISION MAKER
+// ============================================================
+function makeDecision(db, seq, sums) {
+    const { features, bStats, rleArr } = extractFeatures(seq, sums, db);
+
+    let { probT, breakdown, logOddsT } = bayesianFusion(features, db.weights);
+
+    // Kalman smoothing cho confidence
+    const confRaw = Math.abs(probT - 0.5) * 2;
+    db.kalman = kalmanUpdate(db.kalman, confRaw);
+    const smoothedConf = clamp(db.kalman.x, 0.50, 0.95);
+
+    // Calibration
+    probT = calibrate(db, probT);
+
+    // Fallback khi không có feature
+    let finalReason = breakdown.slice(0, 3).map(b => b.tag).join(' + ') || 'Base-Rate';
+    let finalCode = probT >= 0.5 ? 'T' : 'X';
+
+    if (breakdown.length === 0) {
+        const last10 = seq.slice(-10);
+        const tCount = last10.filter(x => x === 'T').length;
+        finalCode = tCount >= 5 ? 'X' : 'T';
+        probT = finalCode === 'T' ? 0.55 : 0.45;
+        finalReason = `Mean-Revert(${tCount}T/${last10.length - tCount}X)`;
+    }
+
+    return {
+        code: finalCode,
+        probT,
+        probRaw: probT,
+        strength: smoothedConf,
+        label: finalReason,
+        breakdown,
+        bStats,
+        rleLen: rleArr.length,
+        regime: db.regime.current
+    };
+}
+
+// ============================================================
+// LAYER 8 — EXECUTION ENGINE
+// ============================================================
+function runEngine(seq, sums, db) {
+    if (!seq || seq.length < 5) {
+        return {
+            code: 'T', probT: 0.5, strength: 0.5,
+            label: 'Boot', breakdown: [], tiLe: '50.0%'
+        };
+    }
+    const d = makeDecision(db, seq, sums);
+    return {
+        code: d.code,
+        probT: d.probT,
+        strength: d.strength,
+        label: d.label,
+        breakdown: d.breakdown,
+        regime: d.regime,
+        tiLe: (d.strength * 100).toFixed(1) + '%'
+    };
+}
+
+// ============================================================
+// LAYER 13 — FETCH & PROCESS LOOP
+// ============================================================
+async function fetchApi(url) {
+    for (let i = 0; i < 3; i++) {
+        try {
+            const res = await axios.get(url, { timeout: 8000 });
+            let arr =
+                res.data?.data?.list ||
+                res.data?.list ||
+                res.data?.data ||
+                (Array.isArray(res.data) ? res.data : []);
+            if (!Array.isArray(arr)) return [];
+            if (arr.length >= 2 && Number(arr[0].SessionId) > Number(arr[arr.length - 1].SessionId)) {
+                arr.reverse();
+            }
+            return arr;
+        } catch (e) {
+            if (i === 2) {
+                console.error(`[fetchApi] fail: ${e.message}`);
+                return [];
+            }
+            await new Promise(r => setTimeout(r, 500));
+        }
     }
     return [];
 }
 
-/**
- * Lưu danh sách key vào file JSON.
- * @param {Array} keys - Mảng các đối tượng key
- */
-function saveKeysToFile(keys) {
-    try {
-        fs.writeFileSync(KEY_FILE_PATH, JSON.stringify(keys, null, 2), 'utf8');
-    } catch (error) {
-        writeLog('ERROR', 'Lỗi ghi file keys.json:', error.message);
+function pushMetaResult(meta, correct) {
+    meta.totalPred = (meta.totalPred || 0) + 1;
+    if (correct) {
+        meta.totalWin = (meta.totalWin || 0) + 1;
+        meta.winStreak = (meta.winStreak || 0) + 1;
+        meta.loseStreak = 0;
+        meta.maxWinStreak = Math.max(meta.maxWinStreak || 0, meta.winStreak);
+    } else {
+        meta.totalLose = (meta.totalLose || 0) + 1;
+        meta.loseStreak = (meta.loseStreak || 0) + 1;
+        meta.winStreak = 0;
+        meta.maxLoseStreak = Math.max(meta.maxLoseStreak || 0, meta.loseStreak);
     }
+    meta.recent50.push(correct ? 1 : 0);
+    while (meta.recent50.length > 50) meta.recent50.shift();
 }
 
-/**
- * Sinh một key mới với định dạng HVW-XXXX-XXXX-XXXX.
- * @param {string} plan - Gói mua (1d, 7d, 30d)
- * @param {string} telegramId - ID Telegram của người mua
- * @returns {Object} Đối tượng key vừa tạo
- */
-function generateNewKey(plan, telegramId) {
-    // Sinh 6 byte ngẫu nhiên, chuyển thành chuỗi HEX in hoa
-    const randomBytes = crypto.randomBytes(6).toString('hex').toUpperCase();
-    
-    // Cắt thành 3 khúc, mỗi khúc 4 ký tự
-    const part1 = randomBytes.slice(0, 4);
-    const part2 = randomBytes.slice(4, 8);
-    const part3 = randomBytes.slice(8, 12);
-    
-    // Ghép thành key hoàn chỉnh
-    const keyString = `HVW-${part1}-${part2}-${part3}`;
-    
-    // Tính thời gian hết hạn
-    const currentTime = Date.now();
-    const durations = {
-        '1d': 1 * 24 * 60 * 60 * 1000,     // 1 ngày
-        '7d': 7 * 24 * 60 * 60 * 1000,     // 7 ngày
-        '30d': 30 * 24 * 60 * 60 * 1000    // 30 ngày
-    };
-    const durationMs = durations[plan] || durations['1d'];
-    const expirationTime = currentTime + durationMs;
-    
-    // Tạo đối tượng record
-    const keyRecord = {
-        key: keyString,
-        plan: plan,
-        telegramId: telegramId,
-        createdAt: currentTime,
-        expiresAt: expirationTime,
-        active: true,
-        revoked: false,
-        failAttempts: 0,
-        lastFailAt: null,
-        activatedAt: null,
-        activatedBy: null,
-        userInfo: null
-    };
-    
-    // Lưu vào file
-    const allKeys = loadKeysFromFile();
-    allKeys.push(keyRecord);
-    saveKeysToFile(allKeys);
-    
-    return keyRecord;
-}
+async function processGame(game) {
+    const url = game === 'md5' ? API_MD5 : API_TX;
+    const list = await fetchApi(url);
+    if (!list || !list.length) return;
 
-// ============================================================================
-// PHẦN 4: CÁC HÀM TƯƠNG TÁC TELEGRAM API
-// ============================================================================
+    const latest = list[list.length - 1];
+    const session = safeInt(latest.SessionId);
+    if (!session) return;
 
-/**
- * Gửi tin nhắn đến một chat ID trên Telegram.
- * @param {string|number} chatId - ID người nhận
- * @param {string} text - Nội dung tin nhắn (HTML)
- * @param {Object} options - Tùy chọn bổ sung (reply_markup, ...)
- */
-async function sendTelegramMessage(chatId, text, options = {}) {
-    if (!TELEGRAM_BOT_TOKEN) {
-        writeLog('WARN', 'Chưa cấu hình TELEGRAM_BOT_TOKEN, không thể gửi tin nhắn.');
-        return;
-    }
-    
-    try {
-        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-        await axios.post(url, {
-            chat_id: chatId,
-            text: text,
-            parse_mode: 'HTML',
-            ...options
-        }, { timeout: 10000 });
-    } catch (error) {
-        writeLog('ERROR', 'Lỗi gửi tin nhắn Telegram:', error.message);
-    }
-}
+    const db = readDB(game);
+    if (db.lastProcessedSession === session) return;
 
-/**
- * Lấy danh sách các bản cập nhật (updates) từ Telegram API.
- * @param {number} offset - ID của update cuối cùng đã xử lý
- * @returns {Array} Mảng các update mới
- */
-async function getTelegramUpdates(offset = 0) {
-    if (!TELEGRAM_BOT_TOKEN) return [];
-    
-    try {
-        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`;
-        const response = await axios.get(url, {
-            params: { offset: offset, timeout: 30 },
-            timeout: 35000
-        });
-        return response.data.result || [];
-    } catch (error) {
-        return [];
-    }
-}
+    const seq  = list.map(getResult).filter(Boolean);
+    const sums = list.map(getSum).filter(s => s >= 3 && s <= 18);
+    if (seq.length < 5) return;
 
-/**
- * Trả lời callback query (khi user bấm nút inline keyboard).
- * @param {string} callbackQueryId - ID của callback query
- */
-async function answerCallbackQuery(callbackQueryId) {
-    if (!TELEGRAM_BOT_TOKEN) return;
-    try {
-        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
-        await axios.post(url, { callback_query_id: callbackQueryId }, { timeout: 5000 });
-    } catch (error) {
-        writeLog('ERROR', 'Lỗi answerCallbackQuery:', error.message);
-    }
-}
+    // ---- (1) Chấm điểm phiên trước ----
+    const prev = db.history[db.history.length - 1];
+    if (prev && safeInt(prev.phienDuDoan) === session) {
+        const actual = getResult(latest);
+        prev.ketQua = actual;
+        prev.ketQuaLabel = label(actual);
+        const correct = prev.DU_DOAN_CODE === actual;
+        prev.trangThai = correct ? 'ĐÚNG' : 'SAI';
 
-// ============================================================================
-// PHẦN 5: XỬ LÝ TIN NHẮN VÀ LỆNH TELEGRAM
-// ============================================================================
+        // Cập nhật meta
+        pushMetaResult(db.meta, correct);
 
-// Map lưu trữ các đơn hàng đang chờ thanh toán: { chatId: { plan, price } }
-const pendingOrdersMap = new Map();
-
-/**
- * Xử lý tin nhắn văn bản gửi đến Bot (từ user thường).
- * @param {Object} message - Đối tượng message từ Telegram
- */
-async function handleUserMessage(message) {
-    const chatId = message.chat.id;
-    const messageText = (message.text || '').trim();
-    const senderInfo = message.from || {};
-    
-    // Lệnh /start hoặc /help
-    if (messageText === '/start' || messageText === '/help') {
-        const helpText = `🎯 <b>BOT BÁN KEY</b>\n\n` +
-            `Các lệnh có sẵn:\n` +
-            `/mua - Mua key mới\n` +
-            `/key - Xem danh sách key đã mua\n` +
-            `/huongdan - Hướng dẫn sử dụng\n\n` +
-            `💡 <b>Bảng giá:</b>\n` +
-            `• 1 Ngày: ${PRICE_LIST['1d'].toLocaleString()}đ\n` +
-            `• 7 Ngày: ${PRICE_LIST['7d'].toLocaleString()}đ\n` +
-            `• 30 Ngày: ${PRICE_LIST['30d'].toLocaleString()}đ`;
-        
-        return sendTelegramMessage(chatId, helpText);
-    }
-    
-    // Lệnh /mua
-    if (messageText === '/mua') {
-        const inlineKeyboard = {
-            inline_keyboard: [
-                [{ text: `1 Ngày — ${PRICE_LIST['1d'].toLocaleString()}đ`, callback_data: 'buy_1d' }],
-                [{ text: `7 Ngày — ${PRICE_LIST['7d'].toLocaleString()}đ`, callback_data: 'buy_7d' }],
-                [{ text: `30 Ngày — ${PRICE_LIST['30d'].toLocaleString()}đ`, callback_data: 'buy_30d' }]
-            ]
-        };
-        
-        return sendTelegramMessage(chatId, '🛒 <b>Vui lòng chọn gói bạn muốn mua:</b>', {
-            reply_markup: inlineKeyboard
-        });
-    }
-    
-    // Lệnh /key
-    if (messageText === '/key') {
-        const userKeys = loadKeysFromFile().filter(
-            keyRecord => String(keyRecord.telegramId) === String(senderInfo.id)
-        );
-        
-        if (userKeys.length === 0) {
-            return sendTelegramMessage(chatId, '❌ Bạn chưa có key nào. Vui lòng dùng lệnh /mua để mua.');
+        // Gradient Descent
+        if (prev.breakdown && prev.breakdown.length > 0) {
+            updateWeights(db, prev.breakdown, prev.DU_DOAN_CODE, actual);
         }
-        
-        let responseText = `🔑 <b>DANH SÁCH KEY CỦA BẠN</b>\n\n`;
-        
-        userKeys.forEach((keyRecord, index) => {
-            const expirationDate = new Date(keyRecord.expiresAt).toLocaleString('vi-VN');
-            
-            let statusIcon = '🟢 HOẠT ĐỘNG';
-            if (!keyRecord.active) {
-                statusIcon = '🔴 ĐÃ BỊ KHÓA';
-            } else if (keyRecord.revoked) {
-                statusIcon = '🔴 BỊ THU HỒI';
-            } else if (Date.now() > keyRecord.expiresAt) {
-                statusIcon = '⚪ ĐÃ HẾT HẠN';
-            }
-            
-            responseText += `<b>#${index + 1}</b> — ${statusIcon}\n`;
-            responseText += `Mã: <code>${keyRecord.key}</code>\n`;
-            responseText += `Hết hạn: ${expirationDate}\n`;
-            responseText += `Số lần sai: ${keyRecord.failAttempts}/${MAXIMUM_FAIL_ATTEMPTS}\n\n`;
-        });
-        
-        return sendTelegramMessage(chatId, responseText);
-    }
-    
-    // Lệnh /huongdan
-    if (messageText === '/huongdan') {
-        const guideText = `📖 <b>HƯỚNG DẪN SỬ DỤNG</b>\n\n` +
-            `1. Mua key qua lệnh /mua\n` +
-            `2. Nhận key dạng HVW-XXXX-XXXX-XXXX\n` +
-            `3. Truy cập website để nhập key\n` +
-            `4. Nhập key và bấm "Kích hoạt"\n\n` +
-            `⚠️ <b>Lưu ý:</b> Nhập sai 3 lần sẽ bị khóa vĩnh viễn, không hỗ trợ đổi key.`;
-        
-        return sendTelegramMessage(chatId, guideText);
-    }
-}
 
-/**
- * Xử lý callback query (khi user bấm nút inline).
- * @param {Object} callbackQuery - Đối tượng callback từ Telegram
- */
-async function handleCallbackQuery(callbackQuery) {
-    const chatId = callbackQuery.message.chat.id;
-    const callbackData = callbackQuery.data;
-    const senderInfo = callbackQuery.from;
-    
-    // Xử lý nút mua gói
-    if (callbackData.startsWith('buy_')) {
-        const selectedPlan = callbackData.replace('buy_', '');
-        
-        if (!PRICE_LIST[selectedPlan]) return;
-        
-        // Lưu đơn hàng vào map
-        pendingOrdersMap.set(String(chatId), {
-            plan: selectedPlan,
-            price: PRICE_LIST[selectedPlan],
-            createdAt: Date.now()
-        });
-        
-        await answerCallbackQuery(callbackQuery.id);
-        
-        const orderText = `💳 <b>ĐƠN HÀNG</b>\n\n` +
-            `Gói: <b>${selectedPlan}</b>\n` +
-            `Giá: <b>${PRICE_LIST[selectedPlan].toLocaleString()}đ</b>\n\n` +
-            `Vui lòng chuyển khoản và bấm "Đã thanh toán".`;
-        
-        const paymentKeyboard = {
-            inline_keyboard: [
-                [{ text: '✅ Đã thanh toán', callback_data: `paid_${selectedPlan}` }],
-                [{ text: '❌ Hủy đơn', callback_data: 'cancel_order' }]
-            ]
-        };
-        
-        return sendTelegramMessage(chatId, orderText, { reply_markup: paymentKeyboard });
-    }
-    
-    // Xử lý nút đã thanh toán
-    if (callbackData.startsWith('paid_')) {
-        const selectedPlan = callbackData.replace('paid_', '');
-        const pendingOrder = pendingOrdersMap.get(String(chatId));
-        
-        if (!pendingOrder || pendingOrder.plan !== selectedPlan) {
-            await answerCallbackQuery(callbackQuery.id);
-            return sendTelegramMessage(chatId, '❌ Đơn hàng không tồn tại hoặc đã hết hạn. Vui lòng dùng /mua lại.');
+        // Calibration update
+        if (typeof prev.PROB_RAW === 'number') {
+            updateCalibration(db, prev.PROB_RAW, correct, prev.DU_DOAN_CODE, actual);
         }
-        
-        // Gửi thông báo cho Admin
-        const adminNotification = `💰 <b>YÊU CẦU DUYỆT ĐƠN</b>\n\n` +
-            `👤 User: ${senderInfo.first_name || ''} (@${senderInfo.username || 'N/A'})\n` +
-            `🆔 Chat ID: <code>${chatId}</code>\n` +
-            `📦 Gói: <b>${selectedPlan}</b> — ${pendingOrder.price.toLocaleString()}đ\n` +
-            `⏰ ${new Date().toLocaleString('vi-VN')}\n\n` +
-            `Để duyệt, gõ lệnh:\n<code>/duyet ${chatId} ${selectedPlan}</code>`;
-        
-        if (ADMIN_CHAT_ID) {
-            await sendTelegramMessage(ADMIN_CHAT_ID, adminNotification);
-        }
-        
-        await answerCallbackQuery(callbackQuery.id);
-        return sendTelegramMessage(chatId, '⏳ Đã gửi yêu cầu tới Admin. Vui lòng chờ duyệt.');
     }
-    
-    // Xử lý nút hủy đơn
-    if (callbackData === 'cancel_order') {
-        pendingOrdersMap.delete(String(chatId));
-        await answerCallbackQuery(callbackQuery.id);
-        return sendTelegramMessage(chatId, '❌ Đã hủy đơn hàng.');
-    }
-}
 
-/**
- * Xử lý tin nhắn từ Admin (các lệnh quản trị).
- * @param {Object} message - Đối tượng message từ Telegram
- */
-async function handleAdminMessage(message) {
-    const chatId = message.chat.id;
-    const messageText = (message.text || '').trim();
-    
-    // Chỉ Admin mới được phép
-    if (String(chatId) !== String(ADMIN_CHAT_ID)) {
-        return;
-    }
-    
-    // Lệnh /duyet <chatId> <plan>
-    if (messageText.startsWith('/duyet ')) {
-        const commandParts = messageText.split(/\s+/);
-        
-        if (commandParts.length < 3) {
-            return sendTelegramMessage(chatId, '⚠️ Cú pháp: /duyet <chatId> <plan>');
-        }
-        
-        const targetChatId = commandParts[1];
-        const selectedPlan = commandParts[2];
-        
-        if (!PRICE_LIST[selectedPlan]) {
-            return sendTelegramMessage(chatId, '⚠️ Plan không hợp lệ. Chỉ chấp nhận: 1d, 7d, 30d.');
-        }
-        
-        // Sinh key mới
-        const newKeyRecord = generateNewKey(selectedPlan, targetChatId);
-        const expirationDate = new Date(newKeyRecord.expiresAt).toLocaleString('vi-VN');
-        
-        // Gửi key cho Admin
-        await sendTelegramMessage(chatId, 
-            `✅ Đã tạo key cho user <code>${targetChatId}</code>\n` +
-            `Mã: <code>${newKeyRecord.key}</code>`
-        );
-        
-        // Gửi key cho User
-        await sendTelegramMessage(targetChatId,
-            `🎉 <b>ĐƠN HÀNG ĐÃ ĐƯỢC DUYỆT</b>\n\n` +
-            `🔑 Key của bạn: <code>${newKeyRecord.key}</code>\n` +
-            `📦 Gói: <b>${selectedPlan}</b>\n` +
-            `📅 Hết hạn: ${expirationDate}\n\n` +
-            `Vui lòng truy cập website để kích hoạt.`
-        );
-        
-        // Xóa khỏi danh sách chờ
-        pendingOrdersMap.delete(String(targetChatId));
-    }
-    
-    // Lệnh /keys — xem tổng quan
-    if (messageText === '/keys') {
-        const allKeys = loadKeysFromFile();
-        const activeCount = allKeys.filter(k => k.active && !k.revoked && Date.now() < k.expiresAt).length;
-        const lockedCount = allKeys.filter(k => !k.active).length;
-        const revokedCount = allKeys.filter(k => k.revoked).length;
-        
-        return sendTelegramMessage(chatId,
-            `📊 <b>TỔNG QUAN HỆ THỐNG</b>\n\n` +
-            `Tổng số key: <b>${allKeys.length}</b>\n` +
-            `🟢 Đang hoạt động: <b>${activeCount}</b>\n` +
-            `🔴 Đã khóa: <b>${lockedCount}</b>\n` +
-            `⛔ Đã thu hồi: <b>${revokedCount}</b>`
-        );
-    }
-    
-    // Lệnh /revoke <key>
-    if (messageText.startsWith('/revoke ')) {
-        const keyToRevoke = messageText.replace('/revoke ', '').trim();
-        const allKeys = loadKeysFromFile();
-        const foundKey = allKeys.find(k => k.key === keyToRevoke);
-        
-        if (!foundKey) {
-            return sendTelegramMessage(chatId, '❌ Không tìm thấy key này.');
-        }
-        
-        foundKey.revoked = true;
-        foundKey.active = false;
-        saveKeysToFile(allKeys);
-        
-        return sendTelegramMessage(chatId, `✅ Đã thu hồi key: <code>${keyToRevoke}</code>`);
-    }
-}
+    // ---- (2) Cập nhật bộ nhớ sâu ----
+    updateDeepMemory(db, seq);
 
-// ============================================================================
-// PHẦN 6: VÒNG LẶP LONG POLLING TELEGRAM
-// ============================================================================
+    // ---- (3) Dự đoán phiên tiếp ----
+    const pred = runEngine(seq, sums, db);
 
-let telegramUpdateOffset = 0;
-
-/**
- * Vòng lặp liên tục lấy cập nhật từ Telegram và xử lý.
- */
-async function telegramPollingLoop() {
-    if (!TELEGRAM_BOT_TOKEN) {
-        writeLog('WARN', 'Không có TELEGRAM_BOT_TOKEN, bot không chạy.');
-        return;
-    }
-    
-    writeLog('INFO', 'Bắt đầu vòng lặp Telegram polling...');
-    
-    while (true) {
-        try {
-            const updates = await getTelegramUpdates(telegramUpdateOffset);
-            
-            for (const update of updates) {
-                telegramUpdateOffset = update.update_id + 1;
-                
-                // Xử lý tin nhắn
-                if (update.message) {
-                    if (String(update.message.chat.id) === String(ADMIN_CHAT_ID)) {
-                        await handleAdminMessage(update.message);
-                    } else {
-                        await handleUserMessage(update.message);
-                    }
-                }
-                
-                // Xử lý callback query
-                if (update.callback_query) {
-                    await handleCallbackQuery(update.callback_query);
-                }
-            }
-        } catch (error) {
-            writeLog('ERROR', 'Lỗi trong vòng lặp polling:', error.message);
-        }
-        
-        // Nghỉ 1 giây trước khi lấy tiếp
-        await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-}
-
-// ============================================================================
-// PHẦN 7: EXPRESS SERVER & API KÍCH HOẠT
-// ============================================================================
-
-const expressApp = express();
-const httpServer = http.createServer(expressApp);
-const webSocketServer = new WebSocketServer({ server: httpServer, path: '/ws' });
-
-// Middleware parse JSON
-expressApp.use(express.json());
-
-// Middleware CORS
-expressApp.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-    
-    next();
-});
-
-/**
- * Lấy địa chỉ IP thật của client, xử lý qua proxy/Cloudflare.
- * @param {Object} req - Express request
- * @returns {string} Địa chỉ IP
- */
-function extractRealIP(req) {
-    const cfIP = req.headers['cf-connecting-ip'];
-    const xForwardedFor = req.headers['x-forwarded-for'];
-    
-    if (cfIP) return cfIP;
-    if (xForwardedFor) return xForwardedFor.split(',')[0].trim();
-    return req.socket.remoteAddress || 'Unknown';
-}
-
-// ============================================================================
-// API: KÍCH HOẠT KEY (TỰ ĐỘNG THU THẬP THÔNG TIN)
-// ============================================================================
-expressApp.post('/api/activate', async (req, res) => {
-    const requestBody = req.body;
-    const providedKey = requestBody.key;
-    const deviceId = requestBody.deviceId;
-    const userAgent = requestBody.userAgent;
-    const screenResolution = requestBody.screen;
-    const browserLanguage = requestBody.language;
-    
-    // Validate cơ bản
-    if (!providedKey) {
-        return res.status(400).json({
-            success: false,
-            error: 'Vui lòng cung cấp key.'
-        });
-    }
-    
-    // Chuẩn hóa key
-    const normalizedKey = providedKey.trim().toUpperCase();
-    
-    // Tìm key trong DB
-    const allKeys = loadKeysFromFile();
-    const keyRecord = allKeys.find(k => k.key === normalizedKey);
-    
-    // Kiểm tra tồn tại
-    if (!keyRecord) {
-        return res.status(404).json({
-            success: false,
-            error: 'Key không tồn tại trên hệ thống.'
-        });
-    }
-    
-    // Kiểm tra đã bị thu hồi
-    if (keyRecord.revoked) {
-        return res.status(403).json({
-            success: false,
-            error: 'Key này đã bị thu hồi vĩnh viễn.'
-        });
-    }
-    
-    // Kiểm tra đã bị khóa (do sai 3 lần)
-    if (!keyRecord.active) {
-        return res.status(403).json({
-            success: false,
-            error: 'Key đã bị khóa do nhập sai quá 3 lần.'
-        });
-    }
-    
-    // Kiểm tra hết hạn
-    if (Date.now() > keyRecord.expiresAt) {
-        return res.status(403).json({
-            success: false,
-            error: 'Key đã hết hạn sử dụng.'
-        });
-    }
-    
-    // Lấy IP
-    const clientIP = extractRealIP(req);
-    
-    // Kiểm tra thiết bị
-    if (keyRecord.activatedBy && deviceId && keyRecord.activatedBy !== deviceId) {
-        return res.status(403).json({
-            success: false,
-            error: 'Key này đã được kích hoạt trên thiết bị khác.'
-        });
-    }
-    
-    // Nếu đã kích hoạt đúng thiết bị này rồi -> trả về OK luôn
-    if (keyRecord.activatedBy === deviceId) {
-        return res.json({
-            success: true,
-            message: 'Key hợp lệ (đã kích hoạt trước đó).',
-            expiresAt: keyRecord.expiresAt,
-            plan: keyRecord.plan,
-            remaining: Math.floor((keyRecord.expiresAt - Date.now()) / 86400000) + ' ngày'
-        });
-    }
-    
-    // Lần đầu kích hoạt -> Thu thập thông tin
-    let geoLocation = 'Không xác định';
-    let internetProvider = 'Không xác định';
-    
-    try {
-        const geoApiUrl = `http://ip-api.com/json/${clientIP === '::1' ? '' : clientIP}`;
-        const geoResponse = await axios.get(geoApiUrl, { timeout: 5000 });
-        
-        if (geoResponse.data && geoResponse.data.status === 'success') {
-            const geoData = geoResponse.data;
-            geoLocation = `${geoData.city || ''}, ${geoData.regionName || ''}, ${geoData.country || ''}`;
-            internetProvider = geoData.isp || geoData.org || 'Không rõ';
-        }
-    } catch (error) {
-        writeLog('ERROR', 'Lỗi lấy thông tin địa lý:', error.message);
-    }
-    
-    // Cập nhật thông tin vào key
-    keyRecord.activatedAt = Date.now();
-    keyRecord.activatedBy = deviceId || 'unknown';
-    keyRecord.userInfo = {
-        ip: clientIP,
-        location: geoLocation,
-        isp: internetProvider,
-        userAgent: userAgent,
-        screen: screenResolution,
-        language: browserLanguage,
-        deviceId: deviceId
-    };
-    
-    // Lưu file
-    saveKeysToFile(allKeys);
-    
-    // Gửi thông báo cho Admin
-    const adminNotification = `🚨 <b>KEY VỪA ĐƯỢC KÍCH HOẠT</b>\n\n` +
-        `🔑 <b>Key:</b> <code>${keyRecord.key}</code>\n` +
-        `📦 <b>Gói:</b> ${keyRecord.plan}\n` +
-        `👤 <b>Telegram ID:</b> <code>${keyRecord.telegramId || 'Không rõ'}</code>\n\n` +
-        `🌐 <b>IP:</b> <code>${clientIP}</code>\n` +
-        `📍 <b>Vị trí:</b> ${geoLocation}\n` +
-        `📡 <b>Nhà mạng:</b> ${internetProvider}\n\n` +
-        `💻 <b>Thiết bị:</b> ${userAgent || 'Không rõ'}\n` +
-        `📱 <b>Màn hình:</b> ${screenResolution || 'Không rõ'}\n` +
-        `🌐 <b>Ngôn ngữ:</b> ${browserLanguage || 'Không rõ'}\n` +
-        `🆔 <b>Mã thiết bị:</b> <code>${deviceId || 'Không rõ'}</code>\n\n` +
-        `⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`;
-    
-    if (ADMIN_CHAT_ID) {
-        await sendTelegramMessage(ADMIN_CHAT_ID, adminNotification);
-    }
-    
-    return res.json({
-        success: true,
-        message: 'Kích hoạt thành công.',
-        expiresAt: keyRecord.expiresAt,
-        plan: keyRecord.plan,
-        remaining: Math.floor((keyRecord.expiresAt - Date.now()) / 86400000) + ' ngày'
+    db.history.push({
+        phien: session,
+        xucXac: getDice(latest),
+        tong: getSum(latest),
+        ketQua: getResult(latest),
+        ketQuaLabel: label(getResult(latest)),
+        phienDuDoan: session + 1,
+        DU_DOAN_CODE: pred.code,
+        DU_DOAN: label(pred.code),
+        TI_LE: pred.tiLe,
+        PROB_RAW: pred.probT,
+        STRENGTH: pred.strength,
+        patternName: pred.label,
+        regime: pred.regime,
+        breakdown: pred.breakdown,
+        trangThai: 'ĐANG CHỜ',
+        at: nowIso()
     });
+
+    if (db.history.length > MAX_HISTORY) db.history.shift();
+    db.lastProcessedSession = session;
+    saveDB(game, db);
+}
+
+// Timer chính
+setInterval(() => {
+    processGame('md5').catch(e => console.error('[md5]', e.message));
+    processGame('taixiu').catch(e => console.error('[taixiu]', e.message));
+}, TICK_MS);
+
+// ============================================================
+// ROUTES — HOME
+// ============================================================
+app.get('/', (req, res) => {
+    res.send(`<div style="font-family:sans-serif;padding:20px;background:#0a0e27;color:#e6eef6;min-height:100vh">
+        <h2 style="color:#22c55e;">🚀 BACKEND v11 — DEEP ADAPTIVE ENSEMBLE (14 LAYERS)</h2>
+        <p>No random. No skip. Online Gradient Descent. Kalman Smoothing. Regime Detector.</p>
+        <ul>
+            <li><a style="color:#93c5fd" href="/api/stats/taixiu">/api/stats/taixiu — Weights, Kalman, Calibration</a></li>
+            <li><a style="color:#93c5fd" href="/api/stats/md5">/api/stats/md5</a></li>
+            <li><a style="color:#93c5fd" href="/api/predict/taixiu">/api/predict/taixiu — Raw prediction</a></li>
+            <li><a style="color:#93c5fd" href="/taixiu">/taixiu — UI</a></li>
+            <li><a style="color:#93c5fd" href="/md5">/md5 — UI</a></li>
+        </ul>
+    </div>`);
 });
 
-// ============================================================================
-// API: GHI NHẬN LẦN SAI KEY
-// ============================================================================
-expressApp.post('/api/fail', (req, res) => {
-    const providedKey = (req.body.key || '').trim().toUpperCase();
-    
-    if (!providedKey) {
-        return res.json({ success: false, message: 'Không có key.' });
-    }
-    
-    const allKeys = loadKeysFromFile();
-    const keyRecord = allKeys.find(k => k.key === providedKey);
-    
-    // Nếu key không tồn tại -> không có gì để tăng
-    if (!keyRecord) {
-        return res.json({ success: false, message: 'Key không tồn tại.' });
-    }
-    
-    // Tăng số lần sai
-    keyRecord.failAttempts = (keyRecord.failAttempts || 0) + 1;
-    keyRecord.lastFailAt = Date.now();
-    
-    let isLockedNow = false;
-    let responseMessage = `Sai lần ${keyRecord.failAttempts}/${MAXIMUM_FAIL_ATTEMPTS}.`;
-    
-    // Nếu đủ 3 lần -> KHÓA VĨNH VIỄN
-    if (keyRecord.failAttempts >= MAXIMUM_FAIL_ATTEMPTS) {
-        keyRecord.active = false;
-        keyRecord.revoked = true;
-        isLockedNow = true;
-        responseMessage = 'Key đã bị khóa vĩnh viễn do sai quá 3 lần.';
-        
-        // Thông báo cho Admin
-        if (ADMIN_CHAT_ID) {
-            sendTelegramMessage(ADMIN_CHAT_ID,
-                `⛔ <b>KEY BỊ KHÓA</b>\n\n` +
-                `Key: <code>${keyRecord.key}</code>\n` +
-                `User: <code>${keyRecord.telegramId || 'Không rõ'}</code>\n` +
-                `Lý do: Nhập sai 3 lần liên tiếp.`
-            );
-        }
-        
-        // Thông báo cho User (nếu có Telegram ID)
-        if (keyRecord.telegramId) {
-            sendTelegramMessage(keyRecord.telegramId,
-                `⛔ <b>KEY ĐÃ BỊ KHÓA</b>\n\n` +
-                `Mã: <code>${keyRecord.key}</code>\n` +
-                `Lý do: Nhập sai quá 3 lần.\n\n` +
-                `<b>Không hỗ trợ đổi key.</b> Vui lòng mua key mới.`
-            );
-        }
-    }
-    
-    saveKeysToFile(allKeys);
-    
-    return res.json({
-        success: true,
-        failAttempts: keyRecord.failAttempts,
-        locked: isLockedNow,
-        message: responseMessage
-    });
-});
-
-// ============================================================================
-// PHẦN 8: GIAO DIỆN WEB (HTML INLINE)
-// ============================================================================
-
-const WEB_INTERFACE_HTML = `<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kích Hoạt Key - HOANG VIP WIN</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0a0e27;
-            color: #e6eef6;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        .container {
-            max-width: 440px;
-            width: 100%;
-            background: #0f172a;
-            border: 1px solid #334155;
-            border-radius: 16px;
-            padding: 28px;
-        }
-        h1 {
-            color: #fbbf24;
-            text-align: center;
-            font-size: 22px;
-            margin-bottom: 24px;
-        }
-        label {
-            display: block;
-            font-size: 12px;
-            color: #94a3b8;
-            margin-bottom: 6px;
-            margin-top: 14px;
-        }
-        input {
-            width: 100%;
-            padding: 14px;
-            background: #020617;
-            border: 2px solid #334155;
-            border-radius: 10px;
-            color: #fff;
-            font-family: monospace;
-            font-size: 16px;
-            text-align: center;
-            text-transform: uppercase;
-            outline: none;
-        }
-        input:focus { border-color: #3b82f6; }
-        button {
-            width: 100%;
-            padding: 14px;
-            background: #1e40af;
-            color: #fff;
-            border: none;
-            border-radius: 10px;
-            font-weight: 700;
-            font-size: 15px;
-            cursor: pointer;
-            margin-top: 20px;
-        }
-        button:hover { background: #2563eb; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
-        .result {
-            margin-top: 16px;
-            padding: 14px;
-            border-radius: 10px;
-            font-size: 13px;
-            line-height: 1.6;
-            display: none;
-        }
-        .result.ok { display: block; background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
-        .result.err { display: block; background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
-        .result.warn { display: block; background: #78350f; color: #fcd34d; border: 1px solid #f59e0b; }
-        .info {
-            margin-top: 18px;
-            padding: 12px;
-            background: #020617;
-            border-radius: 8px;
-            font-size: 11px;
-            color: #64748b;
-            text-align: center;
-            line-height: 1.6;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔑 KÍCH HOẠT KEY</h1>
-        
-        <label>Mã Key (Định dạng: HVW-XXXX-XXXX-XXXX)</label>
-        <input id="keyInput" type="text" placeholder="HVW-XXXX-XXXX-XXXX" maxlength="18" autocomplete="off">
-        
-        <button id="activateButton" onclick="performActivation()">Kích Hoạt</button>
-        
-        <div id="resultBox" class="result"></div>
-        
-        <div class="info">
-            Bằng việc bấm "Kích Hoạt", bạn đồng ý cho hệ thống tự động ghi nhận IP, thiết bị và vị trí để phục vụ bảo mật.
-        </div>
-    </div>
-    
-    <script>
-        // Hàm lấy hoặc sinh Device ID duy nhất
-        function getOrCreateDeviceId() {
-            let existingId = localStorage.getItem('device_id');
-            if (existingId) return existingId;
-            
-            const randomPart = Math.random().toString(36).slice(2);
-            const timePart = Date.now().toString(36);
-            const newId = 'dev_' + randomPart + timePart;
-            
-            localStorage.setItem('device_id', newId);
-            return newId;
-        }
-        
-        // Hàm chính xử lý kích hoạt
-        async function performActivation() {
-            const button = document.getElementById('activateButton');
-            const input = document.getElementById('keyInput');
-            const resultBox = document.getElementById('resultBox');
-            
-            const rawKey = input.value.trim();
-            
-            if (!rawKey) {
-                resultBox.className = 'result err';
-                resultBox.textContent = '❌ Vui lòng nhập Key.';
-                return;
-            }
-            
-            // Vô hiệu hóa nút trong lúc gọi API
-            button.disabled = true;
-            button.textContent = 'Đang xử lý...';
-            resultBox.className = 'result';
-            resultBox.style.display = 'none';
-            
-            try {
-                const screenResolution = window.screen.width + 'x' + window.screen.height;
-                const browserLang = navigator.language || 'unknown';
-                
-                const response = await fetch('/api/activate', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        key: rawKey,
-                        deviceId: getOrCreateDeviceId(),
-                        userAgent: navigator.userAgent,
-                        screen: screenResolution,
-                        language: browserLang
-                    })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    resultBox.className = 'result ok';
-                    resultBox.innerHTML = '✅ <b>KÍCH HOẠT THÀNH CÔNG!</b><br>' +
-                        'Gói: ' + data.plan + '<br>' +
-                        'Hết hạn: ' + new Date(data.expiresAt).toLocaleString('vi-VN') + '<br>' +
-                        'Còn lại: ' + data.remaining;
-                    
-                    localStorage.setItem('activated_key', rawKey);
-                } else {
-                    // Gọi API để đếm số lần sai
-                    const failResponse = await fetch('/api/fail', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ key: rawKey })
-                    });
-                    
-                    const failData = await failResponse.json();
-                    
-                    if (failData.locked) {
-                        resultBox.className = 'result err';
-                        resultBox.innerHTML = '⛔ <b>KEY ĐÃ BỊ KHÓA VĨNH VIỄN</b><br>' + failData.message;
-                    } else {
-                        resultBox.className = 'result warn';
-                        resultBox.innerHTML = '⚠️ ' + (data.error || 'Có lỗi xảy ra.') + '<br>' + (failData.message || '');
-                    }
-                }
-            } catch (error) {
-                resultBox.className = 'result err';
-                resultBox.textContent = '❌ Lỗi kết nối: ' + error.message;
-            } finally {
-                button.disabled = false;
-                button.textContent = 'Kích Hoạt';
-            }
-        }
-        
-        // Cho phép nhấn Enter để kích hoạt
-        document.getElementById('keyInput').addEventListener('keypress', function(event) {
-            if (event.key === 'Enter') {
-                performActivation();
-            }
-        });
-        
-        // Tự động điền key đã lưu (nếu có)
-        window.addEventListener('load', function() {
-            const savedKey = localStorage.getItem('activated_key');
-            if (savedKey) {
-                document.getElementById('keyInput').value = savedKey;
-            }
-        });
-    </script>
-</body>
-</html>`;
-
-// Route chính trả về giao diện web
-expressApp.get('/', (req, res) => {
-    res.send(WEB_INTERFACE_HTML);
-});
-
-// Route health check (dùng cho Render hoặc monitoring)
-expressApp.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        uptime: process.uptime(),
-        timestamp: new Date().toISOString()
-    });
-});
-
-// ============================================================================
-// PHẦN 9: KHỞI ĐỘNG SERVER VÀ BOT
-// ============================================================================
-
-httpServer.listen(PORT, () => {
-    writeLog('INFO', `🚀 Server đang chạy trên cổng ${PORT}`);
-    writeLog('INFO', `📡 Admin ID: ${ADMIN_CHAT_ID}`);
-    writeLog('INFO', `🤖 Bot đang khởi động...`);
-    
-    // Bắt đầu vòng lặp polling
-    telegramPollingLoop();
-});
-
-// Xử lý tắt server an toàn
-process.on('SIGTERM', () => {
-    writeLog('INFO', 'Nhận tín hiệu SIGTERM, đang tắt server...');
-    httpServer.close(() => {
-        writeLog('INFO', 'Server đã tắt.');
-        process.exit(0);
-    });
-});
-
-process.on('SIGINT', () => {
-    writeLog('INFO', 'Nhận tín hiệu SIGINT, đang tắt server...');
-    httpServer.close(() => {
-        writeLog('INFO', 'Server đã tắt.');
-        process.exit(0);
-    });
-});
+// ============================================================
+// ROUTES — STATS
+// ============================================================
+app.get('/api/stats
