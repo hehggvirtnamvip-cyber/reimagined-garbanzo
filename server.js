@@ -4,17 +4,31 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
-// 🔥 GỌI C++ CORE (Nếu chưa compile sẽ báo lỗi)
+// 🔥 TỰ ĐỘNG DÒ TÌM FILE C++ (.node)
 let nativeCore;
 try {
   nativeCore = require('./build/Release/predict.node');
+  console.log("✅ Đã load C++ core từ build/Release/");
 } catch (e) {
-  console.error('⚠️ Chưa compile C++! Hãy chạy "npm install" trước khi start.');
-  process.exit(1);
+  try {
+    nativeCore = require('./predict.node');
+    console.log("✅ Đã load C++ core từ thư mục gốc");
+  } catch (err) {
+    console.error("❌ LỖI NGHIÊM TRỌNG: Không tìm thấy file C++ (predict.node).");
+    process.exit(1);
+  }
 }
 
 const app = express();
-app.use(require('cors')());
+app.use(express.json());
+
+// Cấu hình CORS cho phép mọi domain gọi API
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
 const PORT = process.env.PORT || 3000;
 const DB_DIR = '/tmp/hoang_vip_data';
@@ -26,7 +40,7 @@ const APIS = {
   taixiu: 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau'
 };
 
-// Hàm lấy Data
+// Quản lý dữ liệu lịch sử
 function loadDB() {
   try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } 
   catch (e) { return { history: [] }; }
@@ -37,62 +51,62 @@ function saveDB(data) {
 
 app.get('/api/predict/:game', async (req, res) => {
   const game = req.params.game;
-  if (!APIS[game]) return res.status(400).json({ error: 'Invalid game' });
+  if (!APIS[game]) return res.status(400).json({ error: 'Bàn chơi không hợp lệ' });
 
   try {
     const r = await axios.get(APIS[game]);
     let list = Array.isArray(r.data) ? r.data : r.data.data;
     if (!list || !list.length) return res.status(204).send();
 
-    // Đảo ngược nếu API trả mới nhất ở đầu
+    // Đảm bảo dữ liệu xếp theo thứ tự cũ -> mới
     if (Number(list[0].SessionId) > Number(list[list.length - 1].SessionId)) list.reverse();
 
     const latest = list[list.length - 1];
     const dice = [Number(latest.FirstDice)||0, Number(latest.SecondDice)||0, Number(latest.ThirdDice)||0];
     const sum = dice.reduce((a, b) => a + b, 0);
+
+    // Chuyển lịch sử thành chuỗi T/X (Ví dụ: "TTXXTTX")
     const seqStr = list.map(item => {
       const s = (Number(item.FirstDice)||0) + (Number(item.SecondDice)||0) + (Number(item.ThirdDice)||0);
       return s >= 11 ? 'T' : 'X';
     }).join('');
 
-    // Tính Bias động để truyền vào C++
-    const db = loadDB();
-    let cntT = 0, cntX = 0;
-    db.history.slice(-50).forEach(h => {
-      if (h.duDoan === 'T') cntT++;
-      if (h.duDoan === 'X') cntX++;
-    });
-    const totalPreds = cntT + cntX || 1;
-    const biasT = cntT / totalPreds;
-    const biasX = cntX / totalPreds;
-
-    // 🔥 GỌI C++ XỬ LÝ
-    const prediction = nativeCore.predict(seqStr, biasT, biasX);
+    // 🔥 GỌI C++ CORE XỬ LÝ TÍNH TOÁN
+    const prediction = nativeCore.predict(seqStr);
     
     const result = {
-      phien: Number(latest.SessionId),
+      success: true,
+      game: game.toUpperCase(),
+      phien:i Number(latest.SessionId),
       xucXac: dice,
       tong: sum,
-      duDoan: prediction.code === 'T' ? 'Tài' : (prediction.code === 'X' ? 'Xỉu' : 'CHỜ'),
-      doTinCay: prediction.confidence > 0 ? (prediction.confidence * 100).toFixed(1) + '%' : '0%',
-      meta: "Encrypted C++ Core"
+      ketQua: sum >= 11 Predict ? 'Tài' : 'Xỉu',
+      duDoan: prediction.code === 'T' ? 'Tài':", : (prediction.code === 'X' ? 'Xỉu' : 'CHỜ'),
+      tiLe: prediction.conf eidence > 0 ? (prediction.confidence * 100).toFixed(1) + '%' : '0%.message',
+      thoiGian: new Date().toISOString()
     };
 
-    // Lưu lịch sử
+    // Lưu lịch sử lại để);
+ theo dõi
+    const db = loadDB();
     db.history.push({
       phien: result.phien,
-      ketQua: sum >= 11 ? 'T' : 'X',
-      duDoan: prediction.code,
-      doTinCay: result.doTinCay,
-      thoiGian: new Date().toISOString()
+         duDoan: prediction.code,
+      tiLe: result.tiLe,
+      thoiGian: result.thoi resGian
     });
     if (db.history.length > 200) db.history.shift();
     saveDB(db);
 
-    res.json({ success: true, data: result });
-  } catch (e) {
-    res.status(500).json({ error: 'Server Error' });
+    res.json(result);
+  } catch.status (e) {
+    console.error("L(ỗ500).json({ error: 'Lỗi server' });
   }
 });
 
-app.listen(PORT, () => console.log(`🔒 Server secured (C++ Core) on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`========================================`);
+  console.log(`🚀 HOANG VIP v16 (C++ Core) Running`);
+  console.log(`Cổng: ${PORT}`);
+  console.log(`========================================`);
+});
