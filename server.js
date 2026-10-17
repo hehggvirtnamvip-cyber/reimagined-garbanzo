@@ -1,658 +1,694 @@
-/**
- * server.js — FULL FIX (deterministic algorithm upgraded, preserves /md5 & /taixiu)
- *
- * - Replaces only the internal algorithm (deterministic, many pattern detectors).
- * - Preserves routes: /md5, /taixiu, /api/*, admin endpoints.
- * - Single-file: save as server.js, run with Node.js (>=18).
- *
- * Install:
- *   npm install express axios
- * Run:
- *   node server.js
- */
-
 'use strict';
+
+// ============================================================
+// HOANG CUSTOM PREDICTOR — v13 "LOGIC RIÊNG"
+// Node >= 18 | express + axios + ws
+// Chạy: npm install express axios ws && node server.js
+//
+// ⚠️  LƯU Ý QUAN TRỌNG:
+// Không có thuật toán nào thắng được xúc xắc ngẫu nhiên lâu dài.
+// Code này để bạn tự cắm LOGIC RIÊNG và test trung thực.
+// ============================================================
 
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const { WebSocketServer } = require('ws');
 
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ============================================================
+// CONFIG
+// ============================================================
+const PORT = process.env.PORT || 3000;
+const API_MD5 = 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau';
+const API_TX  = 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau';
+const API_KEY = process.env.API_KEY || 'hoang-vip-secret-change-me';
+const DB_DIR = process.env.DB_DIR || path.join(__dirname, 'data');
+const LOG_DIR = path.join(DB_DIR, 'logs');
+const TICK_MS = parseInt(process.env.TICK_MS || '5000', 10);
+const MAX_HISTORY = 5000;
 
-// Simple CORS for convenience
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
+// CHỌN PRESET Ở ĐÂY: 'A' | 'B' | 'C'
+const PRESET = process.env.PRESET || 'A';
 
-/* ================= CONFIG ================= */
-const PORT = Number(process.env.PORT || 3000);
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
-const MAX_HISTORY = Number(process.env.MAX_HISTORY || 800);
-const API_TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 8000);
-
-const API_MD5 = process.env.API_MD5 || 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau';
-const API_TX = process.env.API_TX || 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau';
-
-const DB_DIR = process.env.DB_DIR || __dirname;
-if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
-
-const DB_FILES = {
-  md5: path.join(DB_DIR, 'db_md5.json'),
-  taixiu: path.join(DB_DIR, 'db_taixiu.json')
-};
-const BACKUP_FILES = {
-  md5: path.join(DB_DIR, 'db_md5.bak.json'),
-  taixiu: path.join(DB_DIR, 'db_taixiu.bak.json')
-};
-
-/* ================= HELPERS ================= */
-function now() { return new Date().toISOString(); }
-function safeReadJson(file, fallback = null) {
-  try { if (!fs.existsSync(file)) return fallback; return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return fallback; }
+for (const d of [DB_DIR, LOG_DIR]) {
+    if (!fs.existsSync(d)) { try { fs.mkdirSync(d, { recursive: true }); } catch (e) {} }
 }
-function safeWriteJson(file, obj) {
-  try { const tmp = file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8'); fs.renameSync(tmp, file); } catch (e) { console.error('write error', file, e && e.message); }
-}
-function clamp(x, lo = 1e-6, hi = 1 - 1e-6) { return Math.min(Math.max(x, lo), hi); }
-function safeInt(x, def = NaN) { const n = Number(x); return Number.isFinite(n) ? n : def; }
-function labelFromCode(c) { if (c === 'T') return 'Tài'; if (c === 'X') return 'Xỉu'; return null; }
-function flip(c) { if (c === 'T') return 'X'; if (c === 'X') return 'T'; return null; }
 
-/* ================= PERSISTENCE ================= */
+function log(level, ...args) {
+    const ts = new Date().toISOString();
+    const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+    const line = `[${ts}] [${level}] ${msg}`;
+    if (level === 'ERROR') console.error(line); else console.log(line);
+    try { fs.appendFileSync(path.join(LOG_DIR, `app-${ts.slice(0,10)}.log`), line + '\n'); } catch (e) {}
+}
+
+// ============================================================
+// UTILS
+// ============================================================
+const label = c => c === 'T' ? 'Tài' : c === 'X' ? 'Xỉu' : null;
+const flip = c => c === 'T' ? 'X' : c === 'X' ? 'T' : null;
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const safeInt = (x, def = 0) => { const n = parseInt(x, 10); return Number.isFinite(n) ? n : def; };
+const nowIso = () => new Date().toISOString();
+
+const getDice = item => [safeInt(item?.FirstDice), safeInt(item?.SecondDice), safeInt(item?.ThirdDice)];
+const getSum = item => {
+    const s = getDice(item).reduce((a, b) => a + b, 0);
+    return (s >= 3 && s <= 18) ? s : safeInt(item?.DiceSum);
+};
+const getResult = item => {
+    const s = getSum(item);
+    return (s >= 3 && s <= 18) ? (s >= 11 ? 'T' : 'X') : null;
+};
+
+// ============================================================
+// SEQUENCE HELPERS
+// ============================================================
+function computeRLE(seq) {
+    const out = []; if (!seq.length) return out;
+    let cur = seq[0], len = 1;
+    for (let i = 1; i < seq.length; i++) {
+        if (seq[i] === cur) len++;
+        else { out.push({ ch: cur, len }); cur = seq[i]; len = 1; }
+    }
+    out.push({ ch: cur, len });
+    return out;
+}
+function currentStreak(seq) {
+    if (!seq.length) return 0;
+    const last = seq[seq.length - 1];
+    let c = 0;
+    for (let i = seq.length - 1; i >= 0; i--) { if (seq[i] === last) c++; else break; }
+    return c;
+}
+function currentAlternation(seq) {
+    if (seq.length < 2) return 0;
+    let c = 0;
+    for (let i = seq.length - 1; i >= 1; i--) { if (seq[i] !== seq[i - 1]) c++; else break; }
+    return c;
+}
+
+// ============================================================
+// DB
+// ============================================================
 function defaultDB() {
-  return {
-    history: [],
-    lastProcessedSession: null,
-    stats: { total: 0, wins: 0, losses: 0 },
-    meta: { events: [], ewma: 0.5 },
-    patterns: { list: [], _map: {} },
-    settings: {
-      antiBias: {
-        maxConsecutivePredictions: 4,
-        failureWindow: 6,
-        failureThreshold: 3,
-        flipOnFail: true,
-        softenOnFail: false
-      }
-    }
-  };
-}
-function loadDatabase(game) {
-  const f = DB_FILES[game];
-  const b = BACKUP_FILES[game];
-  const base = safeReadJson(f);
-  if (base) return base;
-  const restore = safeReadJson(b);
-  if (restore) return restore;
-  const d = defaultDB();
-  safeWriteJson(f, d);
-  return d;
-}
-function saveDatabase(game, db) {
-  safeWriteJson(DB_FILES[game], db);
-  safeWriteJson(BACKUP_FILES[game], db);
-}
-
-/* ================= UPSTREAM PARSE ================= */
-function normalizeUpstream(raw) {
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw.map(normalizeItem).filter(Boolean);
-  if (typeof raw === 'object') return [normalizeItem(raw)].filter(Boolean);
-  try {
-    const parsed = JSON.parse(String(raw));
-    if (Array.isArray(parsed)) return parsed.map(normalizeItem).filter(Boolean);
-    if (typeof parsed === 'object') return [normalizeItem(parsed)].filter(Boolean);
-  } catch (e) {
-    const s = String(raw);
-    const re = /{[^}]*}/g;
-    const out = [];
-    let m;
-    while ((m = re.exec(s)) !== null) {
-      try {
-        const p = JSON.parse(m[0]);
-        const n = normalizeItem(p);
-        if (n) out.push(n);
-      } catch (err) {}
-    }
-    return out;
-  }
-}
-function normalizeItem(it) {
-  if (!it) return null;
-  const id = ('SessionId' in it) ? safeInt(it.SessionId) : (('session' in it) ? safeInt(it.session) : null);
-  const f = ('FirstDice' in it) ? safeInt(it.FirstDice) : safeInt(it.First);
-  const s = ('SecondDice' in it) ? safeInt(it.SecondDice) : safeInt(it.Second);
-  const t = ('ThirdDice' in it) ? safeInt(it.ThirdDice) : safeInt(it.Third);
-  const sum = (it.DiceSum !== undefined) ? safeInt(it.DiceSum) : ((Number.isFinite(f) && Number.isFinite(s) && Number.isFinite(t)) ? (f + s + t) : null);
-  const cd = it.CreatedDate || it.createdAt || it.created || null;
-  return { SessionId: id, FirstDice: f, SecondDice: s, ThirdDice: t, DiceSum: sum, CreatedDate: cd };
-}
-function itemResult(it) {
-  if (!it) return null;
-  const s = safeInt(it.DiceSum, NaN);
-  if (!Number.isFinite(s)) {
-    const a = safeInt(it.FirstDice, 0), b = safeInt(it.SecondDice, 0), c = safeInt(it.ThirdDice, 0);
-    const sum = a + b + c;
-    if (sum >= 3 && sum <= 18) return sum >= 11 ? 'T' : 'X';
-    return null;
-  }
-  return s >= 11 ? 'T' : 'X';
-}
-
-/* ================= SMALL HELPERS FOR ALGORITHM ================= */
-function rle(seq) {
-  if (!seq || seq.length === 0) return [];
-  const out = []; let cur = seq[0], len = 1;
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i] === cur) len++; else { out.push({ ch: cur, len }); cur = seq[i]; len = 1; }
-  }
-  out.push({ ch: cur, len }); return out;
-}
-function lastN(seq, n) { return seq.slice(-n); }
-function tailString(seq, n) { return lastN(seq, n).join(''); }
-function countInWindow(seq, n, ch) { return lastN(seq, n).filter(x => x === ch).length; }
-function ewma(prev, value, alpha = 0.18) { return alpha * value + (1 - alpha) * prev; }
-
-/* ================= DETERMINISTIC ALGORITHM MODULE ================= */
-const ALG = (function buildAlg() {
-  const CONFIG = {
-    EWMA_ALPHA: 0.18,
-    PATTERN_MIN_SUPPORT: 2,
-    MARKOV_ORDER: 3,
-    COMBINER_WEIGHTS: { pattern: 0.45, markov: 0.25, ewma: 0.15, heuristics: 0.15 },
-    ANTI_BIAS: { maxConsecutivePredictions: 4, failureWindow: 6, failureThreshold: 3, flipOnFail: true, softenOnFail: false }
-  };
-
-  const DETECTORS = [];
-
-  // Persist run detector
-  DETECTORS.push((seq) => {
-    const r = rle(seq); if (!r.length) return null;
-    const last = r[r.length - 1];
-    if (last.len >= 3 && last.len <= 6) return { name: 'PERSIST_3_6', code: last.ch, strength: 0.68, info: { len: last.len } };
-    if (last.len >= 7 && last.len <= 10) return { name: 'PERSIST_7_10', code: last.ch, strength: 0.76, info: { len: last.len } };
-    if (last.len >= 11) return { name: 'PERSIST_11', code: last.ch, strength: 0.88, info: { len: last.len } };
-    return null;
-  });
-
-  // Anti-persist (flip)
-  DETECTORS.push((seq) => {
-    const r = rle(seq); if (!r.length) return null;
-    const last = r[r.length - 1];
-    if (last.len >= 8 && last.len <= 12) return { name: 'ANTI_PERSIST_8_12', code: flip(last.ch), strength: 0.70, info: { len: last.len } };
-    if (last.len >= 13) return { name: 'ANTI_PERSIST_13', code: flip(last.ch), strength: 0.83, info: { len: last.len } };
-    return null;
-  });
-
-  // Alternation
-  DETECTORS.push((seq) => {
-    const n = Math.min(12, seq.length); if (n < 6) return null;
-    const tail = lastN(seq, n); let alt = true;
-    for (let i = 2; i < tail.length; i++) if (tail[i] === tail[i - 2]) { alt = false; break; }
-    if (alt) return { name: 'ALTERNATE', code: flip(seq[seq.length - 1]), strength: 0.72, info: { n } };
-    return null;
-  });
-
-  // Repeat block
-  DETECTORS.push((seq) => {
-    if (seq.length < 8) return null;
-    for (let block = 2; block <= 5; block++) {
-      const tail = seq.slice(-block * 2); if (tail.length < block * 2) continue;
-      const a = tail.slice(0, block).join(''), b = tail.slice(block).join('');
-      if (a === b) return { name: `REPEAT_${block}`, code: a[0], strength: 0.70, info: { block } };
-    }
-    return null;
-  });
-
-  // N-gram
-  DETECTORS.push((seq) => {
-    const maxN = Math.min(4, seq.length - 1);
-    for (let n = maxN; n >= 1; n--) {
-      const ctx = seq.slice(-n).join('');
-      let t = 0, x = 0;
-      for (let i = 0; i + n < seq.length; i++) {
-        if (seq.slice(i, i + n).join('') === ctx) {
-          const nx = seq[i + n]; if (nx === 'T') t++; else x++;
-        }
-      }
-      const tot = t + x;
-      if (tot >= 2) {
-        const pT = (t + 1) / (tot + 2), pX = (x + 1) / (tot + 2);
-        const code = pT >= pX ? 'T' : 'X';
-        const strength = 0.55 + Math.abs(pT - pX) * 0.4;
-        return { name: `NGRAM_${n}`, code, strength: clamp(strength), info: { ctx, t, x } };
-      }
-    }
-    return null;
-  });
-
-  // Anti-ratio
-  DETECTORS.push((seq) => {
-    const n = Math.min(20, seq.length);
-    if (n < 8) return null;
-    const tcount = countInWindow(seq, n, 'T');
-    const ratio = tcount / n;
-    if (ratio >= 0.82) return { name: 'ANTI_RATIO_T', code: 'X', strength: 0.62, info: { ratio, n } };
-    if (ratio <= 0.18) return { name: 'ANTI_RATIO_X', code: 'T', strength: 0.62, info: { ratio, n } };
-    return null;
-  });
-
-  // Motif
-  DETECTORS.push((seq) => {
-    if (seq.length < 8) return null;
-    const tail8 = tailString(seq, 8);
-    if (tail8 === 'TTTXTTTX') return { name: 'TTTX_REPEAT', code: 'T', strength: 0.78 };
-    if (tail8 === 'XXXTXXXT') return { name: 'XXXT_REPEAT', code: 'X', strength: 0.78 };
-    return null;
-  });
-
-  // Suffix frequency
-  DETECTORS.push((seq) => {
-    const kmax = Math.min(7, seq.length - 1);
-    for (let k = kmax; k >= 1; k--) {
-      const ctx = seq.slice(-k).join('');
-      let t = 0, x = 0;
-      for (let i = 0; i + k < seq.length; i++) {
-        if (seq.slice(i, i + k).join('') === ctx) {
-          const nx = seq[i + k]; if (nx === 'T') t++; else x++;
-        }
-      }
-      if (t + x >= CONFIG.PATTERN_MIN_SUPPORT) {
-        const code = t >= x ? 'T' : 'X';
-        const strength = 0.55 + (Math.abs(t - x) / (t + x)) * 0.4;
-        return { name: `SUFFIX_${k}`, code, strength: clamp(strength), info: { ctx, t, x } };
-      }
-    }
-    return null;
-  });
-
-  function buildMarkov(list, maxOrder = CONFIG.MARKOV_ORDER) {
-    const seq = list.map(itemResult).filter(Boolean);
-    const models = {};
-    for (let order = 1; order <= maxOrder; order++) {
-      const freq = {};
-      for (let i = 0; i + order < seq.length; i++) {
-        const ctx = seq.slice(i, i + order).join('');
-        const nx = seq[i + order];
-        freq[ctx] = freq[ctx] || { T: 0, X: 0 };
-        freq[ctx][nx]++;
-      }
-      models[order] = freq;
-    }
-    return models;
-  }
-  function markovPredict(models, seq) {
-    for (let order = Math.min(Object.keys(models).length, seq.length); order >= 1; order--) {
-      const ctx = seq.slice(-order).join('');
-      const m = models[order][ctx];
-      if (m) {
-        const t = m.T + 1, x = m.X + 1;
-        const pT = t / (t + x), pX = x / (t + x);
-        return { code: pT >= pX ? 'T' : 'X', pT, pX, order };
-      }
-    }
-    return { code: null, pT: 0.5, pX: 0.5, order: 0 };
-  }
-
-  function combineDeterministic(votes, markovRes, ewmaProb, heurCode) {
-    const weights = CONFIG.COMBINER_WEIGHTS;
-    let scoreT = 0, scoreX = 0, detail = [];
-    for (const v of votes) {
-      const w = weights.pattern * (v.strength || 0.6);
-      if (v.code === 'T') scoreT += w; else scoreX += w;
-      detail.push({ source: v.name, code: v.code, weight: +w.toFixed(3) });
-    }
-    if (markovRes && markovRes.code) {
-      const w = weights.markov * (Math.abs(markovRes.pT - 0.5) * 2 || 0.5);
-      if (markovRes.code === 'T') scoreT += w; else scoreX += w;
-      detail.push({ source: `MARKOV@${markovRes.order}`, code: markovRes.code, weight: +w.toFixed(3) });
-    }
-    const ewmaCode = ewmaProb >= 0.5 ? 'T' : 'X';
-    const wE = weights.ewma * Math.abs(ewmaProb - 0.5) * 2;
-    if (ewmaCode === 'T') scoreT += wE; else scoreX += wE;
-    detail.push({ source: 'EWMA', code: ewmaCode, weight: +wE.toFixed(3) });
-    if (heurCode) {
-      const wH = weights.heuristics * 0.6;
-      if (heurCode === 'T') scoreT += wH; else scoreX += wH;
-      detail.push({ source: 'HEUR', code: heurCode, weight: +wH.toFixed(3) });
-    }
-    const pT = scoreT / Math.max(1, (scoreT + scoreX));
-    const code = pT >= 0.5 ? 'T' : 'X';
-    const strength = clamp(0.45 + Math.abs(pT - 0.5) * 1.1, 0.35, 0.98);
-    return { code, pT, strength, detail };
-  }
-
-  function antiBiasAndTrend(result, seq, db) {
-    const s = db && db.settings && db.settings.antiBias ? db.settings.antiBias : CONFIG.ANTI_BIAS;
-    const recent = (db.history || []).slice(-Math.max(12, s.failureWindow));
-    const recentPreds = recent.map(h => h.DU_DOAN_CODE).filter(Boolean);
-    const recentResults = recent.map(h => (h.ketQua && h.DU_DOAN_CODE) ? (h.ketQua === h.DU_DOAN_CODE ? 'WIN' : 'LOSE') : null).filter(Boolean);
-    let consPred = 0;
-    if (recentPreds.length) {
-      const last = recentPreds[recentPreds.length - 1];
-      for (let i = recentPreds.length - 1; i >= 0; i--) { if (recentPreds[i] === last) consPred++; else break; }
-    }
-    const failures = recentResults.filter(x => x === 'LOSE').length;
-    if (consPred >= s.maxConsecutivePredictions && failures >= s.failureThreshold) {
-      if (s.flipOnFail) {
-        result.code = flip(result.code);
-        result.strength = Math.max(0.45, result.strength * 0.78);
-        result.detail.push({ source: 'ANTI_BIAS', action: 'flip', consPred, failures });
-        result.meta = { antiBias: 'flipped' };
-        return result;
-      } else if (s.softenOnFail) {
-        result.strength = Math.max(0.35, result.strength * 0.7);
-        result.detail.push({ source: 'ANTI_BIAS', action: 'soften', consPred, failures });
-        result.meta = { antiBias: 'softened' };
-        return result;
-      }
-    }
-    const rr = rle(seq);
-    if (rr.length) {
-      const last = rr[rr.length - 1];
-      if (last.len >= 6 && last.ch !== result.code) {
-        result.code = last.ch;
-        result.strength = Math.min(0.95, 0.62 + last.len * 0.04);
-        result.detail.push({ source: 'TREND_BREAKER', run: last.len });
-        result.meta = { trendBreaker: true };
-        return result;
-      }
-    }
-    return result;
-  }
-
-  function predict(list, db) {
-    const seq = list.map(itemResult).filter(Boolean);
-    if (seq.length < 6) return { code: null, strength: 0, tiLe: 'CHỜ', detail: [], regime: 'COLD', votes: [] };
-    db.meta = db.meta || {}; db.meta.ewma = db.meta.ewma === undefined ? 0.5 : db.meta.ewma;
-    db.meta.ewma = ewma(db.meta.ewma, seq[seq.length - 1] === 'T' ? 1 : 0, CONFIG.EWMA_ALPHA);
-    const votes = [];
-    for (const det of DETECTORS) {
-      try { const r = det(seq); if (r && r.code) votes.push(r); } catch (e) {}
-    }
-    const markovModels = buildMarkov(list, CONFIG.MARKOV_ORDER);
-    const markovRes = markovPredict(markovModels, seq);
-    const heur = (() => {
-      const window = Math.min(20, seq.length);
-      const tcount = countInWindow(seq, window, 'T');
-      const ratio = tcount / window;
-      if (ratio >= 0.82) return 'X';
-      if (ratio <= 0.18) return 'T';
-      return null;
-    })();
-    let comb = combineDeterministic(votes, markovRes, db.meta.ewma, heur);
-    comb = antiBiasAndTrend(comb, seq, db);
-    const regime = (function () {
-      try {
-        if (seq.length < 6) return 'COLD';
-        const r = rle(seq); const last = r[r.length - 1];
-        if (last && last.len >= 6) return 'PERSIST';
-        let alt = true;
-        for (let i = 2; i < Math.min(12, seq.length); i++) { if (seq[seq.length - i] === seq[seq.length - i - 2]) { alt = false; break; } }
-        if (alt) return 'ALTERNATE';
-        const tRatio = seq.slice(-30).filter(x => x === 'T').length / Math.min(30, seq.length);
-        if (tRatio > 0.65) return 'TREND_T';
-        if (tRatio < 0.35) return 'TREND_X';
-        return 'CHAOS';
-      } catch (e) { return 'COLD'; }
-    })();
-    const out = {
-      code: comb.code,
-      strength: comb.strength,
-      tiLe: (comb.strength * 100).toFixed(1) + '%',
-      detail: comb.detail,
-      regime,
-      votes
+    return {
+        version: 13,
+        createdAt: nowIso(),
+        lastProcessedSession: null,
+        history: [],
+        meta: {
+            totalPred: 0, totalWin: 0, totalLose: 0, totalSkip: 0,
+            winStreak: 0, loseStreak: 0, maxWinStreak: 0, maxLoseStreak: 0,
+            recent50: [],
+            byLogic: {},  // { logicName: { win, total } }
+            confusion: { TT: 0, TX: 0, XT: 0, XX: 0 }
+        },
+        bankroll: { initial: 1000000, current: 1000000, bets: [], totalPnl: 0 }
     };
+}
+function readDB(game) {
+    const p = path.join(DB_DIR, `db_${game}.json`);
     try {
-      db.meta = db.meta || {}; db.meta.events = db.meta.events || [];
-      db.meta.events.push({ at: now(), type: 'predict', code: out.code, tiLe: out.tiLe, regime });
-      if (db.meta.events.length > 400) db.meta.events.shift();
-    } catch (e) {}
-    return out;
-  }
-
-  return { predict };
-})();
-
-/* ================= FETCH WITH RETRY ================= */
-const axiosInst = axios.create({ timeout: API_TIMEOUT_MS });
-async function fetchWithRetry(url, attempts = 2) {
-  for (let i = 0; i < attempts; i++) {
-    try { return await axiosInst.get(url); } catch (e) { if (i === attempts - 1) throw e; await new Promise(r => setTimeout(r, 200 + i * 200)); }
-  }
+        if (fs.existsSync(p)) {
+            const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+            const def = defaultDB();
+            return {
+                ...def, ...raw,
+                meta: { ...def.meta, ...(raw.meta || {}),
+                    confusion: { ...def.meta.confusion, ...((raw.meta || {}).confusion || {}) },
+                    byLogic: { ...(raw.meta || {}).byLogic } },
+                bankroll: { ...def.bankroll, ...(raw.bankroll || {}) }
+            };
+        }
+    } catch (e) { log('ERROR', `readDB ${game}:`, e.message); }
+    return defaultDB();
+}
+function saveDB(game, db) {
+    const p = path.join(DB_DIR, `db_${game}.json`);
+    try {
+        const tmp = p + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+        fs.renameSync(tmp, p);
+    } catch (e) { log('ERROR', `saveDB ${game}:`, e.message); }
 }
 
-/* ================= PROCESSING (uses ALG.predict) ================= */
-async function processGameTick(game) {
-  try {
-    const api = (game === 'md5') ? API_MD5 : API_TX;
-    const resp = await fetchWithRetry(api, 2);
-    const raw = Array.isArray(resp.data) ? resp.data : (resp.data && (resp.data.data || resp.data.list) ? (resp.data.data || resp.data.list) : resp.data);
-    const list = normalizeUpstream(raw);
+// ============================================================
+// 🎯 PRESET A — "BÁM CẦU THẬT"
+// Chỉ dự đoán khi có cầu RÕ RÀNG, không thì SKIP
+// Triết lý: không chắc thì không đánh
+// ============================================================
+function predictPresetA(seq, sums) {
+    if (seq.length < 6) return { code: null, confidence: 0, reason: 'Boot', logic: 'A-Skip' };
+
+    const rle = computeRLE(seq);
+    const streak = currentStreak(seq);
+    const alt = currentAlternation(seq);
+    const last = seq[seq.length - 1];
+
+    // Cầu bệt 4-7: theo bệt (không đảo như code cũ)
+    // Lý do: bệt 4-7 thường dài hơn là gãy ngay
+    if (streak >= 4 && streak <= 7) {
+        return { code: last, confidence: 0.55, reason: `Bệt ${streak} → theo`, logic: 'A-Bệt' };
+    }
+
+    // Cầu 1-1 (đảo liên tục ≥ 4 lần): tiếp tục đảo
+    if (alt >= 4) {
+        return { code: flip(last), confidence: 0.55, reason: `1-1 (${alt} lần) → đảo`, logic: 'A-1-1' };
+    }
+
+    // Cầu 2-2 (block đều 2): 3 block gần nhất đều len=2 → đoán block tiếp theo len=2
+    if (rle.length >= 3) {
+        const [a, b, c] = rle.slice(-3);
+        if (a.len === 2 && b.len === 2 && c.len === 2) {
+            // Đang ở block thứ 3, đoán nó cũng chỉ 2 rồi đảo
+            if (c.len === 2) return { code: flip(last), confidence: 0.55, reason: '2-2-2 → đảo', logic: 'A-2-2' };
+        }
+    }
+
+    // Cầu 3-3: 2 block 3 gần nhất
+    if (rle.length >= 2) {
+        const [a, b] = rle.slice(-2);
+        if (a.len === 3 && b.len === 3 && streak < 3) {
+            return { code: last, confidence: 0.55, reason: '3-3 → theo', logic: 'A-3-3' };
+        }
+    }
+
+    // Không có cầu rõ → SKIP
+    return { code: null, confidence: 0, reason: 'Không cầu → bỏ', logic: 'A-Skip' };
+}
+
+// ============================================================
+// 🎯 PRESET B — "ANTI-PATTERN" (đánh ngược đám đông)
+// Triết lý: đa số người chơi theo bệt → mình đánh ngược khi bệt dài
+// ============================================================
+function predictPresetB(seq, sums) {
+    if (seq.length < 6) return { code: null, confidence: 0, reason: 'Boot', logic: 'B-Skip' };
+
+    const streak = currentStreak(seq);
+    const alt = currentAlternation(seq);
+    const last = seq[seq.length - 1];
+
+    // Bệt 5-8: đa số sẽ theo → mình đánh NGƯỢC (bẻ cầu)
+    if (streak >= 5 && streak <= 8) {
+        return { code: flip(last), confidence: 0.55, reason: `Bệt ${streak} → bẻ`, logic: 'B-Bẻ bệt' };
+    }
+
+    // Bệt ≥ 9: đa số đã bỏ → mình theo (bệt dai)
+    if (streak >= 9) {
+        return { code: last, confidence: 0.55, reason: `Bệt ${streak} → theo`, logic: 'B-Bệt dai' };
+    }
+
+    // 1-1 dài ≥ 5: đa số đánh đảo → mình đánh theo (bẻ 1-1)
+    if (alt >= 5) {
+        return { code: last, confidence: 0.55, reason: `1-1 (${alt}) → bẻ`, logic: 'B-Bẻ 1-1' };
+    }
+
+    return { code: null, confidence: 0, reason: 'Không tín hiệu → bỏ', logic: 'B-Skip' };
+}
+
+// ============================================================
+// 🎯 PRESET C — "CUSTOM" (bạn tự viết logic ở đây)
+// ============================================================
+function predictPresetC(seq, sums) {
+    if (seq.length < 6) return { code: null, confidence: 0, reason: 'Boot', logic: 'C-Skip' };
+
+    // ============================================================
+    // TODO: VIẾT LOGIC CỦA BẠN Ở ĐÂY
+    // Input: seq (mảng 'T'/'X'), sums (mảng tổng 3-18)
+    // Output: { code: 'T' | 'X' | null, confidence: 0-1, reason: 'string', logic: 'tên' }
+    // ============================================================
+
+    // Ví dụ: đánh theo tổng 5 phiên gần nhất
+    // Nếu tổng trung bình 5 phiên ≥ 13 → đoán X (vì sắp về Tài trung bình)
+    // Ngược lại ≤ 8 → đoán T
+    if (sums.length >= 5) {
+        const avg = sums.slice(-5).reduce((a, b) => a + b, 0) / 5;
+        if (avg >= 14) return { code: 'X', confidence: 0.55, reason: `Avg5=${avg.toFixed(1)} cao → X`, logic: 'C-Sum' };
+        if (avg <= 7)  return { code: 'T', confidence: 0.55, reason: `Avg5=${avg.toFixed(1)} thấp → T`, logic: 'C-Sum' };
+    }
+
+    return { code: null, confidence: 0, reason: 'Không tín hiệu', logic: 'C-Skip' };
+}
+
+// ============================================================
+// ROUTER — CHỌN PRESET
+// ============================================================
+function predict(seq, sums) {
+    if (PRESET === 'A') return predictPresetA(seq, sums);
+    if (PRESET === 'B') return predictPresetB(seq, sums);
+    if (PRESET === 'C') return predictPresetC(seq, sums);
+    return predictPresetA(seq, sums);
+}
+
+// ============================================================
+// FETCH
+// ============================================================
+async function fetchApi(url) {
+    for (let i = 0; i < 3; i++) {
+        try {
+            const res = await axios.get(url, { timeout: 8000 });
+            let arr = res.data?.data?.list || res.data?.list || res.data?.data || (Array.isArray(res.data) ? res.data : []);
+            if (!Array.isArray(arr)) return [];
+            if (arr.length >= 2 && Number(arr[0].SessionId) > Number(arr[arr.length - 1].SessionId)) arr.reverse();
+            return arr;
+        } catch (e) {
+            if (i === 2) { log('ERROR', `fetchApi ${e.message}`); return []; }
+            await new Promise(r => setTimeout(r, 500 * (i + 1)));
+        }
+    }
+    return [];
+}
+
+// ============================================================
+// KELLY
+// ============================================================
+function kellyFraction(probWin, payout = 1.0) {
+    const f = (payout * probWin - (1 - probWin)) / payout;
+    return clamp(f, 0, 0.25);
+}
+
+// ============================================================
+// PROCESS GAME
+// ============================================================
+async function processGame(game) {
+    const url = game === 'md5' ? API_MD5 : API_TX;
+    const list = await fetchApi(url);
     if (!list || !list.length) return;
-    // ensure ascending by SessionId
-    list.sort((a, b) => (Number(a.SessionId || 0) - Number(b.SessionId || 0)));
+
     const latest = list[list.length - 1];
-    const session = safeInt(latest.SessionId, null);
+    const session = safeInt(latest.SessionId);
     if (!session) return;
-    const db = loadDatabase(game);
+
+    const db = readDB(game);
     if (db.lastProcessedSession === session) return;
 
-    // finalize previous if pending
-    const lastRecorded = db.history.length ? db.history[db.history.length - 1] : null;
-    if (lastRecorded && safeInt(lastRecorded.phienDuDoan) === session) {
-      const actual = itemResult(latest);
-      lastRecorded.ketQua = actual;
-      lastRecorded.ketQuaLabel = labelFromCode(actual);
-      lastRecorded.trangThai = !lastRecorded.DU_DOAN_CODE ? 'BỎ QUA' : (lastRecorded.DU_DOAN_CODE === actual ? 'ĐÚNG' : 'SAI');
-      db.stats.total = (db.stats.total || 0) + 1;
-      if (lastRecorded.trangThai === 'ĐÚNG') db.stats.wins = (db.stats.wins || 0) + 1; else db.stats.losses = (db.stats.losses || 0) + 1;
-      if (lastRecorded.patternName) {
-        db.patterns = db.patterns || {}; db.patterns._map = db.patterns._map || {};
-        db.patterns._map[lastRecorded.patternName] = db.patterns._map[lastRecorded.patternName] || { correct: 0, total: 0 };
-        db.patterns._map[lastRecorded.patternName].total++;
-        if (lastRecorded.trangThai === 'ĐÚNG') db.patterns._map[lastRecorded.patternName].correct++;
-      }
-      saveDatabase(game, db);
+    const seq = list.map(getResult).filter(Boolean);
+    const sums = list.map(getSum).filter(s => s >= 3 && s <= 18);
+    if (seq.length < 5) return;
+
+    // ---- Chấm phiên trước ----
+    const prev = db.history[db.history.length - 1];
+    if (prev && safeInt(prev.phienDuDoan) === session) {
+        const actual = getResult(latest);
+        prev.ketQua = actual;
+        prev.ketQuaLabel = label(actual);
+
+        if (prev.DU_DOAN_CODE === null) {
+            // SKIP
+            prev.trangThai = 'BỎ QUA';
+            db.meta.totalSkip = (db.meta.totalSkip || 0) + 1;
+        } else {
+            const correct = prev.DU_DOAN_CODE === actual;
+            prev.trangThai = correct ? 'ĐÚNG' : 'SAI';
+            db.meta.totalPred = (db.meta.totalPred || 0) + 1;
+
+            if (correct) {
+                db.meta.totalWin = (db.meta.totalWin || 0) + 1;
+                db.meta.winStreak = (db.meta.winStreak || 0) + 1;
+                db.meta.loseStreak = 0;
+                db.meta.maxWinStreak = Math.max(db.meta.maxWinStreak || 0, db.meta.winStreak);
+            } else {
+                db.meta.totalLose = (db.meta.totalLose || 0) + 1;
+                db.meta.loseStreak = (db.meta.loseStreak || 0) + 1;
+                db.meta.winStreak = 0;
+                db.meta.maxLoseStreak = Math.max(db.meta.maxLoseStreak || 0, db.meta.loseStreak);
+            }
+            db.meta.recent50.push(correct ? 1 : 0);
+            while (db.meta.recent50.length > 50) db.meta.recent50.shift();
+
+            // Confusion
+            const key = prev.DU_DOAN_CODE + actual;
+            if (key in db.meta.confusion) db.meta.confusion[key]++;
+
+            // By logic
+            const lg = prev.logic || 'unknown';
+            if (!db.meta.byLogic[lg]) db.meta.byLogic[lg] = { win: 0, total: 0 };
+            db.meta.byLogic[lg].total++;
+            if (correct) db.meta.byLogic[lg].win++;
+
+            // Bankroll
+            const probWin = prev.PROB_RAW >= 0.5 ? prev.PROB_RAW : 1 - prev.PROB_RAW;
+            const frac = kellyFraction(probWin);
+            const betAmount = Math.floor(db.bankroll.current * frac * 0.5);
+            if (betAmount > 0) {
+                const pnl = correct ? betAmount : -betAmount;
+                db.bankroll.current += pnl;
+                db.bankroll.totalPnl = (db.bankroll.totalPnl || 0) + pnl;
+                db.bankroll.bets.push({ session: prev.phienDuDoan, amount: betAmount, correct, pnl, at: nowIso() });
+                if (db.bankroll.bets.length > 500) db.bankroll.bets.shift();
+            }
+        }
     }
 
-    // call upgraded algorithm
-    const algOut = ALG.predict(list, db);
+    // ---- Dự đoán phiên tiếp ----
+    const pred = predict(seq, sums);
 
-    const entry = {
-      phien: session,
-      xucXac: [safeInt(latest.FirstDice, 0), safeInt(latest.SecondDice, 0), safeInt(latest.ThirdDice, 0)],
-      tong: safeInt(latest.DiceSum, null),
-      ketQua: itemResult(latest),
-      ketQuaLabel: labelFromCode(itemResult(latest)),
-      phienDuDoan: session + 1,
-      DU_DOAN_CODE: algOut.code,
-      DU_DOAN: algOut.code ? labelFromCode(algOut.code) : 'CHỜ',
-      TI_LE: algOut.tiLe,
-      patternName: (algOut.detail || []).map(d => d.source).slice(0, 3).join('; ') || (algOut.votes && algOut.votes.map(v => v.name).slice(0, 3).join('; ')) || '',
-      regime: algOut.regime,
-      trangThai: 'ĐANG CHỜ',
-      meta: { createdAt: now(), votes: algOut.votes || [], comb: algOut.detail || [] }
-    };
+    db.history.push({
+        phien: session,
+        xucXac: getDice(latest),
+        tong: getSum(latest),
+        ketQua: getResult(latest),
+        ketQuaLabel: label(getResult(latest)),
+        phienDuDoan: session + 1,
+        DU_DOAN_CODE: pred.code,
+        DU_DOAN: label(pred.code) || 'BỎ',
+        PROB_RAW: pred.confidence,
+        TI_LE: pred.code ? (pred.confidence * 100).toFixed(1) + '%' : '—',
+        logic: pred.logic,
+        reason: pred.reason,
+        kelly: pred.code ? kellyFraction(pred.confidence >= 0.5 ? pred.confidence : 1 - pred.confidence) : 0,
+        trangThai: 'ĐANG CHỜ',
+        at: nowIso()
+    });
 
-    db.history.push(entry);
-    if (db.history.length > MAX_HISTORY) db.history.splice(0, db.history.length - MAX_HISTORY);
+    if (db.history.length > MAX_HISTORY) db.history.shift();
     db.lastProcessedSession = session;
-    db.meta.events = db.meta.events || []; db.meta.events.push({ at: now(), type: 'predict', session, code: algOut.code, tiLe: algOut.tiLe });
-    if (db.meta.events.length > 400) db.meta.events.shift();
-    saveDatabase(game, db);
-
-    console.log(`[${game}] session ${session} -> pred=${algOut.code} ${algOut.tiLe}`);
-  } catch (err) {
-    console.error('processGameTick error', err && err.message ? err.message : err);
-  }
+    saveDB(game, db);
+    broadcast({ type: 'update', game });
 }
 
-/* ================= POLLING ================= */
-function startPolling() {
-  async function loop() {
-    try {
-      await Promise.all(['md5', 'taixiu'].map(g => processGameTick(g)));
-    } catch (_) {}
-    setTimeout(loop, POLL_INTERVAL_MS + Math.floor(Math.random() * 1000));
-  }
-  loop();
+// ============================================================
+// EXPRESS + WS
+// ============================================================
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
+app.use(express.json());
+
+function authMiddleware(req, res, next) {
+    const key = req.headers['x-api-key'] || req.query.api_key;
+    if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    next();
+}
+function broadcast(payload) {
+    const msg = JSON.stringify(payload);
+    wss.clients.forEach(c => { if (c.readyState === 1) { try { c.send(msg); } catch (e) {} } });
 }
 
-/* ================= ROUTES (preserve /md5 and /taixiu) ================= */
+// ============================================================
+// API ROUTES
+// ============================================================
+app.get('/health', (req, res) => res.json({ status: 'ok', preset: PRESET, uptime: process.uptime(), ts: nowIso() }));
 
-// Keep /md5 and /taixiu as quick access to JSON prediction (calls processGameTick then returns simple JSON)
-app.get('/md5', async (req, res) => {
-  try { await processGameTick('md5'); } catch (_) {}
-  const db = loadDatabase('md5');
-  const latest = db.history.length ? db.history[db.history.length - 1] : null;
-  if (!latest) return res.status(204).send();
-  return res.json({
-    phien: latest.phien,
-    tong: latest.tong,
-    ketQua: latest.ketQua,
-    phienDuDoan: latest.phienDuDoan,
-    duDoan: latest.DU_DOAN,
-    tiLe: latest.TI_LE
-  });
-});
-app.get('/taixiu', async (req, res) => {
-  try { await processGameTick('taixiu'); } catch (_) {}
-  const db = loadDatabase('taixiu');
-  const latest = db.history.length ? db.history[db.history.length - 1] : null;
-  if (!latest) return res.status(204).send();
-  return res.json({
-    phien: latest.phien,
-    tong: latest.tong,
-    ketQua: latest.ketQua,
-    phienDuDoan: latest.phienDuDoan,
-    duDoan: latest.DU_DOAN,
-    tiLe: latest.TI_LE
-  });
+app.get('/api/stats/:game', authMiddleware, (req, res) => {
+    const game = req.params.game;
+    const db = readDB(game);
+    const m = db.meta;
+    const wr = m.totalPred ? (m.totalWin / m.totalPred * 100).toFixed(2) + '%' : 'N/A';
+    const wr50 = m.recent50.length ? ((m.recent50.reduce((a, b) => a + b, 0) / m.recent50.length) * 100).toFixed(2) + '%' : 'N/A';
+    res.json({
+        success: true, game, preset: PRESET,
+        winRate: wr, winRateRecent50: wr50,
+        totalPred: m.totalPred, totalWin: m.totalWin, totalLose: m.totalLose, totalSkip: m.totalSkip,
+        winStreak: m.winStreak, loseStreak: m.loseStreak,
+        maxWinStreak: m.maxWinStreak, maxLoseStreak: m.maxLoseStreak,
+        confusion: m.confusion,
+        byLogic: m.byLogic,
+        bankroll: db.bankroll,
+        lastProcessedSession: db.lastProcessedSession
+    });
 });
 
-// Root / UI pointer
-app.get('/', (req, res) => {
-  res.send(`<div style="font-family:system-ui,Arial;padding:16px">
-    <h3>HOANG VIP - Deterministic Algorithm (Upgraded)</h3>
-    <ul>
-      <li><a href="/md5">/md5</a></li>
-      <li><a href="/taixiu">/taixiu</a></li>
-      <li><a href="/api/predict/md5">/api/predict/md5</a></li>
-      <li><a href="/api/history/md5?limit=50">/api/history/md5</a></li>
-    </ul>
-  </div>`);
+app.get('/api/predict/:game', authMiddleware, (req, res) => {
+    const db = readDB(req.params.game);
+    if (!db.history.length) return res.json({ success: false, message: 'Chưa có dữ liệu' });
+    const last = db.history[db.history.length - 1];
+    res.json({
+        success: true, game: req.params.game, preset: PRESET,
+        phienHienTai: last.phien, phienDuDoan: last.phienDuDoan,
+        duDoan: last.DU_DOAN, code: last.DU_DOAN_CODE,
+        tiLe: last.TI_LE, logic: last.logic, reason: last.reason,
+        kelly: last.kelly, thoiGian: last.at
+    });
 });
 
-// analyze arbitrary sequence
-app.get('/api/analyze', (req, res) => {
-  const seqStr = String(req.query.seq || '').toUpperCase().replace(/[^TX]/g, '');
-  if (seqStr.length < 4) return res.status(400).json({ success: false, error: 'seq >= 4 required' });
-  const seq = seqStr.split('');
-  const dummy = seq.map((c, i) => ({ SessionId: i + 1, DiceSum: c === 'T' ? 11 : 6, FirstDice: 1, SecondDice: 1, ThirdDice: c === 'T' ? 9 : 4 }));
-  const db = loadDatabase('md5');
-  const out = ALG.predict(dummy, db);
-  res.json({ success: true, seq: seqStr, prediction: out });
-});
-
-// on-demand predict
-app.get('/api/predict/:game', async (req, res) => {
-  const game = req.params.game;
-  if (!['md5', 'taixiu'].includes(game)) return res.status(400).json({ success: false, error: 'Invalid game' });
-  try { await processGameTick(game); const db = loadDatabase(game); const latest = db.history.length ? db.history[db.history.length - 1] : null; if (!latest) return res.status(204).json({ success: false, error: 'No history' }); return res.json({ success: true, game, entry: latest }); } catch (e) { return res.status(500).json({ success: false, error: e && e.message }); }
-});
-
-// simple JSON API
-app.get('/api/simple/:game', async (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
-  const db = loadDatabase(game);
-  let latest = db.history.length ? db.history[db.history.length - 1] : null;
-  if (!latest) {
-    try { await processGameTick(game); } catch (_) {}
-    const db2 = loadDatabase(game); latest = db2.history.length ? db2.history[db2.history.length - 1] : null;
-    if (!latest) return res.status(204).send();
-  }
-  res.json({
-    phien: latest.phien || null,
-    tong: latest.tong || null,
-    ketQua: latest.ketQua || null,
-    phienDuDoan: latest.phienDuDoan || null,
-    duDoan: latest.DU_DOAN || null,
-    tiLe: latest.TI_LE || null
-  });
-});
-
-// history export
-app.get('/api/history/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ error: 'Invalid game' });
-  const db = loadDatabase(game);
-  const limit = Math.max(1, Math.min(2000, Number(req.query.limit) || 200));
-  res.json({ success: true, game, count: db.history.length, items: db.history.slice(-limit).reverse() });
-});
-
-// admin: force tick
-app.post('/admin/force-tick/:game', async (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ success: false, error: 'Invalid game' });
-  try { await processGameTick(game); return res.json({ success: true, msg: 'Tick executed' }); } catch (e) { return res.status(500).json({ success: false, error: e && e.message }); }
-});
-
-// admin stats
-app.get('/admin/stats/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ success: false, error: 'Invalid game' });
-  const db = loadDatabase(game);
-  const total = db.stats.total || 0;
-  const wr = total ? ((db.stats.wins || 0) / total * 100).toFixed(2) + '%' : 'N/A';
-  res.json({ success: true, stats: db.stats, meta: db.meta || {}, winRate: wr });
-});
-
-// admin: configure anti-bias
-app.post('/admin/bias/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ success: false, error: 'Invalid game' });
-  const body = req.body || {};
-  const db = loadDatabase(game);
-  db.settings = db.settings || {};
-  db.settings.antiBias = db.settings.antiBias || {};
-  for (const key of ['maxConsecutivePredictions', 'failureWindow', 'failureThreshold', 'flipOnFail', 'softenOnFail']) {
-    if (body[key] !== undefined) db.settings.antiBias[key] = body[key];
-  }
-  saveDatabase(game, db);
-  res.json({ success: true, settings: db.settings.antiBias });
-});
-
-// admin: losing chains
-app.get('/admin/losing-chains/:game', (req, res) => {
-  const game = req.params.game;
-  if (!DB_FILES[game]) return res.status(400).json({ success: false, error: 'Invalid game' });
-  const db = loadDatabase(game);
-  const window = Number(req.query.window) || 100;
-  const hist = db.history.slice(-window).map(h => h.ketQua).filter(Boolean);
-  const chains = [];
-  if (hist.length) {
-    let cur = hist[0], len = 1;
-    for (let i = 1; i < hist.length; i++) {
-      if (hist[i] === cur) len++; else { chains.push({ code: cur, len }); cur = hist[i]; len = 1; }
+app.get('/api/export/:game', authMiddleware, (req, res) => {
+    const db = readDB(req.params.game);
+    const format = (req.query.format || 'json').toLowerCase();
+    if (format === 'csv') {
+        const rows = ['phien,xucxac,tong,ketqua,phienDuDoan,duDoan,code,tiLe,logic,reason,trangThai'];
+        db.history.forEach(h => {
+            rows.push([h.phien, (h.xucXac || []).join('-'), h.tong, h.ketQua || '', h.phienDuDoan,
+                h.DU_DOAN || '', h.DU_DOAN_CODE || '', h.TI_LE || '',
+                `"${h.logic || ''}"`, `"${h.reason || ''}"`, h.trangThai || ''].join(','));
+        });
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="${req.params.game}-history.csv"`);
+        return res.send(rows.join('\n'));
     }
-    chains.push({ code: cur, len });
-  }
-  chains.sort((a, b) => b.len - a.len);
-  res.json({ success: true, chains });
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${req.params.game}-db.json"`);
+    res.send(JSON.stringify(db, null, 2));
 });
 
-/* ================= START ================= */
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT} — deterministic algorithm active`);
-  startPolling();
+// So sánh 3 preset trên cùng dữ liệu
+app.get('/api/compare/:game', authMiddleware, (req, res) => {
+    const game = req.params.game;
+    const db = readDB(game);
+    // Chạy lại history, mỗi phiên predict bằng 3 preset
+    const seqAll = db.history.map(h => h.ketQua).filter(Boolean);
+    const sumsAll = db.history.map(h => h.tong).filter(s => s >= 3 && s <= 18);
+    const out = { A: { win: 0, total: 0 }, B: { win: 0, total: 0 }, C: { win: 0, total: 0 } };
+    for (let i = 6; i < seqAll.length - 1; i++) {
+        const subSeq = seqAll.slice(0, i);
+        const subSums = sumsAll.slice(0, i);
+        const actual = seqAll[i + 1];
+        for (const p of ['A', 'B', 'C']) {
+            const fn = p === 'A' ? predictPresetA : p === 'B' ? predictPresetB : predictPresetC;
+            const r = fn(subSeq, subSums);
+            if (r.code) {
+                out[p].total++;
+                if (r.code === actual) out[p].win++;
+            }
+        }
+    }
+    const result = {};
+    for (const p of ['A', 'B', 'C']) {
+        result[p] = {
+            total: out[p].total,
+            win: out[p].win,
+            winrate: out[p].total ? (out[p].win / out[p].total * 100).toFixed(2) + '%' : 'N/A'
+        };
+    }
+    res.json({ success: true, game, comparison: result });
+});
+
+// ============================================================
+// UI
+// ============================================================
+app.get('/', (req, res) => res.send(HTML_UI));
+app.get('/:game', (req, res) => {
+    const g = req.params.game;
+    if (['api', 'health', 'ws'].includes(g)) return res.status(404).send('Not found');
+    res.send(HTML_UI);
+});
+
+const HTML_UI = `<!DOCTYPE html>
+<html lang="vi"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HOANG CUSTOM v13 [${PRESET}]</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e27;color:#e6eef6;padding:12px;margin:0;min-height:100vh}
+.header{background:linear-gradient(135deg,#1e3a8a,#3b82f6);padding:16px;border-radius:14px;margin-bottom:12px;text-align:center}
+h1{color:#fff;font-size:18px;margin:0;font-weight:800;text-transform:uppercase}
+.badge-preset{display:inline-block;padding:4px 12px;background:#fbbf24;color:#0a0e27;border-radius:6px;font-weight:800;font-size:13px;margin-top:8px}
+h2{color:#93c5fd;font-size:13px;margin:16px 0 8px;text-transform:uppercase}
+.tabs{display:flex;gap:8px;margin-bottom:12px}
+.tab{flex:1;padding:10px;background:#0f172a;border:1px solid #334155;border-radius:8px;cursor:pointer;text-align:center;font-weight:600;color:#94a3b8;font-size:12px}
+.tab.active{background:#1e40af;color:#fff;border-color:#3b82f6}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin-bottom:12px}
+.stat{background:#0f172a;padding:10px;border-radius:8px;border:1px solid #334155;font-size:11px;text-align:center}
+.stat b{color:#fbbf24;font-size:15px;display:block;margin-top:4px}
+.card{background:#0f172a;border-radius:12px;padding:14px;border:1px solid #334155;margin-bottom:12px;overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{background:#1e40af;color:#fff;padding:8px 4px;font-size:10px;text-transform:uppercase}
+td{padding:8px 4px;text-align:center;border-bottom:1px solid #1e293b}
+.tai{color:#22c55e;font-weight:700}.xiu{color:#ef4444;font-weight:700}
+.dung{color:#22c55e;font-weight:700}.sai{color:#ef4444;font-weight:700}.cho{color:#94a3b8;font-style:italic}.skip{color:#fbbf24;font-weight:700}
+.dice{color:#fbbf24;font-weight:700;font-size:11px}
+.sum{display:inline-block;padding:2px 8px;border-radius:6px;background:#334155;color:#fbbf24;font-weight:800}
+.badge{display:inline-block;padding:2px 6px;border-radius:6px;font-size:10px;font-weight:700}
+.ws-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:6px}
+.ws-dot.on{background:#22c55e;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.warn{background:#7f1d1d;color:#fca5a5;padding:10px;border-radius:8px;font-size:12px;margin-bottom:12px;border-left:4px solid #dc2626}
+.btn{padding:8px 14px;background:#1e40af;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:12px;margin:4px 4px 4px 0}
+.btn:hover{background:#2563eb}
+pre{background:#020617;padding:10px;border-radius:6px;font-size:11px;overflow-x:auto;max-height:300px}
+</style></head>
+<body>
+
+<div class="header">
+  <h1>🎯 HOANG CUSTOM v13 <span><span class="ws-dot" id="ws-dot"></span></span></h1>
+  <div class="badge-preset">PRESET ${PRESET}</div>
+  <div style="font-size:11px;margin-top:6px;color:#bfdbfe" id="game-label">TAIXIU</div>
+</div>
+
+<div class="warn">
+  ⚠️ Không có thuật toán nào thắng xúc xắc ngẫu nhiên lâu dài. Đây là công cụ test LOGIC RIÊNG.
+  Winrate thực tế sẽ về ~50% sau vài trăm phiên.
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-game="taixiu">TÀI XỈU</div>
+  <div class="tab" data-game="md5">MD5</div>
+</div>
+
+<div class="stats" id="stats-grid"></div>
+
+<h2>📊 Hiệu quả theo Logic</h2>
+<div class="card" id="logic-card">—</div>
+
+<h2>🎲 Lịch sử 50 phiên</h2>
+<div class="card">
+  <table><thead><tr>
+    <th>Phiên</th><th>XX</th><th>Tổng</th><th>KQ</th><th>Dự đoán</th><th>Logic</th><th>Lý do</th><th>TT</th>
+  </tr></thead><tbody id="history-body"></tbody></table>
+</div>
+
+<div class="card">
+  <button class="btn" onclick="compare()">⚖️ So sánh A/B/C</button>
+  <button class="btn" onclick="exportCSV()">💾 Export CSV</button>
+  <pre id="extra-output">—</pre>
+</div>
+
+<script>
+let currentGame = 'taixiu';
+let ws = null;
+let API_KEY = localStorage.getItem('api_key') || '';
+if (!API_KEY) {
+  API_KEY = prompt('API key (mặc định: hoang-vip-secret-change-me):', 'hoang-vip-secret-change-me') || '';
+  localStorage.setItem('api_key', API_KEY);
+}
+function hdr() { return { 'x-api-key': API_KEY }; }
+
+function switchGame(g) {
+  currentGame = g;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.game === g));
+  document.getElementById('game-label').textContent = g.toUpperCase();
+  loadAll();
+}
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => switchGame(t.dataset.game));
+
+async function loadStats() {
+  try {
+    const r = await fetch('/api/stats/'+currentGame, { headers: hdr() });
+    if (!r.ok) return;
+    const s = await r.json();
+    renderStats(s);
+    renderLogic(s.byLogic || {});
+  } catch (e) { console.warn(e); }
+}
+function renderStats(s) {
+  const g = document.getElementById('stats-grid');
+  g.innerHTML = \`
+    <div class="stat">WinRate<b>\${s.winRate}</b></div>
+    <div class="stat">Recent50<b>\${s.winRateRecent50}</b></div>
+    <div class="stat">Dự đoán<b>\${s.totalPred||0}</b></div>
+    <div class="stat">Win<b style="color:#22c55e">\${s.totalWin||0}</b></div>
+    <div class="stat">Lose<b style="color:#ef4444">\${s.totalLose||0}</b></div>
+    <div class="stat">Skip<b style="color:#fbbf24">\${s.totalSkip||0}</b></div>
+    <div class="stat">WinStreak<b>\${s.winStreak||0}</b></div>
+    <div class="stat">LoseStreak<b>\${s.loseStreak||0}</b></div>
+    <div class="stat">Bankroll<b>\${(s.bankroll?.current||0).toLocaleString()}</b></div>
+    <div class="stat">PnL<b style="color:\${((s.bankroll?.totalPnl)||0)>=0?'#22c55e':'#ef4444'}">\${((s.bankroll?.totalPnl)||0).toLocaleString()}</b></div>
+  \`;
+}
+function renderLogic(byLogic) {
+  let html = '<table><thead><tr><th>Logic</th><th>Tổng</th><th>Win</th><th>Winrate</th></tr></thead><tbody>';
+  const keys = Object.keys(byLogic);
+  if (!keys.length) html += '<tr><td colspan="4" style="color:#64748b">Chưa có dữ liệu</td></tr>';
+  keys.sort((a,b) => byLogic[b].total - byLogic[a].total).forEach(k => {
+    const { win, total } = byLogic[k];
+    const wr = total ? ((win/total)*100).toFixed(1)+'%' : '-';
+    const color = total && win/total >= 0.55 ? '#22c55e' : total && win/total <= 0.45 ? '#ef4444' : '#fbbf24';
+    html += '<tr><td>'+k+'</td><td>'+total+'</td><td>'+win+'</td><td style="color:'+color+'">'+wr+'</td></tr>';
+  });
+  html += '</tbody></table>';
+  document.getElementById('logic-card').innerHTML = html;
+}
+
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/export/'+currentGame+'?format=json', { headers: hdr() });
+    if (!r.ok) return;
+    const db = await r.json();
+    renderHistory(db.history.slice(-50).reverse());
+  } catch (e) { console.warn(e); }
+}
+function renderHistory(rows) {
+  document.getElementById('history-body').innerHTML = rows.map(h => {
+    const dice = (h.xucXac||[]).join('-');
+    const kqCls = h.ketQua==='T'?'tai':(h.ketQua==='X'?'xiu':'');
+    const ddCls = h.DU_DOAN_CODE==='T'?'tai':(h.DU_DOAN_CODE==='X'?'xiu':'skip');
+    const ttCls = h.trangThai==='ĐÚNG'?'dung':(h.trangThai==='SAI'?'sai':(h.trangThai==='BỎ QUA'?'skip':'cho'));
+    return '<tr>'+
+      '<td style="font-family:monospace;font-size:10px;color:#64748b">'+h.phien+'</td>'+
+      '<td class="dice">'+dice+'</td>'+
+      '<td><span class="sum">'+(h.tong||'')+'</span></td>'+
+      '<td class="'+kqCls+'">'+(h.ketQuaLabel||'')+'</td>'+
+      '<td class="'+ddCls+'">'+(h.DU_DOAN||'—')+'</td>'+
+      '<td style="font-size:10px"><span class="badge" style="background:#334155;color:#cbd5e1">'+(h.logic||'-')+'</span></td>'+
+      '<td style="font-size:10px;color:#94a3b8;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(h.reason||'')+'">'+(h.reason||'')+'</td>'+
+      '<td class="'+ttCls+'">'+(h.trangThai==='ĐANG CHỜ'?'...':(h.trangThai||''))+'</td>'+
+    '</tr>';
+  }).join('');
+}
+async function loadAll() { await Promise.all([loadStats(), loadHistory()]); }
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(proto+'://'+location.host+'/ws');
+  ws.onopen = () => document.getElementById('ws-dot').classList.add('on');
+  ws.onclose = () => { document.getElementById('ws-dot').classList.remove('on'); setTimeout(connectWS, 3000); };
+  ws.onmessage = (e) => { try { const d = JSON.parse(e.data); if (d.type==='update' && d.game===currentGame) loadAll(); } catch (err) {} };
+}
+async function compare() {
+  const r = await fetch('/api/compare/'+currentGame, { headers: hdr() });
+  document.getElementById('extra-output').textContent = JSON.stringify(await r.json(), null, 2);
+}
+function exportCSV() { window.open('/api/export/'+currentGame+'?format=csv&api_key='+API_KEY, '_blank'); }
+
+connectWS(); loadAll(); setInterval(loadAll, 15000);
+</script>
+</body></html>`;
+
+// ============================================================
+// TICK + SHUTDOWN
+// ============================================================
+let isShuttingDown = false;
+async function tick() {
+    if (isShuttingDown) return;
+    try { await processGame('md5'); await processGame('taixiu'); }
+    catch (e) { log('ERROR', 'tick:', e.message); }
+}
+setInterval(tick, TICK_MS);
+wss.on('connection', (ws) => { ws.send(JSON.stringify({ type: 'hello', ts: nowIso() })); });
+
+function shutdown(sig) {
+    log('INFO', `Shutdown ${sig}`);
+    isShuttingDown = true;
+    wss.clients.forEach(c => { try { c.close(); } catch (e) {} });
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 5000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('uncaughtException', e => log('ERROR', 'uncaught:', e.message));
+
+server.listen(PORT, () => {
+    log('INFO', `🚀 HOANG CUSTOM v13 [PRESET=${PRESET}] on port ${PORT}`);
+    tick();
 });
