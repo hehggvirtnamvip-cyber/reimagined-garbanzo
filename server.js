@@ -1,694 +1,1020 @@
 'use strict';
 
-// ============================================================
-// HOANG CUSTOM PREDICTOR — v13 "LOGIC RIÊNG"
-// Node >= 18 | express + axios + ws
-// Chạy: npm install express axios ws && node server.js
-//
-// ⚠️  LƯU Ý QUAN TRỌNG:
-// Không có thuật toán nào thắng được xúc xắc ngẫu nhiên lâu dài.
-// Code này để bạn tự cắm LOGIC RIÊNG và test trung thực.
-// ============================================================
+// ============================================================================
+// FILE: server.js
+// MÔ TẢ: Hệ thống Bot Bán Key Telegram + Web API Kích Hoạt Key Tự Động
+// TÁC GIẢ: HOANG VIP WIN
+// PHIÊN BẢN: 14.0.0
+// NGÔN NGỮ: JavaScript (Node.js >= 18)
+// THƯ VIỆN: express, axios, ws, crypto, fs, path, http
+// ============================================================================
 
+// ============================================================================
+// PHẦN 1: IMPORT CÁC THƯ VIỆN CẦN THIẾT
+// ============================================================================
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-// ============================================================
-// CONFIG
-// ============================================================
+// ============================================================================
+// PHẦN 2: CẤU HÌNH HỆ THỐNG (CONFIG)
+// ============================================================================
+// Cổng chạy server (Render sẽ tự cấp phát qua biến môi trường PORT)
 const PORT = process.env.PORT || 3000;
-const API_MD5 = 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau';
-const API_TX  = 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau';
-const API_KEY = process.env.API_KEY || 'hoang-vip-secret-change-me';
-const DB_DIR = process.env.DB_DIR || path.join(__dirname, 'data');
-const LOG_DIR = path.join(DB_DIR, 'logs');
-const TICK_MS = parseInt(process.env.TICK_MS || '5000', 10);
-const MAX_HISTORY = 5000;
 
-// CHỌN PRESET Ở ĐÂY: 'A' | 'B' | 'C'
-const PRESET = process.env.PRESET || 'A';
+// Token của Telegram Bot (ĐÃ CẮM CỨNG THEO YÊU CẦU)
+// CẢNH BÁO: Token này đã bị lộ, cần đổi mới sau khi test thành công.
+const TELEGRAM_BOT_TOKEN = '8801717755:AAG_EpSnfyFXJDZfaEyT1L0XFrH3gtaJTHc';
 
-for (const d of [DB_DIR, LOG_DIR]) {
-    if (!fs.existsSync(d)) { try { fs.mkdirSync(d, { recursive: true }); } catch (e) {} }
-}
+// ID Telegram của Admin (ĐÃ CẮM CỨNG THEO YÊU CẦU)
+const ADMIN_CHAT_ID = '7757046138';
 
-function log(level, ...args) {
-    const ts = new Date().toISOString();
-    const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
-    const line = `[${ts}] [${level}] ${msg}`;
-    if (level === 'ERROR') console.error(line); else console.log(line);
-    try { fs.appendFileSync(path.join(LOG_DIR, `app-${ts.slice(0,10)}.log`), line + '\n'); } catch (e) {}
-}
+// Đường dẫn thư mục lưu trữ dữ liệu
+const DATA_DIRECTORY = path.join(__dirname, 'data');
+const KEY_FILE_PATH = path.join(DATA_DIRECTORY, 'keys.json');
 
-// ============================================================
-// UTILS
-// ============================================================
-const label = c => c === 'T' ? 'Tài' : c === 'X' ? 'Xỉu' : null;
-const flip = c => c === 'T' ? 'X' : c === 'X' ? 'T' : null;
-const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
-const safeInt = (x, def = 0) => { const n = parseInt(x, 10); return Number.isFinite(n) ? n : def; };
-const nowIso = () => new Date().toISOString();
-
-const getDice = item => [safeInt(item?.FirstDice), safeInt(item?.SecondDice), safeInt(item?.ThirdDice)];
-const getSum = item => {
-    const s = getDice(item).reduce((a, b) => a + b, 0);
-    return (s >= 3 && s <= 18) ? s : safeInt(item?.DiceSum);
-};
-const getResult = item => {
-    const s = getSum(item);
-    return (s >= 3 && s <= 18) ? (s >= 11 ? 'T' : 'X') : null;
+// Bảng giá các gói (Đơn vị: VNĐ)
+const PRICE_LIST = {
+    '1d': 10000,
+    '7d': 50000,
+    '30d': 150000
 };
 
-// ============================================================
-// SEQUENCE HELPERS
-// ============================================================
-function computeRLE(seq) {
-    const out = []; if (!seq.length) return out;
-    let cur = seq[0], len = 1;
-    for (let i = 1; i < seq.length; i++) {
-        if (seq[i] === cur) len++;
-        else { out.push({ ch: cur, len }); cur = seq[i]; len = 1; }
-    }
-    out.push({ ch: cur, len });
-    return out;
-}
-function currentStreak(seq) {
-    if (!seq.length) return 0;
-    const last = seq[seq.length - 1];
-    let c = 0;
-    for (let i = seq.length - 1; i >= 0; i--) { if (seq[i] === last) c++; else break; }
-    return c;
-}
-function currentAlternation(seq) {
-    if (seq.length < 2) return 0;
-    let c = 0;
-    for (let i = seq.length - 1; i >= 1; i--) { if (seq[i] !== seq[i - 1]) c++; else break; }
-    return c;
+// Số lần nhập sai tối đa trước khi khóa vĩnh viễn
+const MAXIMUM_FAIL_ATTEMPTS = 3;
+
+// Khởi tạo thư mục dữ liệu nếu chưa tồn tại
+if (!fs.existsSync(DATA_DIRECTORY)) {
+    fs.mkdirSync(DATA_DIRECTORY, { recursive: true });
 }
 
-// ============================================================
-// DB
-// ============================================================
-function defaultDB() {
-    return {
-        version: 13,
-        createdAt: nowIso(),
-        lastProcessedSession: null,
-        history: [],
-        meta: {
-            totalPred: 0, totalWin: 0, totalLose: 0, totalSkip: 0,
-            winStreak: 0, loseStreak: 0, maxWinStreak: 0, maxLoseStreak: 0,
-            recent50: [],
-            byLogic: {},  // { logicName: { win, total } }
-            confusion: { TT: 0, TX: 0, XT: 0, XX: 0 }
-        },
-        bankroll: { initial: 1000000, current: 1000000, bets: [], totalPnl: 0 }
-    };
+// ============================================================================
+// PHẦN 3: CÁC HÀM TIỆN ÍCH (UTILITIES)
+// ============================================================================
+
+/**
+ * Ghi log ra console kèm theo mốc thời gian.
+ * @param {string} level - Cấp độ log (INFO, ERROR, WARN)
+ * @param {...any} args - Các tham số cần log
+ */
+function writeLog(level, ...args) {
+    const timestamp = new Date().toISOString();
+    const message = args.map(arg => {
+        if (typeof arg === 'object') {
+            return JSON.stringify(arg);
+        }
+        return String(arg);
+    }).join(' ');
+    
+    const formattedLine = `[${timestamp}] [${level}] ${message}`;
+    
+    if (level === 'ERROR') {
+        console.error(formattedLine);
+    } else {
+        console.log(formattedLine);
+    }
 }
-function readDB(game) {
-    const p = path.join(DB_DIR, `db_${game}.json`);
+
+/**
+ * Đọc danh sách key từ file JSON.
+ * @returns {Array} Mảng các đối tượng key
+ */
+function loadKeysFromFile() {
     try {
-        if (fs.existsSync(p)) {
-            const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
-            const def = defaultDB();
-            return {
-                ...def, ...raw,
-                meta: { ...def.meta, ...(raw.meta || {}),
-                    confusion: { ...def.meta.confusion, ...((raw.meta || {}).confusion || {}) },
-                    byLogic: { ...(raw.meta || {}).byLogic } },
-                bankroll: { ...def.bankroll, ...(raw.bankroll || {}) }
-            };
+        if (fs.existsSync(KEY_FILE_PATH)) {
+            const rawData = fs.readFileSync(KEY_FILE_PATH, 'utf8');
+            return JSON.parse(rawData);
         }
-    } catch (e) { log('ERROR', `readDB ${game}:`, e.message); }
-    return defaultDB();
-}
-function saveDB(game, db) {
-    const p = path.join(DB_DIR, `db_${game}.json`);
-    try {
-        const tmp = p + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
-        fs.renameSync(tmp, p);
-    } catch (e) { log('ERROR', `saveDB ${game}:`, e.message); }
-}
-
-// ============================================================
-// 🎯 PRESET A — "BÁM CẦU THẬT"
-// Chỉ dự đoán khi có cầu RÕ RÀNG, không thì SKIP
-// Triết lý: không chắc thì không đánh
-// ============================================================
-function predictPresetA(seq, sums) {
-    if (seq.length < 6) return { code: null, confidence: 0, reason: 'Boot', logic: 'A-Skip' };
-
-    const rle = computeRLE(seq);
-    const streak = currentStreak(seq);
-    const alt = currentAlternation(seq);
-    const last = seq[seq.length - 1];
-
-    // Cầu bệt 4-7: theo bệt (không đảo như code cũ)
-    // Lý do: bệt 4-7 thường dài hơn là gãy ngay
-    if (streak >= 4 && streak <= 7) {
-        return { code: last, confidence: 0.55, reason: `Bệt ${streak} → theo`, logic: 'A-Bệt' };
-    }
-
-    // Cầu 1-1 (đảo liên tục ≥ 4 lần): tiếp tục đảo
-    if (alt >= 4) {
-        return { code: flip(last), confidence: 0.55, reason: `1-1 (${alt} lần) → đảo`, logic: 'A-1-1' };
-    }
-
-    // Cầu 2-2 (block đều 2): 3 block gần nhất đều len=2 → đoán block tiếp theo len=2
-    if (rle.length >= 3) {
-        const [a, b, c] = rle.slice(-3);
-        if (a.len === 2 && b.len === 2 && c.len === 2) {
-            // Đang ở block thứ 3, đoán nó cũng chỉ 2 rồi đảo
-            if (c.len === 2) return { code: flip(last), confidence: 0.55, reason: '2-2-2 → đảo', logic: 'A-2-2' };
-        }
-    }
-
-    // Cầu 3-3: 2 block 3 gần nhất
-    if (rle.length >= 2) {
-        const [a, b] = rle.slice(-2);
-        if (a.len === 3 && b.len === 3 && streak < 3) {
-            return { code: last, confidence: 0.55, reason: '3-3 → theo', logic: 'A-3-3' };
-        }
-    }
-
-    // Không có cầu rõ → SKIP
-    return { code: null, confidence: 0, reason: 'Không cầu → bỏ', logic: 'A-Skip' };
-}
-
-// ============================================================
-// 🎯 PRESET B — "ANTI-PATTERN" (đánh ngược đám đông)
-// Triết lý: đa số người chơi theo bệt → mình đánh ngược khi bệt dài
-// ============================================================
-function predictPresetB(seq, sums) {
-    if (seq.length < 6) return { code: null, confidence: 0, reason: 'Boot', logic: 'B-Skip' };
-
-    const streak = currentStreak(seq);
-    const alt = currentAlternation(seq);
-    const last = seq[seq.length - 1];
-
-    // Bệt 5-8: đa số sẽ theo → mình đánh NGƯỢC (bẻ cầu)
-    if (streak >= 5 && streak <= 8) {
-        return { code: flip(last), confidence: 0.55, reason: `Bệt ${streak} → bẻ`, logic: 'B-Bẻ bệt' };
-    }
-
-    // Bệt ≥ 9: đa số đã bỏ → mình theo (bệt dai)
-    if (streak >= 9) {
-        return { code: last, confidence: 0.55, reason: `Bệt ${streak} → theo`, logic: 'B-Bệt dai' };
-    }
-
-    // 1-1 dài ≥ 5: đa số đánh đảo → mình đánh theo (bẻ 1-1)
-    if (alt >= 5) {
-        return { code: last, confidence: 0.55, reason: `1-1 (${alt}) → bẻ`, logic: 'B-Bẻ 1-1' };
-    }
-
-    return { code: null, confidence: 0, reason: 'Không tín hiệu → bỏ', logic: 'B-Skip' };
-}
-
-// ============================================================
-// 🎯 PRESET C — "CUSTOM" (bạn tự viết logic ở đây)
-// ============================================================
-function predictPresetC(seq, sums) {
-    if (seq.length < 6) return { code: null, confidence: 0, reason: 'Boot', logic: 'C-Skip' };
-
-    // ============================================================
-    // TODO: VIẾT LOGIC CỦA BẠN Ở ĐÂY
-    // Input: seq (mảng 'T'/'X'), sums (mảng tổng 3-18)
-    // Output: { code: 'T' | 'X' | null, confidence: 0-1, reason: 'string', logic: 'tên' }
-    // ============================================================
-
-    // Ví dụ: đánh theo tổng 5 phiên gần nhất
-    // Nếu tổng trung bình 5 phiên ≥ 13 → đoán X (vì sắp về Tài trung bình)
-    // Ngược lại ≤ 8 → đoán T
-    if (sums.length >= 5) {
-        const avg = sums.slice(-5).reduce((a, b) => a + b, 0) / 5;
-        if (avg >= 14) return { code: 'X', confidence: 0.55, reason: `Avg5=${avg.toFixed(1)} cao → X`, logic: 'C-Sum' };
-        if (avg <= 7)  return { code: 'T', confidence: 0.55, reason: `Avg5=${avg.toFixed(1)} thấp → T`, logic: 'C-Sum' };
-    }
-
-    return { code: null, confidence: 0, reason: 'Không tín hiệu', logic: 'C-Skip' };
-}
-
-// ============================================================
-// ROUTER — CHỌN PRESET
-// ============================================================
-function predict(seq, sums) {
-    if (PRESET === 'A') return predictPresetA(seq, sums);
-    if (PRESET === 'B') return predictPresetB(seq, sums);
-    if (PRESET === 'C') return predictPresetC(seq, sums);
-    return predictPresetA(seq, sums);
-}
-
-// ============================================================
-// FETCH
-// ============================================================
-async function fetchApi(url) {
-    for (let i = 0; i < 3; i++) {
-        try {
-            const res = await axios.get(url, { timeout: 8000 });
-            let arr = res.data?.data?.list || res.data?.list || res.data?.data || (Array.isArray(res.data) ? res.data : []);
-            if (!Array.isArray(arr)) return [];
-            if (arr.length >= 2 && Number(arr[0].SessionId) > Number(arr[arr.length - 1].SessionId)) arr.reverse();
-            return arr;
-        } catch (e) {
-            if (i === 2) { log('ERROR', `fetchApi ${e.message}`); return []; }
-            await new Promise(r => setTimeout(r, 500 * (i + 1)));
-        }
+    } catch (error) {
+        writeLog('ERROR', 'Lỗi đọc file keys.json:', error.message);
     }
     return [];
 }
 
-// ============================================================
-// KELLY
-// ============================================================
-function kellyFraction(probWin, payout = 1.0) {
-    const f = (payout * probWin - (1 - probWin)) / payout;
-    return clamp(f, 0, 0.25);
-}
-
-// ============================================================
-// PROCESS GAME
-// ============================================================
-async function processGame(game) {
-    const url = game === 'md5' ? API_MD5 : API_TX;
-    const list = await fetchApi(url);
-    if (!list || !list.length) return;
-
-    const latest = list[list.length - 1];
-    const session = safeInt(latest.SessionId);
-    if (!session) return;
-
-    const db = readDB(game);
-    if (db.lastProcessedSession === session) return;
-
-    const seq = list.map(getResult).filter(Boolean);
-    const sums = list.map(getSum).filter(s => s >= 3 && s <= 18);
-    if (seq.length < 5) return;
-
-    // ---- Chấm phiên trước ----
-    const prev = db.history[db.history.length - 1];
-    if (prev && safeInt(prev.phienDuDoan) === session) {
-        const actual = getResult(latest);
-        prev.ketQua = actual;
-        prev.ketQuaLabel = label(actual);
-
-        if (prev.DU_DOAN_CODE === null) {
-            // SKIP
-            prev.trangThai = 'BỎ QUA';
-            db.meta.totalSkip = (db.meta.totalSkip || 0) + 1;
-        } else {
-            const correct = prev.DU_DOAN_CODE === actual;
-            prev.trangThai = correct ? 'ĐÚNG' : 'SAI';
-            db.meta.totalPred = (db.meta.totalPred || 0) + 1;
-
-            if (correct) {
-                db.meta.totalWin = (db.meta.totalWin || 0) + 1;
-                db.meta.winStreak = (db.meta.winStreak || 0) + 1;
-                db.meta.loseStreak = 0;
-                db.meta.maxWinStreak = Math.max(db.meta.maxWinStreak || 0, db.meta.winStreak);
-            } else {
-                db.meta.totalLose = (db.meta.totalLose || 0) + 1;
-                db.meta.loseStreak = (db.meta.loseStreak || 0) + 1;
-                db.meta.winStreak = 0;
-                db.meta.maxLoseStreak = Math.max(db.meta.maxLoseStreak || 0, db.meta.loseStreak);
-            }
-            db.meta.recent50.push(correct ? 1 : 0);
-            while (db.meta.recent50.length > 50) db.meta.recent50.shift();
-
-            // Confusion
-            const key = prev.DU_DOAN_CODE + actual;
-            if (key in db.meta.confusion) db.meta.confusion[key]++;
-
-            // By logic
-            const lg = prev.logic || 'unknown';
-            if (!db.meta.byLogic[lg]) db.meta.byLogic[lg] = { win: 0, total: 0 };
-            db.meta.byLogic[lg].total++;
-            if (correct) db.meta.byLogic[lg].win++;
-
-            // Bankroll
-            const probWin = prev.PROB_RAW >= 0.5 ? prev.PROB_RAW : 1 - prev.PROB_RAW;
-            const frac = kellyFraction(probWin);
-            const betAmount = Math.floor(db.bankroll.current * frac * 0.5);
-            if (betAmount > 0) {
-                const pnl = correct ? betAmount : -betAmount;
-                db.bankroll.current += pnl;
-                db.bankroll.totalPnl = (db.bankroll.totalPnl || 0) + pnl;
-                db.bankroll.bets.push({ session: prev.phienDuDoan, amount: betAmount, correct, pnl, at: nowIso() });
-                if (db.bankroll.bets.length > 500) db.bankroll.bets.shift();
-            }
-        }
+/**
+ * Lưu danh sách key vào file JSON.
+ * @param {Array} keys - Mảng các đối tượng key
+ */
+function saveKeysToFile(keys) {
+    try {
+        fs.writeFileSync(KEY_FILE_PATH, JSON.stringify(keys, null, 2), 'utf8');
+    } catch (error) {
+        writeLog('ERROR', 'Lỗi ghi file keys.json:', error.message);
     }
-
-    // ---- Dự đoán phiên tiếp ----
-    const pred = predict(seq, sums);
-
-    db.history.push({
-        phien: session,
-        xucXac: getDice(latest),
-        tong: getSum(latest),
-        ketQua: getResult(latest),
-        ketQuaLabel: label(getResult(latest)),
-        phienDuDoan: session + 1,
-        DU_DOAN_CODE: pred.code,
-        DU_DOAN: label(pred.code) || 'BỎ',
-        PROB_RAW: pred.confidence,
-        TI_LE: pred.code ? (pred.confidence * 100).toFixed(1) + '%' : '—',
-        logic: pred.logic,
-        reason: pred.reason,
-        kelly: pred.code ? kellyFraction(pred.confidence >= 0.5 ? pred.confidence : 1 - pred.confidence) : 0,
-        trangThai: 'ĐANG CHỜ',
-        at: nowIso()
-    });
-
-    if (db.history.length > MAX_HISTORY) db.history.shift();
-    db.lastProcessedSession = session;
-    saveDB(game, db);
-    broadcast({ type: 'update', game });
 }
 
-// ============================================================
-// EXPRESS + WS
-// ============================================================
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+/**
+ * Sinh một key mới với định dạng HVW-XXXX-XXXX-XXXX.
+ * @param {string} plan - Gói mua (1d, 7d, 30d)
+ * @param {string} telegramId - ID Telegram của người mua
+ * @returns {Object} Đối tượng key vừa tạo
+ */
+function generateNewKey(plan, telegramId) {
+    // Sinh 6 byte ngẫu nhiên, chuyển thành chuỗi HEX in hoa
+    const randomBytes = crypto.randomBytes(6).toString('hex').toUpperCase();
+    
+    // Cắt thành 3 khúc, mỗi khúc 4 ký tự
+    const part1 = randomBytes.slice(0, 4);
+    const part2 = randomBytes.slice(4, 8);
+    const part3 = randomBytes.slice(8, 12);
+    
+    // Ghép thành key hoàn chỉnh
+    const keyString = `HVW-${part1}-${part2}-${part3}`;
+    
+    // Tính thời gian hết hạn
+    const currentTime = Date.now();
+    const durations = {
+        '1d': 1 * 24 * 60 * 60 * 1000,     // 1 ngày
+        '7d': 7 * 24 * 60 * 60 * 1000,     // 7 ngày
+        '30d': 30 * 24 * 60 * 60 * 1000    // 30 ngày
+    };
+    const durationMs = durations[plan] || durations['1d'];
+    const expirationTime = currentTime + durationMs;
+    
+    // Tạo đối tượng record
+    const keyRecord = {
+        key: keyString,
+        plan: plan,
+        telegramId: telegramId,
+        createdAt: currentTime,
+        expiresAt: expirationTime,
+        active: true,
+        revoked: false,
+        failAttempts: 0,
+        lastFailAt: null,
+        activatedAt: null,
+        activatedBy: null,
+        userInfo: null
+    };
+    
+    // Lưu vào file
+    const allKeys = loadKeysFromFile();
+    allKeys.push(keyRecord);
+    saveKeysToFile(allKeys);
+    
+    return keyRecord;
+}
 
-app.use((req, res, next) => {
+// ============================================================================
+// PHẦN 4: CÁC HÀM TƯƠNG TÁC TELEGRAM API
+// ============================================================================
+
+/**
+ * Gửi tin nhắn đến một chat ID trên Telegram.
+ * @param {string|number} chatId - ID người nhận
+ * @param {string} text - Nội dung tin nhắn (HTML)
+ * @param {Object} options - Tùy chọn bổ sung (reply_markup, ...)
+ */
+async function sendTelegramMessage(chatId, text, options = {}) {
+    if (!TELEGRAM_BOT_TOKEN) {
+        writeLog('WARN', 'Chưa cấu hình TELEGRAM_BOT_TOKEN, không thể gửi tin nhắn.');
+        return;
+    }
+    
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        await axios.post(url, {
+            chat_id: chatId,
+            text: text,
+            parse_mode: 'HTML',
+            ...options
+        }, { timeout: 10000 });
+    } catch (error) {
+        writeLog('ERROR', 'Lỗi gửi tin nhắn Telegram:', error.message);
+    }
+}
+
+/**
+ * Lấy danh sách các bản cập nhật (updates) từ Telegram API.
+ * @param {number} offset - ID của update cuối cùng đã xử lý
+ * @returns {Array} Mảng các update mới
+ */
+async function getTelegramUpdates(offset = 0) {
+    if (!TELEGRAM_BOT_TOKEN) return [];
+    
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`;
+        const response = await axios.get(url, {
+            params: { offset: offset, timeout: 30 },
+            timeout: 35000
+        });
+        return response.data.result || [];
+    } catch (error) {
+        return [];
+    }
+}
+
+/**
+ * Trả lời callback query (khi user bấm nút inline keyboard).
+ * @param {string} callbackQueryId - ID của callback query
+ */
+async function answerCallbackQuery(callbackQueryId) {
+    if (!TELEGRAM_BOT_TOKEN) return;
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
+        await axios.post(url, { callback_query_id: callbackQueryId }, { timeout: 5000 });
+    } catch (error) {
+        writeLog('ERROR', 'Lỗi answerCallbackQuery:', error.message);
+    }
+}
+
+// ============================================================================
+// PHẦN 5: XỬ LÝ TIN NHẮN VÀ LỆNH TELEGRAM
+// ============================================================================
+
+// Map lưu trữ các đơn hàng đang chờ thanh toán: { chatId: { plan, price } }
+const pendingOrdersMap = new Map();
+
+/**
+ * Xử lý tin nhắn văn bản gửi đến Bot (từ user thường).
+ * @param {Object} message - Đối tượng message từ Telegram
+ */
+async function handleUserMessage(message) {
+    const chatId = message.chat.id;
+    const messageText = (message.text || '').trim();
+    const senderInfo = message.from || {};
+    
+    // Lệnh /start hoặc /help
+    if (messageText === '/start' || messageText === '/help') {
+        const helpText = `🎯 <b>BOT BÁN KEY</b>\n\n` +
+            `Các lệnh có sẵn:\n` +
+            `/mua - Mua key mới\n` +
+            `/key - Xem danh sách key đã mua\n` +
+            `/huongdan - Hướng dẫn sử dụng\n\n` +
+            `💡 <b>Bảng giá:</b>\n` +
+            `• 1 Ngày: ${PRICE_LIST['1d'].toLocaleString()}đ\n` +
+            `• 7 Ngày: ${PRICE_LIST['7d'].toLocaleString()}đ\n` +
+            `• 30 Ngày: ${PRICE_LIST['30d'].toLocaleString()}đ`;
+        
+        return sendTelegramMessage(chatId, helpText);
+    }
+    
+    // Lệnh /mua
+    if (messageText === '/mua') {
+        const inlineKeyboard = {
+            inline_keyboard: [
+                [{ text: `1 Ngày — ${PRICE_LIST['1d'].toLocaleString()}đ`, callback_data: 'buy_1d' }],
+                [{ text: `7 Ngày — ${PRICE_LIST['7d'].toLocaleString()}đ`, callback_data: 'buy_7d' }],
+                [{ text: `30 Ngày — ${PRICE_LIST['30d'].toLocaleString()}đ`, callback_data: 'buy_30d' }]
+            ]
+        };
+        
+        return sendTelegramMessage(chatId, '🛒 <b>Vui lòng chọn gói bạn muốn mua:</b>', {
+            reply_markup: inlineKeyboard
+        });
+    }
+    
+    // Lệnh /key
+    if (messageText === '/key') {
+        const userKeys = loadKeysFromFile().filter(
+            keyRecord => String(keyRecord.telegramId) === String(senderInfo.id)
+        );
+        
+        if (userKeys.length === 0) {
+            return sendTelegramMessage(chatId, '❌ Bạn chưa có key nào. Vui lòng dùng lệnh /mua để mua.');
+        }
+        
+        let responseText = `🔑 <b>DANH SÁCH KEY CỦA BẠN</b>\n\n`;
+        
+        userKeys.forEach((keyRecord, index) => {
+            const expirationDate = new Date(keyRecord.expiresAt).toLocaleString('vi-VN');
+            
+            let statusIcon = '🟢 HOẠT ĐỘNG';
+            if (!keyRecord.active) {
+                statusIcon = '🔴 ĐÃ BỊ KHÓA';
+            } else if (keyRecord.revoked) {
+                statusIcon = '🔴 BỊ THU HỒI';
+            } else if (Date.now() > keyRecord.expiresAt) {
+                statusIcon = '⚪ ĐÃ HẾT HẠN';
+            }
+            
+            responseText += `<b>#${index + 1}</b> — ${statusIcon}\n`;
+            responseText += `Mã: <code>${keyRecord.key}</code>\n`;
+            responseText += `Hết hạn: ${expirationDate}\n`;
+            responseText += `Số lần sai: ${keyRecord.failAttempts}/${MAXIMUM_FAIL_ATTEMPTS}\n\n`;
+        });
+        
+        return sendTelegramMessage(chatId, responseText);
+    }
+    
+    // Lệnh /huongdan
+    if (messageText === '/huongdan') {
+        const guideText = `📖 <b>HƯỚNG DẪN SỬ DỤNG</b>\n\n` +
+            `1. Mua key qua lệnh /mua\n` +
+            `2. Nhận key dạng HVW-XXXX-XXXX-XXXX\n` +
+            `3. Truy cập website để nhập key\n` +
+            `4. Nhập key và bấm "Kích hoạt"\n\n` +
+            `⚠️ <b>Lưu ý:</b> Nhập sai 3 lần sẽ bị khóa vĩnh viễn, không hỗ trợ đổi key.`;
+        
+        return sendTelegramMessage(chatId, guideText);
+    }
+}
+
+/**
+ * Xử lý callback query (khi user bấm nút inline).
+ * @param {Object} callbackQuery - Đối tượng callback từ Telegram
+ */
+async function handleCallbackQuery(callbackQuery) {
+    const chatId = callbackQuery.message.chat.id;
+    const callbackData = callbackQuery.data;
+    const senderInfo = callbackQuery.from;
+    
+    // Xử lý nút mua gói
+    if (callbackData.startsWith('buy_')) {
+        const selectedPlan = callbackData.replace('buy_', '');
+        
+        if (!PRICE_LIST[selectedPlan]) return;
+        
+        // Lưu đơn hàng vào map
+        pendingOrdersMap.set(String(chatId), {
+            plan: selectedPlan,
+            price: PRICE_LIST[selectedPlan],
+            createdAt: Date.now()
+        });
+        
+        await answerCallbackQuery(callbackQuery.id);
+        
+        const orderText = `💳 <b>ĐƠN HÀNG</b>\n\n` +
+            `Gói: <b>${selectedPlan}</b>\n` +
+            `Giá: <b>${PRICE_LIST[selectedPlan].toLocaleString()}đ</b>\n\n` +
+            `Vui lòng chuyển khoản và bấm "Đã thanh toán".`;
+        
+        const paymentKeyboard = {
+            inline_keyboard: [
+                [{ text: '✅ Đã thanh toán', callback_data: `paid_${selectedPlan}` }],
+                [{ text: '❌ Hủy đơn', callback_data: 'cancel_order' }]
+            ]
+        };
+        
+        return sendTelegramMessage(chatId, orderText, { reply_markup: paymentKeyboard });
+    }
+    
+    // Xử lý nút đã thanh toán
+    if (callbackData.startsWith('paid_')) {
+        const selectedPlan = callbackData.replace('paid_', '');
+        const pendingOrder = pendingOrdersMap.get(String(chatId));
+        
+        if (!pendingOrder || pendingOrder.plan !== selectedPlan) {
+            await answerCallbackQuery(callbackQuery.id);
+            return sendTelegramMessage(chatId, '❌ Đơn hàng không tồn tại hoặc đã hết hạn. Vui lòng dùng /mua lại.');
+        }
+        
+        // Gửi thông báo cho Admin
+        const adminNotification = `💰 <b>YÊU CẦU DUYỆT ĐƠN</b>\n\n` +
+            `👤 User: ${senderInfo.first_name || ''} (@${senderInfo.username || 'N/A'})\n` +
+            `🆔 Chat ID: <code>${chatId}</code>\n` +
+            `📦 Gói: <b>${selectedPlan}</b> — ${pendingOrder.price.toLocaleString()}đ\n` +
+            `⏰ ${new Date().toLocaleString('vi-VN')}\n\n` +
+            `Để duyệt, gõ lệnh:\n<code>/duyet ${chatId} ${selectedPlan}</code>`;
+        
+        if (ADMIN_CHAT_ID) {
+            await sendTelegramMessage(ADMIN_CHAT_ID, adminNotification);
+        }
+        
+        await answerCallbackQuery(callbackQuery.id);
+        return sendTelegramMessage(chatId, '⏳ Đã gửi yêu cầu tới Admin. Vui lòng chờ duyệt.');
+    }
+    
+    // Xử lý nút hủy đơn
+    if (callbackData === 'cancel_order') {
+        pendingOrdersMap.delete(String(chatId));
+        await answerCallbackQuery(callbackQuery.id);
+        return sendTelegramMessage(chatId, '❌ Đã hủy đơn hàng.');
+    }
+}
+
+/**
+ * Xử lý tin nhắn từ Admin (các lệnh quản trị).
+ * @param {Object} message - Đối tượng message từ Telegram
+ */
+async function handleAdminMessage(message) {
+    const chatId = message.chat.id;
+    const messageText = (message.text || '').trim();
+    
+    // Chỉ Admin mới được phép
+    if (String(chatId) !== String(ADMIN_CHAT_ID)) {
+        return;
+    }
+    
+    // Lệnh /duyet <chatId> <plan>
+    if (messageText.startsWith('/duyet ')) {
+        const commandParts = messageText.split(/\s+/);
+        
+        if (commandParts.length < 3) {
+            return sendTelegramMessage(chatId, '⚠️ Cú pháp: /duyet <chatId> <plan>');
+        }
+        
+        const targetChatId = commandParts[1];
+        const selectedPlan = commandParts[2];
+        
+        if (!PRICE_LIST[selectedPlan]) {
+            return sendTelegramMessage(chatId, '⚠️ Plan không hợp lệ. Chỉ chấp nhận: 1d, 7d, 30d.');
+        }
+        
+        // Sinh key mới
+        const newKeyRecord = generateNewKey(selectedPlan, targetChatId);
+        const expirationDate = new Date(newKeyRecord.expiresAt).toLocaleString('vi-VN');
+        
+        // Gửi key cho Admin
+        await sendTelegramMessage(chatId, 
+            `✅ Đã tạo key cho user <code>${targetChatId}</code>\n` +
+            `Mã: <code>${newKeyRecord.key}</code>`
+        );
+        
+        // Gửi key cho User
+        await sendTelegramMessage(targetChatId,
+            `🎉 <b>ĐƠN HÀNG ĐÃ ĐƯỢC DUYỆT</b>\n\n` +
+            `🔑 Key của bạn: <code>${newKeyRecord.key}</code>\n` +
+            `📦 Gói: <b>${selectedPlan}</b>\n` +
+            `📅 Hết hạn: ${expirationDate}\n\n` +
+            `Vui lòng truy cập website để kích hoạt.`
+        );
+        
+        // Xóa khỏi danh sách chờ
+        pendingOrdersMap.delete(String(targetChatId));
+    }
+    
+    // Lệnh /keys — xem tổng quan
+    if (messageText === '/keys') {
+        const allKeys = loadKeysFromFile();
+        const activeCount = allKeys.filter(k => k.active && !k.revoked && Date.now() < k.expiresAt).length;
+        const lockedCount = allKeys.filter(k => !k.active).length;
+        const revokedCount = allKeys.filter(k => k.revoked).length;
+        
+        return sendTelegramMessage(chatId,
+            `📊 <b>TỔNG QUAN HỆ THỐNG</b>\n\n` +
+            `Tổng số key: <b>${allKeys.length}</b>\n` +
+            `🟢 Đang hoạt động: <b>${activeCount}</b>\n` +
+            `🔴 Đã khóa: <b>${lockedCount}</b>\n` +
+            `⛔ Đã thu hồi: <b>${revokedCount}</b>`
+        );
+    }
+    
+    // Lệnh /revoke <key>
+    if (messageText.startsWith('/revoke ')) {
+        const keyToRevoke = messageText.replace('/revoke ', '').trim();
+        const allKeys = loadKeysFromFile();
+        const foundKey = allKeys.find(k => k.key === keyToRevoke);
+        
+        if (!foundKey) {
+            return sendTelegramMessage(chatId, '❌ Không tìm thấy key này.');
+        }
+        
+        foundKey.revoked = true;
+        foundKey.active = false;
+        saveKeysToFile(allKeys);
+        
+        return sendTelegramMessage(chatId, `✅ Đã thu hồi key: <code>${keyToRevoke}</code>`);
+    }
+}
+
+// ============================================================================
+// PHẦN 6: VÒNG LẶP LONG POLLING TELEGRAM
+// ============================================================================
+
+let telegramUpdateOffset = 0;
+
+/**
+ * Vòng lặp liên tục lấy cập nhật từ Telegram và xử lý.
+ */
+async function telegramPollingLoop() {
+    if (!TELEGRAM_BOT_TOKEN) {
+        writeLog('WARN', 'Không có TELEGRAM_BOT_TOKEN, bot không chạy.');
+        return;
+    }
+    
+    writeLog('INFO', 'Bắt đầu vòng lặp Telegram polling...');
+    
+    while (true) {
+        try {
+            const updates = await getTelegramUpdates(telegramUpdateOffset);
+            
+            for (const update of updates) {
+                telegramUpdateOffset = update.update_id + 1;
+                
+                // Xử lý tin nhắn
+                if (update.message) {
+                    if (String(update.message.chat.id) === String(ADMIN_CHAT_ID)) {
+                        await handleAdminMessage(update.message);
+                    } else {
+                        await handleUserMessage(update.message);
+                    }
+                }
+                
+                // Xử lý callback query
+                if (update.callback_query) {
+                    await handleCallbackQuery(update.callback_query);
+                }
+            }
+        } catch (error) {
+            writeLog('ERROR', 'Lỗi trong vòng lặp polling:', error.message);
+        }
+        
+        // Nghỉ 1 giây trước khi lấy tiếp
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+}
+
+// ============================================================================
+// PHẦN 7: EXPRESS SERVER & API KÍCH HOẠT
+// ============================================================================
+
+const expressApp = express();
+const httpServer = http.createServer(expressApp);
+const webSocketServer = new WebSocketServer({ server: httpServer, path: '/ws' });
+
+// Middleware parse JSON
+expressApp.use(express.json());
+
+// Middleware CORS
+expressApp.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
-});
-app.use(express.json());
-
-function authMiddleware(req, res, next) {
-    const key = req.headers['x-api-key'] || req.query.api_key;
-    if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
-    next();
-}
-function broadcast(payload) {
-    const msg = JSON.stringify(payload);
-    wss.clients.forEach(c => { if (c.readyState === 1) { try { c.send(msg); } catch (e) {} } });
-}
-
-// ============================================================
-// API ROUTES
-// ============================================================
-app.get('/health', (req, res) => res.json({ status: 'ok', preset: PRESET, uptime: process.uptime(), ts: nowIso() }));
-
-app.get('/api/stats/:game', authMiddleware, (req, res) => {
-    const game = req.params.game;
-    const db = readDB(game);
-    const m = db.meta;
-    const wr = m.totalPred ? (m.totalWin / m.totalPred * 100).toFixed(2) + '%' : 'N/A';
-    const wr50 = m.recent50.length ? ((m.recent50.reduce((a, b) => a + b, 0) / m.recent50.length) * 100).toFixed(2) + '%' : 'N/A';
-    res.json({
-        success: true, game, preset: PRESET,
-        winRate: wr, winRateRecent50: wr50,
-        totalPred: m.totalPred, totalWin: m.totalWin, totalLose: m.totalLose, totalSkip: m.totalSkip,
-        winStreak: m.winStreak, loseStreak: m.loseStreak,
-        maxWinStreak: m.maxWinStreak, maxLoseStreak: m.maxLoseStreak,
-        confusion: m.confusion,
-        byLogic: m.byLogic,
-        bankroll: db.bankroll,
-        lastProcessedSession: db.lastProcessedSession
-    });
-});
-
-app.get('/api/predict/:game', authMiddleware, (req, res) => {
-    const db = readDB(req.params.game);
-    if (!db.history.length) return res.json({ success: false, message: 'Chưa có dữ liệu' });
-    const last = db.history[db.history.length - 1];
-    res.json({
-        success: true, game: req.params.game, preset: PRESET,
-        phienHienTai: last.phien, phienDuDoan: last.phienDuDoan,
-        duDoan: last.DU_DOAN, code: last.DU_DOAN_CODE,
-        tiLe: last.TI_LE, logic: last.logic, reason: last.reason,
-        kelly: last.kelly, thoiGian: last.at
-    });
-});
-
-app.get('/api/export/:game', authMiddleware, (req, res) => {
-    const db = readDB(req.params.game);
-    const format = (req.query.format || 'json').toLowerCase();
-    if (format === 'csv') {
-        const rows = ['phien,xucxac,tong,ketqua,phienDuDoan,duDoan,code,tiLe,logic,reason,trangThai'];
-        db.history.forEach(h => {
-            rows.push([h.phien, (h.xucXac || []).join('-'), h.tong, h.ketQua || '', h.phienDuDoan,
-                h.DU_DOAN || '', h.DU_DOAN_CODE || '', h.TI_LE || '',
-                `"${h.logic || ''}"`, `"${h.reason || ''}"`, h.trangThai || ''].join(','));
-        });
-        res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', `attachment; filename="${req.params.game}-history.csv"`);
-        return res.send(rows.join('\n'));
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
     }
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="${req.params.game}-db.json"`);
-    res.send(JSON.stringify(db, null, 2));
+    
+    next();
 });
 
-// So sánh 3 preset trên cùng dữ liệu
-app.get('/api/compare/:game', authMiddleware, (req, res) => {
-    const game = req.params.game;
-    const db = readDB(game);
-    // Chạy lại history, mỗi phiên predict bằng 3 preset
-    const seqAll = db.history.map(h => h.ketQua).filter(Boolean);
-    const sumsAll = db.history.map(h => h.tong).filter(s => s >= 3 && s <= 18);
-    const out = { A: { win: 0, total: 0 }, B: { win: 0, total: 0 }, C: { win: 0, total: 0 } };
-    for (let i = 6; i < seqAll.length - 1; i++) {
-        const subSeq = seqAll.slice(0, i);
-        const subSums = sumsAll.slice(0, i);
-        const actual = seqAll[i + 1];
-        for (const p of ['A', 'B', 'C']) {
-            const fn = p === 'A' ? predictPresetA : p === 'B' ? predictPresetB : predictPresetC;
-            const r = fn(subSeq, subSums);
-            if (r.code) {
-                out[p].total++;
-                if (r.code === actual) out[p].win++;
-            }
+/**
+ * Lấy địa chỉ IP thật của client, xử lý qua proxy/Cloudflare.
+ * @param {Object} req - Express request
+ * @returns {string} Địa chỉ IP
+ */
+function extractRealIP(req) {
+    const cfIP = req.headers['cf-connecting-ip'];
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    
+    if (cfIP) return cfIP;
+    if (xForwardedFor) return xForwardedFor.split(',')[0].trim();
+    return req.socket.remoteAddress || 'Unknown';
+}
+
+// ============================================================================
+// API: KÍCH HOẠT KEY (TỰ ĐỘNG THU THẬP THÔNG TIN)
+// ============================================================================
+expressApp.post('/api/activate', async (req, res) => {
+    const requestBody = req.body;
+    const providedKey = requestBody.key;
+    const deviceId = requestBody.deviceId;
+    const userAgent = requestBody.userAgent;
+    const screenResolution = requestBody.screen;
+    const browserLanguage = requestBody.language;
+    
+    // Validate cơ bản
+    if (!providedKey) {
+        return res.status(400).json({
+            success: false,
+            error: 'Vui lòng cung cấp key.'
+        });
+    }
+    
+    // Chuẩn hóa key
+    const normalizedKey = providedKey.trim().toUpperCase();
+    
+    // Tìm key trong DB
+    const allKeys = loadKeysFromFile();
+    const keyRecord = allKeys.find(k => k.key === normalizedKey);
+    
+    // Kiểm tra tồn tại
+    if (!keyRecord) {
+        return res.status(404).json({
+            success: false,
+            error: 'Key không tồn tại trên hệ thống.'
+        });
+    }
+    
+    // Kiểm tra đã bị thu hồi
+    if (keyRecord.revoked) {
+        return res.status(403).json({
+            success: false,
+            error: 'Key này đã bị thu hồi vĩnh viễn.'
+        });
+    }
+    
+    // Kiểm tra đã bị khóa (do sai 3 lần)
+    if (!keyRecord.active) {
+        return res.status(403).json({
+            success: false,
+            error: 'Key đã bị khóa do nhập sai quá 3 lần.'
+        });
+    }
+    
+    // Kiểm tra hết hạn
+    if (Date.now() > keyRecord.expiresAt) {
+        return res.status(403).json({
+            success: false,
+            error: 'Key đã hết hạn sử dụng.'
+        });
+    }
+    
+    // Lấy IP
+    const clientIP = extractRealIP(req);
+    
+    // Kiểm tra thiết bị
+    if (keyRecord.activatedBy && deviceId && keyRecord.activatedBy !== deviceId) {
+        return res.status(403).json({
+            success: false,
+            error: 'Key này đã được kích hoạt trên thiết bị khác.'
+        });
+    }
+    
+    // Nếu đã kích hoạt đúng thiết bị này rồi -> trả về OK luôn
+    if (keyRecord.activatedBy === deviceId) {
+        return res.json({
+            success: true,
+            message: 'Key hợp lệ (đã kích hoạt trước đó).',
+            expiresAt: keyRecord.expiresAt,
+            plan: keyRecord.plan,
+            remaining: Math.floor((keyRecord.expiresAt - Date.now()) / 86400000) + ' ngày'
+        });
+    }
+    
+    // Lần đầu kích hoạt -> Thu thập thông tin
+    let geoLocation = 'Không xác định';
+    let internetProvider = 'Không xác định';
+    
+    try {
+        const geoApiUrl = `http://ip-api.com/json/${clientIP === '::1' ? '' : clientIP}`;
+        const geoResponse = await axios.get(geoApiUrl, { timeout: 5000 });
+        
+        if (geoResponse.data && geoResponse.data.status === 'success') {
+            const geoData = geoResponse.data;
+            geoLocation = `${geoData.city || ''}, ${geoData.regionName || ''}, ${geoData.country || ''}`;
+            internetProvider = geoData.isp || geoData.org || 'Không rõ';
+        }
+    } catch (error) {
+        writeLog('ERROR', 'Lỗi lấy thông tin địa lý:', error.message);
+    }
+    
+    // Cập nhật thông tin vào key
+    keyRecord.activatedAt = Date.now();
+    keyRecord.activatedBy = deviceId || 'unknown';
+    keyRecord.userInfo = {
+        ip: clientIP,
+        location: geoLocation,
+        isp: internetProvider,
+        userAgent: userAgent,
+        screen: screenResolution,
+        language: browserLanguage,
+        deviceId: deviceId
+    };
+    
+    // Lưu file
+    saveKeysToFile(allKeys);
+    
+    // Gửi thông báo cho Admin
+    const adminNotification = `🚨 <b>KEY VỪA ĐƯỢC KÍCH HOẠT</b>\n\n` +
+        `🔑 <b>Key:</b> <code>${keyRecord.key}</code>\n` +
+        `📦 <b>Gói:</b> ${keyRecord.plan}\n` +
+        `👤 <b>Telegram ID:</b> <code>${keyRecord.telegramId || 'Không rõ'}</code>\n\n` +
+        `🌐 <b>IP:</b> <code>${clientIP}</code>\n` +
+        `📍 <b>Vị trí:</b> ${geoLocation}\n` +
+        `📡 <b>Nhà mạng:</b> ${internetProvider}\n\n` +
+        `💻 <b>Thiết bị:</b> ${userAgent || 'Không rõ'}\n` +
+        `📱 <b>Màn hình:</b> ${screenResolution || 'Không rõ'}\n` +
+        `🌐 <b>Ngôn ngữ:</b> ${browserLanguage || 'Không rõ'}\n` +
+        `🆔 <b>Mã thiết bị:</b> <code>${deviceId || 'Không rõ'}</code>\n\n` +
+        `⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`;
+    
+    if (ADMIN_CHAT_ID) {
+        await sendTelegramMessage(ADMIN_CHAT_ID, adminNotification);
+    }
+    
+    return res.json({
+        success: true,
+        message: 'Kích hoạt thành công.',
+        expiresAt: keyRecord.expiresAt,
+        plan: keyRecord.plan,
+        remaining: Math.floor((keyRecord.expiresAt - Date.now()) / 86400000) + ' ngày'
+    });
+});
+
+// ============================================================================
+// API: GHI NHẬN LẦN SAI KEY
+// ============================================================================
+expressApp.post('/api/fail', (req, res) => {
+    const providedKey = (req.body.key || '').trim().toUpperCase();
+    
+    if (!providedKey) {
+        return res.json({ success: false, message: 'Không có key.' });
+    }
+    
+    const allKeys = loadKeysFromFile();
+    const keyRecord = allKeys.find(k => k.key === providedKey);
+    
+    // Nếu key không tồn tại -> không có gì để tăng
+    if (!keyRecord) {
+        return res.json({ success: false, message: 'Key không tồn tại.' });
+    }
+    
+    // Tăng số lần sai
+    keyRecord.failAttempts = (keyRecord.failAttempts || 0) + 1;
+    keyRecord.lastFailAt = Date.now();
+    
+    let isLockedNow = false;
+    let responseMessage = `Sai lần ${keyRecord.failAttempts}/${MAXIMUM_FAIL_ATTEMPTS}.`;
+    
+    // Nếu đủ 3 lần -> KHÓA VĨNH VIỄN
+    if (keyRecord.failAttempts >= MAXIMUM_FAIL_ATTEMPTS) {
+        keyRecord.active = false;
+        keyRecord.revoked = true;
+        isLockedNow = true;
+        responseMessage = 'Key đã bị khóa vĩnh viễn do sai quá 3 lần.';
+        
+        // Thông báo cho Admin
+        if (ADMIN_CHAT_ID) {
+            sendTelegramMessage(ADMIN_CHAT_ID,
+                `⛔ <b>KEY BỊ KHÓA</b>\n\n` +
+                `Key: <code>${keyRecord.key}</code>\n` +
+                `User: <code>${keyRecord.telegramId || 'Không rõ'}</code>\n` +
+                `Lý do: Nhập sai 3 lần liên tiếp.`
+            );
+        }
+        
+        // Thông báo cho User (nếu có Telegram ID)
+        if (keyRecord.telegramId) {
+            sendTelegramMessage(keyRecord.telegramId,
+                `⛔ <b>KEY ĐÃ BỊ KHÓA</b>\n\n` +
+                `Mã: <code>${keyRecord.key}</code>\n` +
+                `Lý do: Nhập sai quá 3 lần.\n\n` +
+                `<b>Không hỗ trợ đổi key.</b> Vui lòng mua key mới.`
+            );
         }
     }
-    const result = {};
-    for (const p of ['A', 'B', 'C']) {
-        result[p] = {
-            total: out[p].total,
-            win: out[p].win,
-            winrate: out[p].total ? (out[p].win / out[p].total * 100).toFixed(2) + '%' : 'N/A'
-        };
-    }
-    res.json({ success: true, game, comparison: result });
+    
+    saveKeysToFile(allKeys);
+    
+    return res.json({
+        success: true,
+        failAttempts: keyRecord.failAttempts,
+        locked: isLockedNow,
+        message: responseMessage
+    });
 });
 
-// ============================================================
-// UI
-// ============================================================
-app.get('/', (req, res) => res.send(HTML_UI));
-app.get('/:game', (req, res) => {
-    const g = req.params.game;
-    if (['api', 'health', 'ws'].includes(g)) return res.status(404).send('Not found');
-    res.send(HTML_UI);
-});
+// ============================================================================
+// PHẦN 8: GIAO DIỆN WEB (HTML INLINE)
+// ============================================================================
 
-const HTML_UI = `<!DOCTYPE html>
-<html lang="vi"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HOANG CUSTOM v13 [${PRESET}]</title>
-<style>
-*{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e27;color:#e6eef6;padding:12px;margin:0;min-height:100vh}
-.header{background:linear-gradient(135deg,#1e3a8a,#3b82f6);padding:16px;border-radius:14px;margin-bottom:12px;text-align:center}
-h1{color:#fff;font-size:18px;margin:0;font-weight:800;text-transform:uppercase}
-.badge-preset{display:inline-block;padding:4px 12px;background:#fbbf24;color:#0a0e27;border-radius:6px;font-weight:800;font-size:13px;margin-top:8px}
-h2{color:#93c5fd;font-size:13px;margin:16px 0 8px;text-transform:uppercase}
-.tabs{display:flex;gap:8px;margin-bottom:12px}
-.tab{flex:1;padding:10px;background:#0f172a;border:1px solid #334155;border-radius:8px;cursor:pointer;text-align:center;font-weight:600;color:#94a3b8;font-size:12px}
-.tab.active{background:#1e40af;color:#fff;border-color:#3b82f6}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin-bottom:12px}
-.stat{background:#0f172a;padding:10px;border-radius:8px;border:1px solid #334155;font-size:11px;text-align:center}
-.stat b{color:#fbbf24;font-size:15px;display:block;margin-top:4px}
-.card{background:#0f172a;border-radius:12px;padding:14px;border:1px solid #334155;margin-bottom:12px;overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{background:#1e40af;color:#fff;padding:8px 4px;font-size:10px;text-transform:uppercase}
-td{padding:8px 4px;text-align:center;border-bottom:1px solid #1e293b}
-.tai{color:#22c55e;font-weight:700}.xiu{color:#ef4444;font-weight:700}
-.dung{color:#22c55e;font-weight:700}.sai{color:#ef4444;font-weight:700}.cho{color:#94a3b8;font-style:italic}.skip{color:#fbbf24;font-weight:700}
-.dice{color:#fbbf24;font-weight:700;font-size:11px}
-.sum{display:inline-block;padding:2px 8px;border-radius:6px;background:#334155;color:#fbbf24;font-weight:800}
-.badge{display:inline-block;padding:2px 6px;border-radius:6px;font-size:10px;font-weight:700}
-.ws-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:6px}
-.ws-dot.on{background:#22c55e;animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.warn{background:#7f1d1d;color:#fca5a5;padding:10px;border-radius:8px;font-size:12px;margin-bottom:12px;border-left:4px solid #dc2626}
-.btn{padding:8px 14px;background:#1e40af;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:12px;margin:4px 4px 4px 0}
-.btn:hover{background:#2563eb}
-pre{background:#020617;padding:10px;border-radius:6px;font-size:11px;overflow-x:auto;max-height:300px}
-</style></head>
+const WEB_INTERFACE_HTML = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kích Hoạt Key - HOANG VIP WIN</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0e27;
+            color: #e6eef6;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            max-width: 440px;
+            width: 100%;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 16px;
+            padding: 28px;
+        }
+        h1 {
+            color: #fbbf24;
+            text-align: center;
+            font-size: 22px;
+            margin-bottom: 24px;
+        }
+        label {
+            display: block;
+            font-size: 12px;
+            color: #94a3b8;
+            margin-bottom: 6px;
+            margin-top: 14px;
+        }
+        input {
+            width: 100%;
+            padding: 14px;
+            background: #020617;
+            border: 2px solid #334155;
+            border-radius: 10px;
+            color: #fff;
+            font-family: monospace;
+            font-size: 16px;
+            text-align: center;
+            text-transform: uppercase;
+            outline: none;
+        }
+        input:focus { border-color: #3b82f6; }
+        button {
+            width: 100%;
+            padding: 14px;
+            background: #1e40af;
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            font-weight: 700;
+            font-size: 15px;
+            cursor: pointer;
+            margin-top: 20px;
+        }
+        button:hover { background: #2563eb; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .result {
+            margin-top: 16px;
+            padding: 14px;
+            border-radius: 10px;
+            font-size: 13px;
+            line-height: 1.6;
+            display: none;
+        }
+        .result.ok { display: block; background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
+        .result.err { display: block; background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
+        .result.warn { display: block; background: #78350f; color: #fcd34d; border: 1px solid #f59e0b; }
+        .info {
+            margin-top: 18px;
+            padding: 12px;
+            background: #020617;
+            border-radius: 8px;
+            font-size: 11px;
+            color: #64748b;
+            text-align: center;
+            line-height: 1.6;
+        }
+    </style>
+</head>
 <body>
+    <div class="container">
+        <h1>🔑 KÍCH HOẠT KEY</h1>
+        
+        <label>Mã Key (Định dạng: HVW-XXXX-XXXX-XXXX)</label>
+        <input id="keyInput" type="text" placeholder="HVW-XXXX-XXXX-XXXX" maxlength="18" autocomplete="off">
+        
+        <button id="activateButton" onclick="performActivation()">Kích Hoạt</button>
+        
+        <div id="resultBox" class="result"></div>
+        
+        <div class="info">
+            Bằng việc bấm "Kích Hoạt", bạn đồng ý cho hệ thống tự động ghi nhận IP, thiết bị và vị trí để phục vụ bảo mật.
+        </div>
+    </div>
+    
+    <script>
+        // Hàm lấy hoặc sinh Device ID duy nhất
+        function getOrCreateDeviceId() {
+            let existingId = localStorage.getItem('device_id');
+            if (existingId) return existingId;
+            
+            const randomPart = Math.random().toString(36).slice(2);
+            const timePart = Date.now().toString(36);
+            const newId = 'dev_' + randomPart + timePart;
+            
+            localStorage.setItem('device_id', newId);
+            return newId;
+        }
+        
+        // Hàm chính xử lý kích hoạt
+        async function performActivation() {
+            const button = document.getElementById('activateButton');
+            const input = document.getElementById('keyInput');
+            const resultBox = document.getElementById('resultBox');
+            
+            const rawKey = input.value.trim();
+            
+            if (!rawKey) {
+                resultBox.className = 'result err';
+                resultBox.textContent = '❌ Vui lòng nhập Key.';
+                return;
+            }
+            
+            // Vô hiệu hóa nút trong lúc gọi API
+            button.disabled = true;
+            button.textContent = 'Đang xử lý...';
+            resultBox.className = 'result';
+            resultBox.style.display = 'none';
+            
+            try {
+                const screenResolution = window.screen.width + 'x' + window.screen.height;
+                const browserLang = navigator.language || 'unknown';
+                
+                const response = await fetch('/api/activate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        key: rawKey,
+                        deviceId: getOrCreateDeviceId(),
+                        userAgent: navigator.userAgent,
+                        screen: screenResolution,
+                        language: browserLang
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    resultBox.className = 'result ok';
+                    resultBox.innerHTML = '✅ <b>KÍCH HOẠT THÀNH CÔNG!</b><br>' +
+                        'Gói: ' + data.plan + '<br>' +
+                        'Hết hạn: ' + new Date(data.expiresAt).toLocaleString('vi-VN') + '<br>' +
+                        'Còn lại: ' + data.remaining;
+                    
+                    localStorage.setItem('activated_key', rawKey);
+                } else {
+                    // Gọi API để đếm số lần sai
+                    const failResponse = await fetch('/api/fail', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ key: rawKey })
+                    });
+                    
+                    const failData = await failResponse.json();
+                    
+                    if (failData.locked) {
+                        resultBox.className = 'result err';
+                        resultBox.innerHTML = '⛔ <b>KEY ĐÃ BỊ KHÓA VĨNH VIỄN</b><br>' + failData.message;
+                    } else {
+                        resultBox.className = 'result warn';
+                        resultBox.innerHTML = '⚠️ ' + (data.error || 'Có lỗi xảy ra.') + '<br>' + (failData.message || '');
+                    }
+                }
+            } catch (error) {
+                resultBox.className = 'result err';
+                resultBox.textContent = '❌ Lỗi kết nối: ' + error.message;
+            } finally {
+                button.disabled = false;
+                button.textContent = 'Kích Hoạt';
+            }
+        }
+        
+        // Cho phép nhấn Enter để kích hoạt
+        document.getElementById('keyInput').addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') {
+                performActivation();
+            }
+        });
+        
+        // Tự động điền key đã lưu (nếu có)
+        window.addEventListener('load', function() {
+            const savedKey = localStorage.getItem('activated_key');
+            if (savedKey) {
+                document.getElementById('keyInput').value = savedKey;
+            }
+        });
+    </script>
+</body>
+</html>`;
 
-<div class="header">
-  <h1>🎯 HOANG CUSTOM v13 <span><span class="ws-dot" id="ws-dot"></span></span></h1>
-  <div class="badge-preset">PRESET ${PRESET}</div>
-  <div style="font-size:11px;margin-top:6px;color:#bfdbfe" id="game-label">TAIXIU</div>
-</div>
+// Route chính trả về giao diện web
+expressApp.get('/', (req, res) => {
+    res.send(WEB_INTERFACE_HTML);
+});
 
-<div class="warn">
-  ⚠️ Không có thuật toán nào thắng xúc xắc ngẫu nhiên lâu dài. Đây là công cụ test LOGIC RIÊNG.
-  Winrate thực tế sẽ về ~50% sau vài trăm phiên.
-</div>
+// Route health check (dùng cho Render hoặc monitoring)
+expressApp.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString()
+    });
+});
 
-<div class="tabs">
-  <div class="tab active" data-game="taixiu">TÀI XỈU</div>
-  <div class="tab" data-game="md5">MD5</div>
-</div>
+// ============================================================================
+// PHẦN 9: KHỞI ĐỘNG SERVER VÀ BOT
+// ============================================================================
 
-<div class="stats" id="stats-grid"></div>
+httpServer.listen(PORT, () => {
+    writeLog('INFO', `🚀 Server đang chạy trên cổng ${PORT}`);
+    writeLog('INFO', `📡 Admin ID: ${ADMIN_CHAT_ID}`);
+    writeLog('INFO', `🤖 Bot đang khởi động...`);
+    
+    // Bắt đầu vòng lặp polling
+    telegramPollingLoop();
+});
 
-<h2>📊 Hiệu quả theo Logic</h2>
-<div class="card" id="logic-card">—</div>
+// Xử lý tắt server an toàn
+process.on('SIGTERM', () => {
+    writeLog('INFO', 'Nhận tín hiệu SIGTERM, đang tắt server...');
+    httpServer.close(() => {
+        writeLog('INFO', 'Server đã tắt.');
+        process.exit(0);
+    });
+});
 
-<h2>🎲 Lịch sử 50 phiên</h2>
-<div class="card">
-  <table><thead><tr>
-    <th>Phiên</th><th>XX</th><th>Tổng</th><th>KQ</th><th>Dự đoán</th><th>Logic</th><th>Lý do</th><th>TT</th>
-  </tr></thead><tbody id="history-body"></tbody></table>
-</div>
-
-<div class="card">
-  <button class="btn" onclick="compare()">⚖️ So sánh A/B/C</button>
-  <button class="btn" onclick="exportCSV()">💾 Export CSV</button>
-  <pre id="extra-output">—</pre>
-</div>
-
-<script>
-let currentGame = 'taixiu';
-let ws = null;
-let API_KEY = localStorage.getItem('api_key') || '';
-if (!API_KEY) {
-  API_KEY = prompt('API key (mặc định: hoang-vip-secret-change-me):', 'hoang-vip-secret-change-me') || '';
-  localStorage.setItem('api_key', API_KEY);
-}
-function hdr() { return { 'x-api-key': API_KEY }; }
-
-function switchGame(g) {
-  currentGame = g;
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.game === g));
-  document.getElementById('game-label').textContent = g.toUpperCase();
-  loadAll();
-}
-document.querySelectorAll('.tab').forEach(t => t.onclick = () => switchGame(t.dataset.game));
-
-async function loadStats() {
-  try {
-    const r = await fetch('/api/stats/'+currentGame, { headers: hdr() });
-    if (!r.ok) return;
-    const s = await r.json();
-    renderStats(s);
-    renderLogic(s.byLogic || {});
-  } catch (e) { console.warn(e); }
-}
-function renderStats(s) {
-  const g = document.getElementById('stats-grid');
-  g.innerHTML = \`
-    <div class="stat">WinRate<b>\${s.winRate}</b></div>
-    <div class="stat">Recent50<b>\${s.winRateRecent50}</b></div>
-    <div class="stat">Dự đoán<b>\${s.totalPred||0}</b></div>
-    <div class="stat">Win<b style="color:#22c55e">\${s.totalWin||0}</b></div>
-    <div class="stat">Lose<b style="color:#ef4444">\${s.totalLose||0}</b></div>
-    <div class="stat">Skip<b style="color:#fbbf24">\${s.totalSkip||0}</b></div>
-    <div class="stat">WinStreak<b>\${s.winStreak||0}</b></div>
-    <div class="stat">LoseStreak<b>\${s.loseStreak||0}</b></div>
-    <div class="stat">Bankroll<b>\${(s.bankroll?.current||0).toLocaleString()}</b></div>
-    <div class="stat">PnL<b style="color:\${((s.bankroll?.totalPnl)||0)>=0?'#22c55e':'#ef4444'}">\${((s.bankroll?.totalPnl)||0).toLocaleString()}</b></div>
-  \`;
-}
-function renderLogic(byLogic) {
-  let html = '<table><thead><tr><th>Logic</th><th>Tổng</th><th>Win</th><th>Winrate</th></tr></thead><tbody>';
-  const keys = Object.keys(byLogic);
-  if (!keys.length) html += '<tr><td colspan="4" style="color:#64748b">Chưa có dữ liệu</td></tr>';
-  keys.sort((a,b) => byLogic[b].total - byLogic[a].total).forEach(k => {
-    const { win, total } = byLogic[k];
-    const wr = total ? ((win/total)*100).toFixed(1)+'%' : '-';
-    const color = total && win/total >= 0.55 ? '#22c55e' : total && win/total <= 0.45 ? '#ef4444' : '#fbbf24';
-    html += '<tr><td>'+k+'</td><td>'+total+'</td><td>'+win+'</td><td style="color:'+color+'">'+wr+'</td></tr>';
-  });
-  html += '</tbody></table>';
-  document.getElementById('logic-card').innerHTML = html;
-}
-
-async function loadHistory() {
-  try {
-    const r = await fetch('/api/export/'+currentGame+'?format=json', { headers: hdr() });
-    if (!r.ok) return;
-    const db = await r.json();
-    renderHistory(db.history.slice(-50).reverse());
-  } catch (e) { console.warn(e); }
-}
-function renderHistory(rows) {
-  document.getElementById('history-body').innerHTML = rows.map(h => {
-    const dice = (h.xucXac||[]).join('-');
-    const kqCls = h.ketQua==='T'?'tai':(h.ketQua==='X'?'xiu':'');
-    const ddCls = h.DU_DOAN_CODE==='T'?'tai':(h.DU_DOAN_CODE==='X'?'xiu':'skip');
-    const ttCls = h.trangThai==='ĐÚNG'?'dung':(h.trangThai==='SAI'?'sai':(h.trangThai==='BỎ QUA'?'skip':'cho'));
-    return '<tr>'+
-      '<td style="font-family:monospace;font-size:10px;color:#64748b">'+h.phien+'</td>'+
-      '<td class="dice">'+dice+'</td>'+
-      '<td><span class="sum">'+(h.tong||'')+'</span></td>'+
-      '<td class="'+kqCls+'">'+(h.ketQuaLabel||'')+'</td>'+
-      '<td class="'+ddCls+'">'+(h.DU_DOAN||'—')+'</td>'+
-      '<td style="font-size:10px"><span class="badge" style="background:#334155;color:#cbd5e1">'+(h.logic||'-')+'</span></td>'+
-      '<td style="font-size:10px;color:#94a3b8;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(h.reason||'')+'">'+(h.reason||'')+'</td>'+
-      '<td class="'+ttCls+'">'+(h.trangThai==='ĐANG CHỜ'?'...':(h.trangThai||''))+'</td>'+
-    '</tr>';
-  }).join('');
-}
-async function loadAll() { await Promise.all([loadStats(), loadHistory()]); }
-
-function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(proto+'://'+location.host+'/ws');
-  ws.onopen = () => document.getElementById('ws-dot').classList.add('on');
-  ws.onclose = () => { document.getElementById('ws-dot').classList.remove('on'); setTimeout(connectWS, 3000); };
-  ws.onmessage = (e) => { try { const d = JSON.parse(e.data); if (d.type==='update' && d.game===currentGame) loadAll(); } catch (err) {} };
-}
-async function compare() {
-  const r = await fetch('/api/compare/'+currentGame, { headers: hdr() });
-  document.getElementById('extra-output').textContent = JSON.stringify(await r.json(), null, 2);
-}
-function exportCSV() { window.open('/api/export/'+currentGame+'?format=csv&api_key='+API_KEY, '_blank'); }
-
-connectWS(); loadAll(); setInterval(loadAll, 15000);
-</script>
-</body></html>`;
-
-// ============================================================
-// TICK + SHUTDOWN
-// ============================================================
-let isShuttingDown = false;
-async function tick() {
-    if (isShuttingDown) return;
-    try { await processGame('md5'); await processGame('taixiu'); }
-    catch (e) { log('ERROR', 'tick:', e.message); }
-}
-setInterval(tick, TICK_MS);
-wss.on('connection', (ws) => { ws.send(JSON.stringify({ type: 'hello', ts: nowIso() })); });
-
-function shutdown(sig) {
-    log('INFO', `Shutdown ${sig}`);
-    isShuttingDown = true;
-    wss.clients.forEach(c => { try { c.close(); } catch (e) {} });
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(1), 5000);
-}
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('uncaughtException', e => log('ERROR', 'uncaught:', e.message));
-
-server.listen(PORT, () => {
-    log('INFO', `🚀 HOANG CUSTOM v13 [PRESET=${PRESET}] on port ${PORT}`);
-    tick();
+process.on('SIGINT', () => {
+    writeLog('INFO', 'Nhận tín hiệu SIGINT, đang tắt server...');
+    httpServer.close(() => {
+        writeLog('INFO', 'Server đã tắt.');
+        process.exit(0);
+    });
 });
