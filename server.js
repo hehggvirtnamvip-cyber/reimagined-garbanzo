@@ -1,11 +1,8 @@
 'use strict';
 
 // ============================================================
-// SERVER.JS — v19 ULTIMATE FULL STACK
+// SERVER.JS — v19 ULTIMATE FULL STACK (RENDER OPTIMIZED)
 // Node.js >= 18 | npm i express axios
-// Features: 3000+ Patterns + 12 Special Cầu + Live UI v2
-//          + Telegram Full Alert + Multi-Shield + Meta-Learning
-//          + Chart + API mở rộng + Circuit Breaker
 // ============================================================
 
 const express = require('express');
@@ -26,9 +23,12 @@ app.use(express.json());
 // ==========================================
 // CONFIG
 // ==========================================
-const PORT = process.env.PORT || 3000;
+// Ép kiểu Number cho PORT để tránh lỗi Render truyền String
+const PORT = Number(process.env.PORT) || 3000;
 const API_MD5 = 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau';
 const API_TX  = 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau';
+
+// Hỗ trợ Render Disk (nếu có), mặc định lưu ở thư mục hiện tại
 const DB_DIR  = process.env.DB_DIR || __dirname;
 const TICK_MS = 5000;
 const MAX_HIST = 2000;
@@ -36,7 +36,9 @@ const MAX_HIST = 2000;
 const TG_TOKEN = process.env.TG_TOKEN || '';
 const TG_CHAT  = process.env.TG_CHAT  || '';
 
-if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+if (!fs.existsSync(DB_DIR)) {
+    try { fs.mkdirSync(DB_DIR, { recursive: true }); } catch (e) {}
+}
 
 // ==========================================
 // UTILS
@@ -58,31 +60,27 @@ const getResult = item => {
 };
 
 // ==========================================
-// 1. AUTO-GENERATE 3000+ PATTERNS (có trọng số)
+// 1. AUTO-GENERATE 3000+ PATTERNS
 // ==========================================
 const MATRIX = [];
 const addPattern = (id, str, p, weight = 1) => MATRIX.push({ id, str, p, w: weight });
 
-// --- Streak bet (weight cao) ---
 for (let l = 3; l <= 12; l++) {
     addPattern(`BET_T_${l}`, 'T'.repeat(l), 'T', l >= 5 ? 1.2 : 1);
     addPattern(`BET_X_${l}`, 'X'.repeat(l), 'X', l >= 5 ? 1.2 : 1);
 }
-// --- Alternating ---
 for (let l = 4; l <= 12; l++) {
     let t = '', x = '';
     for (let i = 0; i < l; i++) { t += i % 2 ? 'X' : 'T'; x += i % 2 ? 'T' : 'X'; }
     addPattern(`ALT_${l}`, t, 'X', 1.1);
     addPattern(`ALT_${l}_X`, x, 'T', 1.1);
 }
-// --- Block repeat ---
 for (let b = 2; b <= 5; b++) {
     for (let r = 2; r <= 4; r++) {
         addPattern(`BLK_${b}_${r}_T`, ('T'.repeat(b) + 'X'.repeat(b)).repeat(r), 'X', 1.15);
         addPattern(`BLK_${b}_${r}_X`, ('X'.repeat(b) + 'T'.repeat(b)).repeat(r), 'T', 1.15);
     }
 }
-// --- Ramp (tăng dần) ---
 for (let a = 1; a <= 3; a++) {
     for (let b = a + 1; b <= 5; b++) {
         for (let c = b + 1; c <= 7; c++) {
@@ -93,12 +91,10 @@ for (let a = 1; a <= 3; a++) {
         }
     }
 }
-// --- Cầu 3-2-1 / 1-2-3 ---
 for (let l = 2; l <= 5; l++) {
     addPattern(`DEC_${l}`, ('T'.repeat(l) + 'X'.repeat(l - 1) + 'T'.repeat(Math.max(1, l - 2))), 'X', 1.1);
     addPattern(`INC_${l}`, ('X'.repeat(l) + 'T'.repeat(l - 1) + 'X'.repeat(Math.max(1, l - 2))), 'T', 1.1);
 }
-// --- Grammar fill có kiểm soát (1500 patterns) ---
 const seen = new Set(MATRIX.map(m => m.str));
 let gen = 0;
 while (gen < 1500) {
@@ -114,14 +110,13 @@ while (gen < 1500) {
 }
 
 // ==========================================
-// 2. SPECIAL CẦU MÔ — 12 LOẠI
+// 2. SPECIAL CẦU MÔ
 // ==========================================
 function checkSpecialPatterns(seq) {
     const n = seq.length;
     if (n < 6) return null;
     const last = seq[n - 1];
 
-    // RLE
     const rle = [];
     let cur = seq[0], len = 1;
     for (let i = 1; i < n; i++) {
@@ -133,11 +128,8 @@ function checkSpecialPatterns(seq) {
     const blocks = rle.map(b => b.len);
     const sz = blocks.slice(-3);
 
-    // 1. Cầu Gối
     if (sz.length === 3 && sz[0] >= 3 && sz[1] === 1 && sz[2] >= 3)
         return { name: 'Gối', code: flip(last), conf: 0.78 };
-
-    // 2. Cầu Bẻ
     if (rle.length >= 4) {
         const lastBlk = rle[rle.length - 1];
         const prev3 = rle.slice(-4, -1).map(b => b.len);
@@ -145,77 +137,56 @@ function checkSpecialPatterns(seq) {
         if (lastBlk.len >= avg * 2.5 && lastBlk.len >= 4)
             return { name: 'Bẻ', code: flip(last), conf: 0.75 };
     }
-
-    // 3. Cầu Nhảy Cóc
     if (blocks.length >= 4) {
         const [a, b, c, d] = blocks.slice(-4);
         if (a === c && b === d && a !== b)
             return { name: 'NhảyCóc', code: flip(last), conf: 0.72 };
     }
-
-    // 4. Cầu Xóc Đĩa
     if (blocks.length >= 5) {
         const s5 = blocks.slice(-5).join('-');
         if (['2-1-2-1-2', '1-2-1-2-1'].includes(s5))
             return { name: 'XócĐĩa', code: flip(last), conf: 0.77 };
     }
-
-    // 5. Cầu Nghiêng Giảm
     if (blocks.length >= 3) {
         const [a, b, c] = blocks.slice(-3);
         if (a > b && b > c) return { name: 'NghiêngGiảm', code: flip(last), conf: 0.7 };
     }
-
-    // 6. Cầu Nghiêng Tăng
     if (blocks.length >= 3) {
         const [a, b, c] = blocks.slice(-3);
         if (a < b && b < c) return { name: 'NghiêngTăng', code: flip(last), conf: 0.7 };
     }
-
-    // 7. Cầu Zic-Zac
     if (blocks.length >= 5) {
         const s5 = blocks.slice(-5).join('');
         if (s5 === '12121' || s5 === '21212')
             return { name: 'ZicZac', code: flip(last), conf: 0.74 };
     }
-
-    // 8. Cầu 3-2-1
     if (blocks.length >= 3) {
         const [a, b, c] = blocks.slice(-3);
         if (a === 3 && b === 2 && c === 1) return { name: 'Cầu321', code: flip(last), conf: 0.76 };
         if (a === 1 && b === 2 && c === 3) return { name: 'Cầu123', code: flip(last), conf: 0.76 };
     }
-
-    // 9. Cầu Đôi (2 block lớn liên tiếp)
     if (blocks.length >= 3) {
         const [a, b, c] = blocks.slice(-3);
         if (a >= 3 && b >= 3 && c === 1) return { name: 'CầuĐôi', code: flip(last), conf: 0.73 };
     }
-
-    // 10. Cầu Sóng (1-3-1-3)
     if (blocks.length >= 4) {
         const [a, b, c, d] = blocks.slice(-4);
         if (a === 1 && b === 3 && c === 1 && d === 3)
             return { name: 'CầuSóng', code: flip(last), conf: 0.75 };
     }
-
-    // 11. Cầu Kim Cương (block đối xứng 2-1-2)
     if (blocks.length >= 3) {
         const [a, b, c] = blocks.slice(-3);
         if (a === 2 && b === 1 && c === 2) return { name: 'KimCương', code: flip(last), conf: 0.72 };
     }
-
-    // 12. Cầu 4-4-4 (block đều)
     if (blocks.length >= 3) {
         const [a, b, c] = blocks.slice(-3);
         if (a === b && b === c && a >= 3) return { name: 'Đều', code: flip(last), conf: 0.71 };
     }
-
     return null;
 }
 
 // ==========================================
-// 3. STATE & DB (có Meta-Learning)
+// 3. STATE & DB
 // ==========================================
 function initDB() {
     return {
@@ -276,7 +247,6 @@ function predict(seq, sums, db, state) {
         feats.push({ name, code, pts, tag });
     };
 
-    // 1. MATRIX (3000+)
     let mc = 0;
     for (const rule of MATRIX) {
         if (seqStr.endsWith(rule.str)) {
@@ -290,11 +260,9 @@ function predict(seq, sums, db, state) {
         }
     }
 
-    // 2. SPECIAL CẦU
     const sp = checkSpecialPatterns(seq);
     if (sp) add('special', sp.code, sp.conf, sp.name);
 
-    // 3. N-GRAM (2→8)
     for (let l = 8; l >= 2; l--) {
         const k = seq.slice(-l).join('');
         const g = db.ngram[k];
@@ -307,7 +275,6 @@ function predict(seq, sums, db, state) {
         }
     }
 
-    // 4. MARKOV CHAIN
     if (seq.length >= 2) {
         const key = seq.slice(-2).join('');
         const m = db.markov[key];
@@ -318,19 +285,16 @@ function predict(seq, sums, db, state) {
         }
     }
 
-    // 5. SUM TREND
     if (sums.length >= 5) {
         const a = sums.slice(-5).reduce((x, y) => x + y, 0) / 5;
         if (a >= 13) add('sum', 'X', 0.65, 'SumCao');
         else if (a <= 8) add('sum', 'T', 0.65, 'SumThap');
     }
 
-    // 6. STREAK OVERRIDE (đảo sau streak dài)
     let streak = 1;
     for (let i = seq.length - 2; i >= 0; i--) { if (seq[i] === last) streak++; else break; }
     if (streak >= 6) add('streak', flip(last), 0.7, `DaoStreak${streak}`);
 
-    // 7. MULTI-SHIELD
     if (db.shield.T >= 2) { sT -= db.shield.T * 6; sX += db.shield.T * 6; }
     if (db.shield.X >= 2) { sX -= db.shield.X * 6; sT += db.shield.X * 6; }
 
@@ -340,7 +304,6 @@ function predict(seq, sums, db, state) {
     const code = sT >= sX ? 'T' : 'X';
     const rawConf = Math.max(sT, sX) / (sT + sX);
 
-    // CALIBRATION
     const bucket = Math.min(9, Math.floor(rawConf * 10));
     const cb = db.calibration.buckets[bucket];
     const calibFactor = cb.total >= 10 ? cb.hit / cb.total : 0.5;
@@ -348,9 +311,7 @@ function predict(seq, sums, db, state) {
 
     const topF = feats.filter(f => f.code === code).sort((a, b) => b.pts - a.pts).slice(0, 3).map(f => f.tag).join('+');
 
-    return {
-        code, label: topF || 'Fusion', conf, tiLe: fmtPct(conf), feats, state
-    };
+    return { code, label: topF || 'Fusion', conf, tiLe: fmtPct(conf), feats, state };
 }
 
 // ==========================================
@@ -399,7 +360,7 @@ function broadcastSSE(data) {
 }
 
 // ==========================================
-// 7. CIRCUIT BREAKER + RETRY
+// 7. CIRCUIT BREAKER
 // ==========================================
 const circuit = { md5: { fails: 0, until: 0 }, taixiu: { fails: 0, until: 0 } };
 
@@ -439,7 +400,6 @@ async function tick(game) {
         const sums = list.map(getSum).filter(s => s >= 3 && s <= 18);
         if (seq.length < 6) return;
 
-        // === CHẤM PHIÊN TRƯỚC ===
         const prev = db.hist[db.hist.length - 1];
         if (prev && prev.pd === sess && prev.tt === '...') {
             const act = getResult(latest);
@@ -456,13 +416,11 @@ async function tick(game) {
             }
             db.shield[prev.code] = ok ? 0 : db.shield[prev.code] + 1;
 
-            // Calibration update
             const bucket = Math.min(9, Math.floor(parseFloat(prev.tiLe) / 10));
             const cb = db.calibration.buckets[bucket];
             cb.total++;
             if (ok) cb.hit++;
 
-            // Online learning feats
             if (prev.feats) {
                 for (const f of prev.feats) {
                     if (f.name === 'mat') {
@@ -476,7 +434,6 @@ async function tick(game) {
                 }
             }
 
-            // N-Gram update
             for (let l = 2; l <= 8; l++) {
                 if (seq.length < l + 1) break;
                 const k = seq.slice(-l - 1, -1).join('');
@@ -484,7 +441,6 @@ async function tick(game) {
                 db.ngram[k][act === 'T' ? 't' : 'x']++;
             }
 
-            // Markov update
             if (seq.length >= 3) {
                 const mk = seq.slice(-3, -1).join('');
                 if (db.markov[mk]) db.markov[mk][act === 'T' ? 't' : 'x']++;
@@ -493,7 +449,6 @@ async function tick(game) {
             sendResult(game, prev, act, ok);
         }
 
-        // === DỰ ĐOÁN PHIÊN MỚI ===
         const state = getState(seq);
         const pred = predict(seq, sums, db, state);
 
@@ -506,7 +461,6 @@ async function tick(game) {
         if (db.hist.length > MAX_HIST) db.hist = db.hist.slice(-MAX_HIST);
         db.lastSess = sess;
 
-        // Daily counter
         const day = new Date().toISOString().slice(0, 10);
         if (!db.daily[day]) db.daily[day] = { pred: 0, win: 0 };
         if (prev) db.daily[day].pred++;
@@ -712,7 +666,11 @@ process.on('SIGINT', () => {
     process.exit(0);
 });
 
-app.listen(PORT, () => {
+// ==========================================
+// 12. START SERVER (FIX RENDER)
+// ==========================================
+// Thêm '0.0.0.0' để Render quét thấy port
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`🔥 Server v19 Ultimate running on port ${PORT}`);
     console.log(`   Patterns: ${MATRIX.length}`);
     console.log(`   Telegram: ${TG_TOKEN ? 'ON' : 'OFF'}`);
