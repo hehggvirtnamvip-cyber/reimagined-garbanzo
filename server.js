@@ -1,6 +1,7 @@
+'use strict';
 
 // ============================================================
-// SERVER.JS — v19 ULTIMATE FULL STACK (RENDER FIX V2)
+// SERVER.JS — v19 ULTIMATE FULL STACK (RENDER FIX V3 - PRIORITY LISTEN)
 // Node.js >= 18 | npm i express axios
 // ============================================================
 
@@ -22,7 +23,6 @@ app.use(express.json());
 // ==========================================
 // CẤU HÌNH PORT AN TOÀN CHO RENDER
 // ==========================================
-// Render yêu cầu bind 0.0.0.0 và dùng PORT do họ cấp (thường là 10000)
 const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
 const HOST = '0.0.0.0';
 
@@ -36,12 +36,10 @@ const MAX_HIST = 2000;
 const TG_TOKEN = process.env.TG_TOKEN || '';
 const TG_CHAT  = process.env.TG_CHAT  || '';
 
-// Đảm bảo thư mục DB tồn tại
 if (!fs.existsSync(DB_DIR)) {
     try { fs.mkdirSync(DB_DIR, { recursive: true }); } catch (e) {}
 }
 
-// Bắt lỗi toàn cục để Render không bị "im lặng" khi app crash
 process.on('uncaughtException', (err) => {
     console.error('🔥 UNCAUGHT EXCEPTION:', err);
 });
@@ -71,50 +69,53 @@ const getResult = item => {
 // ==========================================
 // 1. AUTO-GENERATE 3000+ PATTERNS
 // ==========================================
-const MATRIX = [];
-const addPattern = (id, str, p, weight = 1) => MATRIX.push({ id, str, p, w: weight });
+let MATRIX = [];
+function generatePatterns() {
+    MATRIX = [];
+    const addPattern = (id, str, p, weight = 1) => MATRIX.push({ id, str, p, w: weight });
 
-for (let l = 3; l <= 12; l++) {
-    addPattern(`BET_T_${l}`, 'T'.repeat(l), 'T', l >= 5 ? 1.2 : 1);
-    addPattern(`BET_X_${l}`, 'X'.repeat(l), 'X', l >= 5 ? 1.2 : 1);
-}
-for (let l = 4; l <= 12; l++) {
-    let t = '', x = '';
-    for (let i = 0; i < l; i++) { t += i % 2 ? 'X' : 'T'; x += i % 2 ? 'T' : 'X'; }
-    addPattern(`ALT_${l}`, t, 'X', 1.1);
-    addPattern(`ALT_${l}_X`, x, 'T', 1.1);
-}
-for (let b = 2; b <= 5; b++) {
-    for (let r = 2; r <= 4; r++) {
-        addPattern(`BLK_${b}_${r}_T`, ('T'.repeat(b) + 'X'.repeat(b)).repeat(r), 'X', 1.15);
-        addPattern(`BLK_${b}_${r}_X`, ('X'.repeat(b) + 'T'.repeat(b)).repeat(r), 'T', 1.15);
+    for (let l = 3; l <= 12; l++) {
+        addPattern(`BET_T_${l}`, 'T'.repeat(l), 'T', l >= 5 ? 1.2 : 1);
+        addPattern(`BET_X_${l}`, 'X'.repeat(l), 'X', l >= 5 ? 1.2 : 1);
     }
-}
-for (let a = 1; a <= 3; a++) {
-    for (let b = a + 1; b <= 5; b++) {
-        for (let c = b + 1; c <= 7; c++) {
-            if (a + b + c <= 12) {
-                addPattern(`RAMP_${a}${b}${c}`, 'T'.repeat(a) + 'X'.repeat(b) + 'T'.repeat(c), 'X', 1.05);
-                addPattern(`RAMP_${a}${b}${c}_X`, 'X'.repeat(a) + 'T'.repeat(b) + 'X'.repeat(c), 'T', 1.05);
+    for (let l = 4; l <= 12; l++) {
+        let t = '', x = '';
+        for (let i = 0; i < l; i++) { t += i % 2 ? 'X' : 'T'; x += i % 2 ? 'T' : 'X'; }
+        addPattern(`ALT_${l}`, t, 'X', 1.1);
+        addPattern(`ALT_${l}_X`, x, 'T', 1.1);
+    }
+    for (let b = 2; b <= 5; b++) {
+        for (let r = 2; r <= 4; r++) {
+            addPattern(`BLK_${b}_${r}_T`, ('T'.repeat(b) + 'X'.repeat(b)).repeat(r), 'X', 1.15);
+            addPattern(`BLK_${b}_${r}_X`, ('X'.repeat(b) + 'T'.repeat(b)).repeat(r), 'T', 1.15);
+        }
+    }
+    for (let a = 1; a <= 3; a++) {
+        for (let b = a + 1; b <= 5; b++) {
+            for (let c = b + 1; c <= 7; c++) {
+                if (a + b + c <= 12) {
+                    addPattern(`RAMP_${a}${b}${c}`, 'T'.repeat(a) + 'X'.repeat(b) + 'T'.repeat(c), 'X', 1.05);
+                    addPattern(`RAMP_${a}${b}${c}_X`, 'X'.repeat(a) + 'T'.repeat(b) + 'X'.repeat(c), 'T', 1.05);
+                }
             }
         }
     }
-}
-for (let l = 2; l <= 5; l++) {
-    addPattern(`DEC_${l}`, ('T'.repeat(l) + 'X'.repeat(l - 1) + 'T'.repeat(Math.max(1, l - 2))), 'X', 1.1);
-    addPattern(`INC_${l}`, ('X'.repeat(l) + 'T'.repeat(l - 1) + 'X'.repeat(Math.max(1, l - 2))), 'T', 1.1);
-}
-const seen = new Set(MATRIX.map(m => m.str));
-let gen = 0;
-while (gen < 1500) {
-    const len = 5 + Math.floor(Math.random() * 4);
-    let s = [Math.random() > 0.5 ? 'T' : 'X'];
-    for (let j = 1; j < len; j++) s.push(Math.random() > 0.55 ? flip(s[j - 1]) : s[j - 1]);
-    const str = s.join('');
-    if (!seen.has(str)) {
-        seen.add(str);
-        addPattern(`GEN_${str}`, str, flip(s[s.length - 1]), 0.8);
-        gen++;
+    for (let l = 2; l <= 5; l++) {
+        addPattern(`DEC_${l}`, ('T'.repeat(l) + 'X'.repeat(l - 1) + 'T'.repeat(Math.max(1, l - 2))), 'X', 1.1);
+        addPattern(`INC_${l}`, ('X'.repeat(l) + 'T'.repeat(l - 1) + 'X'.repeat(Math.max(1, l - 2))), 'T', 1.1);
+    }
+    const seen = new Set(MATRIX.map(m => m.str));
+    let gen = 0;
+    while (gen < 1500) {
+        const len = 5 + Math.floor(Math.random() * 4);
+        let s = [Math.random() > 0.5 ? 'T' : 'X'];
+        for (let j = 1; j < len; j++) s.push(Math.random() > 0.55 ? flip(s[j - 1]) : s[j - 1]);
+        const str = s.join('');
+        if (!seen.has(str)) {
+            seen.add(str);
+            addPattern(`GEN_${str}`, str, flip(s[s.length - 1]), 0.8);
+            gen++;
+        }
     }
 }
 
@@ -472,8 +473,6 @@ async function tick(game) {
     }
 }
 
-setInterval(() => { tick('md5'); tick('taixiu'); }, TICK_MS);
-
 // ==========================================
 // 9. API ROUTES
 // ==========================================
@@ -501,7 +500,6 @@ app.get('/api/health', (req, res) => res.json({
     clients: sseClients.length, patterns: MATRIX.length
 }));
 
-// (Giữ nguyên các API phụ như cũ nếu bạn cần)
 app.get('/api/predict/:game', (req, res) => {
     if (!['md5', 'taixiu'].includes(req.params.game)) return res.status(400).json({ error: 'invalid' });
     const db = loadDB(req.params.game);
@@ -519,7 +517,6 @@ app.get('/api/stream', (req, res) => {
     req.on('close', () => { sseClients = sseClients.filter(c => c.id !== client.id); });
 });
 
-// Trang chơi game
 app.get('/:game', (req, res) => {
     const game = req.params.game;
     if (!['md5', 'taixiu'].includes(game)) return res.status(404).send('Not found');
@@ -624,14 +621,18 @@ es.onmessage = (e) => {
 });
 
 // ==========================================
-// 10. KHỞI ĐỘNG SERVER
+// 10. KHỞI ĐỘNG SERVER VÀ LẮNG NGHE PORT TRƯỚC
 // ==========================================
 app.listen(PORT, HOST, () => {
     console.log(`🔥 Server v19 Ultimate running on http://${HOST}:${PORT}`);
+    
+    // Chạy tác vụ nặng SAU KHI đã listen thành công để Render không bị timeout
+    generatePatterns();
     console.log(`   Patterns: ${MATRIX.length}`);
     console.log(`   Telegram: ${TG_TOKEN ? 'ON' : 'OFF'}`);
     
-    // Chạy tick đầu tiên
+    // Bắt đầu vòng lặp tick sau khi mọi thứ đã sẵn sàng
     tick('md5'); 
     tick('taixiu');
+    setInterval(() => { tick('md5'); tick('taixiu'); }, TICK_MS);
 });
