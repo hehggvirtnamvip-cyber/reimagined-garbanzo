@@ -1,4 +1,3 @@
-'use strict';
 
 // ============================================================
 // SERVER.JS — v19 ULTIMATE FULL STACK (RENDER FIX V2)
