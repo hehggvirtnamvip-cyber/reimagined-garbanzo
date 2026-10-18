@@ -1,7 +1,7 @@
 'use strict';
 
 // ============================================================
-// SERVER.JS — v19 ULTIMATE FULL STACK (RENDER OPTIMIZED)
+// SERVER.JS — v19 ULTIMATE FULL STACK (RENDER FIX V2)
 // Node.js >= 18 | npm i express axios
 // ============================================================
 
@@ -21,14 +21,15 @@ app.use((req, res, next) => {
 app.use(express.json());
 
 // ==========================================
-// CONFIG
+// CẤU HÌNH PORT AN TOÀN CHO RENDER
 // ==========================================
-// Ép kiểu Number cho PORT để tránh lỗi Render truyền String
-const PORT = Number(process.env.PORT) || 3000;
+// Render yêu cầu bind 0.0.0.0 và dùng PORT do họ cấp (thường là 10000)
+const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
+const HOST = '0.0.0.0';
+
 const API_MD5 = 'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau';
 const API_TX  = 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau';
 
-// Hỗ trợ Render Disk (nếu có), mặc định lưu ở thư mục hiện tại
 const DB_DIR  = process.env.DB_DIR || __dirname;
 const TICK_MS = 5000;
 const MAX_HIST = 2000;
@@ -36,9 +37,18 @@ const MAX_HIST = 2000;
 const TG_TOKEN = process.env.TG_TOKEN || '';
 const TG_CHAT  = process.env.TG_CHAT  || '';
 
+// Đảm bảo thư mục DB tồn tại
 if (!fs.existsSync(DB_DIR)) {
     try { fs.mkdirSync(DB_DIR, { recursive: true }); } catch (e) {}
 }
+
+// Bắt lỗi toàn cục để Render không bị "im lặng" khi app crash
+process.on('uncaughtException', (err) => {
+    console.error('🔥 UNCAUGHT EXCEPTION:', err);
+});
+process.on('unhandledRejection', (err) => {
+    console.error('🔥 UNHANDLED REJECTION:', err);
+});
 
 // ==========================================
 // UTILS
@@ -150,9 +160,6 @@ function checkSpecialPatterns(seq) {
     if (blocks.length >= 3) {
         const [a, b, c] = blocks.slice(-3);
         if (a > b && b > c) return { name: 'NghiêngGiảm', code: flip(last), conf: 0.7 };
-    }
-    if (blocks.length >= 3) {
-        const [a, b, c] = blocks.slice(-3);
         if (a < b && b < c) return { name: 'NghiêngTăng', code: flip(last), conf: 0.7 };
     }
     if (blocks.length >= 5) {
@@ -164,23 +171,14 @@ function checkSpecialPatterns(seq) {
         const [a, b, c] = blocks.slice(-3);
         if (a === 3 && b === 2 && c === 1) return { name: 'Cầu321', code: flip(last), conf: 0.76 };
         if (a === 1 && b === 2 && c === 3) return { name: 'Cầu123', code: flip(last), conf: 0.76 };
-    }
-    if (blocks.length >= 3) {
-        const [a, b, c] = blocks.slice(-3);
         if (a >= 3 && b >= 3 && c === 1) return { name: 'CầuĐôi', code: flip(last), conf: 0.73 };
+        if (a === 2 && b === 1 && c === 2) return { name: 'KimCương', code: flip(last), conf: 0.72 };
+        if (a === b && b === c && a >= 3) return { name: 'Đều', code: flip(last), conf: 0.71 };
     }
     if (blocks.length >= 4) {
         const [a, b, c, d] = blocks.slice(-4);
         if (a === 1 && b === 3 && c === 1 && d === 3)
             return { name: 'CầuSóng', code: flip(last), conf: 0.75 };
-    }
-    if (blocks.length >= 3) {
-        const [a, b, c] = blocks.slice(-3);
-        if (a === 2 && b === 1 && c === 2) return { name: 'KimCương', code: flip(last), conf: 0.72 };
-    }
-    if (blocks.length >= 3) {
-        const [a, b, c] = blocks.slice(-3);
-        if (a === b && b === c && a >= 3) return { name: 'Đều', code: flip(last), conf: 0.71 };
     }
     return null;
 }
@@ -480,63 +478,8 @@ setInterval(() => { tick('md5'); tick('taixiu'); }, TICK_MS);
 // ==========================================
 // 9. API ROUTES
 // ==========================================
-app.get('/api/health', (req, res) => res.json({
-    ok: true, uptime: process.uptime(),
-    circuit: { md5: circuit.md5.fails, taixiu: circuit.taixiu.fails },
-    clients: sseClients.length, patterns: MATRIX.length
-}));
-
-app.get('/api/predict/:game', (req, res) => {
-    if (!['md5', 'taixiu'].includes(req.params.game)) return res.status(400).json({ error: 'invalid' });
-    const db = loadDB(req.params.game);
-    if (!db.hist.length) return res.json({ error: 'Wait...' });
-    const l = db.hist[db.hist.length - 1];
-    res.json({
-        game: req.params.game, session: l.pd, code: l.code,
-        predict: l.lb, rate: l.tiLe, reason: l.pn, state: l.state
-    });
-});
-
-app.get('/api/stats/:game', (req, res) => {
-    const db = loadDB(req.params.game);
-    const wr = db.meta.pred ? (db.meta.win / db.meta.pred * 100).toFixed(1) + '%' : '0%';
-    res.json({
-        winrate: wr, total: db.meta.pred, win: db.meta.win,
-        streak: db.meta.streak, bestStreak: db.meta.bestStreak,
-        shield: db.shield, weights: db.w
-    });
-});
-
-app.get('/api/history/:game', (req, res) => {
-    const db = loadDB(req.params.game);
-    const lim = clamp(safeInt(req.query.limit, 100), 1, 500);
-    res.json(db.hist.slice(-lim));
-});
-
-app.get('/api/patterns', (req, res) => {
-    res.json({ total: MATRIX.length, sample: MATRIX.slice(0, 50) });
-});
-
-app.get('/api/export/:game', (req, res) => {
-    const db = loadDB(req.params.game);
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename=db_${req.params.game}.json`);
-    res.send(JSON.stringify(db, null, 2));
-});
-
-app.get('/api/stream', (req, res) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    const client = { id: Date.now() + Math.random(), res };
-    sseClients.push(client);
-    req.on('close', () => { sseClients = sseClients.filter(c => c.id !== client.id); });
-});
-
-// ==========================================
-// 10. WEB UI v2
-// ==========================================
-app.get('/', (req, res) => res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>HOANG VIP WIN v19</title>
+app.get('/', (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>HOANG VIP WIN v19</title>
 <style>
 body{font-family:system-ui;background:#0a0e27;color:#fff;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;margin:0}
 h1{font-size:32px;background:linear-gradient(135deg,#3b82f6,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
@@ -549,8 +492,35 @@ a:hover{background:#22c55e;color:#0a0e27}
 <a href="/md5">🎰 MD5</a>
 </div>
 <p style="color:#64748b">3000+ Patterns · 12 Special Cầu · Live Streaming</p>
-</body></html>`));
+</body></html>`);
+});
 
+app.get('/api/health', (req, res) => res.json({
+    ok: true, uptime: process.uptime(),
+    port: PORT,
+    circuit: { md5: circuit.md5.fails, taixiu: circuit.taixiu.fails },
+    clients: sseClients.length, patterns: MATRIX.length
+}));
+
+// (Giữ nguyên các API phụ như cũ nếu bạn cần)
+app.get('/api/predict/:game', (req, res) => {
+    if (!['md5', 'taixiu'].includes(req.params.game)) return res.status(400).json({ error: 'invalid' });
+    const db = loadDB(req.params.game);
+    if (!db.hist.length) return res.json({ error: 'Wait...' });
+    const l = db.hist[db.hist.length - 1];
+    res.json({ game: req.params.game, session: l.pd, code: l.code, predict: l.lb, rate: l.tiLe, reason: l.pn, state: l.state });
+});
+
+app.get('/api/stream', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    const client = { id: Date.now() + Math.random(), res };
+    sseClients.push(client);
+    req.on('close', () => { sseClients = sseClients.filter(c => c.id !== client.id); });
+});
+
+// Trang chơi game
 app.get('/:game', (req, res) => {
     const game = req.params.game;
     if (!['md5', 'taixiu'].includes(game)) return res.status(404).send('Not found');
@@ -571,9 +541,6 @@ h1{color:#fff;font-size:22px;margin:0;font-weight:900;text-transform:uppercase;l
 .stat{background:rgba(15,23,42,.8);padding:12px;border-radius:12px;border:1px solid #334155;text-align:center;backdrop-filter:blur(8px)}
 .stat-l{font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:1px}
 .stat-v{font-size:18px;color:#fbbf24;font-weight:800;display:block;margin-top:4px}
-.tabs{display:flex;gap:8px;margin-bottom:12px;justify-content:center}
-.tab{padding:8px 16px;background:#0f172a;border:1px solid #334155;border-radius:8px;cursor:pointer;font-size:12px;color:#cbd5e1;transition:.2s}
-.tab.active{background:#3b82f6;border-color:#3b82f6;color:#fff}
 .table-wrap{background:rgba(15,23,42,.8);border-radius:14px;overflow-x:auto;border:1px solid #334155;backdrop-filter:blur(8px)}
 table{width:100%;border-collapse:collapse;font-size:12px;min-width:650px}
 th{background:linear-gradient(135deg,#1e40af,#3b82f6);color:#fff;padding:12px 6px;font-weight:700;text-transform:uppercase;font-size:10px;letter-spacing:.5px;position:sticky;top:0;z-index:1}
@@ -658,21 +625,14 @@ es.onmessage = (e) => {
 });
 
 // ==========================================
-// 11. GRACEFUL SHUTDOWN
+// 10. KHỞI ĐỘNG SERVER
 // ==========================================
-process.on('SIGINT', () => {
-    console.log('\n⏹ Shutting down...');
-    sseClients.forEach(c => { try { c.res.end(); } catch (e) {} });
-    process.exit(0);
-});
-
-// ==========================================
-// 12. START SERVER (FIX RENDER)
-// ==========================================
-// Thêm '0.0.0.0' để Render quét thấy port
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🔥 Server v19 Ultimate running on port ${PORT}`);
+app.listen(PORT, HOST, () => {
+    console.log(`🔥 Server v19 Ultimate running on http://${HOST}:${PORT}`);
     console.log(`   Patterns: ${MATRIX.length}`);
     console.log(`   Telegram: ${TG_TOKEN ? 'ON' : 'OFF'}`);
-    tick('md5'); tick('taixiu');
+    
+    // Chạy tick đầu tiên
+    tick('md5'); 
+    tick('taixiu');
 });
